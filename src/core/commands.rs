@@ -66,6 +66,35 @@ pub struct CommandSpec {
     pub summary: &'static str,
 }
 
+impl CommandSpec {
+    /// `" (also /h, /?)"`, or an empty string when there are no aliases.
+    pub fn alias_hint(&self) -> String {
+        if self.aliases.is_empty() {
+            return String::new();
+        }
+        let names = self
+            .aliases
+            .iter()
+            .map(|alias| format!("/{alias}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" (also {names})")
+    }
+}
+
+/// Commands whose name or one of its aliases starts with `query`
+/// (case-insensitive). An empty query returns every command in table order.
+pub fn suggestions(query: &str) -> Vec<&'static CommandSpec> {
+    let query = query.trim().to_ascii_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|spec| {
+            spec.name.starts_with(&query)
+                || spec.aliases.iter().any(|alias| alias.starts_with(&query))
+        })
+        .collect()
+}
+
 /// Every command the agent understands.
 pub const COMMANDS: [CommandSpec; 3] = [
     CommandSpec {
@@ -119,19 +148,14 @@ impl SlashCommand {
     pub fn help_text() -> String {
         let mut text = String::from("slash commands:");
         for spec in &COMMANDS {
-            let aliases = if spec.aliases.is_empty() {
-                String::new()
-            } else {
-                let names = spec
-                    .aliases
-                    .iter()
-                    .map(|alias| format!("/{alias}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(" (also {names})")
-            };
             // Writing into a String cannot fail.
-            let _ = write!(text, "\n  {:<8} {}{}", spec.usage, spec.summary, aliases);
+            let _ = write!(
+                text,
+                "\n  {:<8} {}{}",
+                spec.usage,
+                spec.summary,
+                spec.alias_hint()
+            );
         }
         let _ = write!(text, "\nAnything else is sent to the model.");
         text
@@ -249,5 +273,44 @@ mod tests {
             assert!(help.contains(spec.summary), "missing {}", spec.summary);
         }
         assert!(help.contains("Anything else is sent to the model."));
+    }
+
+    #[test]
+    fn empty_query_suggests_every_command_in_order() {
+        let names = suggestions("")
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["help", "clear", "quit"]);
+    }
+
+    #[test]
+    fn suggestions_filter_by_name_prefix() {
+        let names = suggestions("cl")
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["clear"]);
+        assert!(suggestions("zzz").is_empty());
+    }
+
+    #[test]
+    fn suggestions_match_aliases() {
+        for (query, expected) in [("h", "help"), ("re", "clear"), ("ex", "quit")] {
+            let names = suggestions(query)
+                .into_iter()
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec![expected], "query {query}");
+        }
+    }
+
+    #[test]
+    fn suggestions_are_case_insensitive() {
+        let names = suggestions("HE")
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["help"]);
     }
 }

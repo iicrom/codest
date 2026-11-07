@@ -20,7 +20,7 @@ pub mod openai_compat;
 pub mod protocol;
 pub mod session;
 
-pub use commands::{CommandError, CommandInput, SlashCommand};
+pub use commands::{CommandError, CommandInput, CommandSpec, SlashCommand, suggestions};
 pub use conversation::Conversation;
 pub use model::{ModelClient, ModelError};
 pub use protocol::{Event, EventMsg, Message, Op, Role, Submission};

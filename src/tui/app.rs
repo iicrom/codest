@@ -63,9 +63,11 @@ use tokio::time::MissedTickBehavior;
 
 use crate::core::AgentSession;
 use crate::core::CommandInput;
+use crate::core::CommandSpec;
 use crate::core::EventMsg;
 use crate::core::ModelClient;
 use crate::core::SlashCommand;
+use crate::core::suggestions;
 use crate::tui::TuiMode;
 use crate::tui::chat;
 use crate::tui::chat::HistoryCell;
@@ -76,6 +78,7 @@ use crate::tui::wrap::display_width;
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 const MAX_COMPOSER_ROWS: usize = 8;
+const MAX_COMMAND_MENU_ROWS: usize = 6;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
@@ -120,7 +123,7 @@ fn setup_terminal(mode: TuiMode) -> Result<Tui> {
         TuiMode::Inline => {
             execute!(stdout, EnableBracketedPaste)?;
             let (columns, rows) = crossterm::terminal::size()?;
-            let height = inline_pane_height(rows, 1, false);
+            let height = inline_pane_height(rows, 1, false, 0);
             // Reserve the bottom rows for the pane: scrolling once keeps the
             // shell's existing output intact above us.
             execute!(
@@ -191,12 +194,13 @@ fn finish_terminal(terminal: &mut Option<Tui>, app: &App, mode: TuiMode) {
     );
 }
 
-/// Height of the inline bottom pane: live assistant tail, composer block
-/// (top border + visible rows), and the footer.
-fn inline_pane_height(rows: u16, composer_rows: usize, has_live: bool) -> u16 {
+/// Height of the inline bottom pane: optional live assistant tail, optional
+/// command menu, composer block (top border + visible rows), and the footer.
+fn inline_pane_height(rows: u16, composer_rows: usize, has_live: bool, menu_rows: usize) -> u16 {
     let composer = composer_rows.clamp(1, MAX_COMPOSER_ROWS) as u16 + 1;
     let live = u16::from(has_live);
-    (composer + live + 1).min(rows.max(1))
+    let menu = menu_rows as u16;
+    (composer + live + menu + 1).min(rows.max(1))
 }
 
 struct App {
@@ -207,6 +211,10 @@ struct App {
     /// Assistant text currently streaming (not yet committed to history).
     live: Option<String>,
     composer: Composer,
+    /// Selected row in the slash-command menu.
+    command_selection: usize,
+    /// True after Esc dismissed the menu for the current input.
+    command_menu_dismissed: bool,
     busy: bool,
     /// When true the transcript sticks to the bottom as new lines arrive.
     follow: bool,
@@ -244,16 +252,16 @@ impl App {
         )));
         let hint = match mode {
             TuiMode::Fullscreen => {
-                "Enter send · /help commands · Ctrl+J newline · wheel/PgUp/PgDn scroll · Ctrl+C twice to quit"
+                "Enter send · type / for commands · Ctrl+J newline · wheel/PgUp/PgDn scroll · Ctrl+C twice to quit"
             }
             TuiMode::Inline => {
-                "Enter send · /help commands · Ctrl+J newline · PgUp/PgDn terminal scrollback · Ctrl+C twice to quit"
+                "Enter send · type / for commands · Ctrl+J newline · PgUp/PgDn terminal scrollback · Ctrl+C twice to quit"
             }
         };
         history.push(HistoryCell::Notice(hint.to_string()));
 
         let (inline_columns, inline_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let inline_height = inline_pane_height(inline_rows, 1, false);
+        let inline_height = inline_pane_height(inline_rows, 1, false, 0);
         let inline_top = inline_rows.saturating_sub(inline_height);
 
         Self {
@@ -263,6 +271,8 @@ impl App {
             history,
             live: None,
             composer: Composer::new(),
+            command_selection: 0,
+            command_menu_dismissed: false,
             busy: false,
             follow: true,
             scroll: 0,
@@ -346,7 +356,13 @@ impl App {
         let composer_rows = self.composer.visual_rows(composer_width);
         let desired_rows = composer_rows.len().clamp(1, MAX_COMPOSER_ROWS);
         let has_live = self.live.is_some();
-        let pane_height = inline_pane_height(rows, desired_rows, has_live);
+        let menu = self.command_matches();
+        let menu_rows = menu.len().min(MAX_COMMAND_MENU_ROWS);
+        let pane_height = inline_pane_height(rows, desired_rows, has_live, menu_rows);
+        let live_height = u16::from(has_live);
+        let composer_height = desired_rows as u16 + 1;
+        let menu_height =
+            (menu_rows as u16).min(pane_height.saturating_sub(live_height + composer_height + 1));
         let new_top = rows.saturating_sub(pane_height);
 
         let resized = rows != self.inline_rows || size.width != self.inline_columns;
@@ -402,13 +418,7 @@ impl App {
         });
 
         tui.draw(|frame| {
-            self.render_inline_pane(
-                frame,
-                live_tail,
-                composer_width,
-                &composer_rows,
-                desired_rows,
-            );
+            self.render_inline_pane(frame, live_tail, &menu, menu_height, &composer_rows);
         })?;
         Ok(())
     }
@@ -451,7 +461,11 @@ impl App {
     fn handle_terminal_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
-            Event::Paste(text) => self.composer.insert_str(&text),
+            Event::Paste(text) => {
+                self.composer.insert_str(&text);
+                self.command_selection = 0;
+                self.command_menu_dismissed = false;
+            }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             _ => {}
         }
@@ -474,6 +488,7 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        let before = self.composer.text();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -495,7 +510,10 @@ impl App {
             KeyCode::Char('n') if ctrl => self.history_next(),
             KeyCode::Char(c) if !ctrl && !alt => self.composer.insert_char(c),
             KeyCode::Enter if ctrl || alt || shift => self.composer.insert_char('\n'),
-            KeyCode::Enter => self.try_submit(),
+            KeyCode::Enter => self.on_enter(),
+            KeyCode::Tab => {
+                self.complete_command_selection();
+            }
             KeyCode::Backspace if alt => self.composer.delete_word_backward(),
             KeyCode::Backspace => self.composer.backspace(),
             KeyCode::Delete => self.composer.delete(),
@@ -510,6 +528,13 @@ impl App {
             KeyCode::PageUp if self.mode == TuiMode::Fullscreen => self.scroll_up(5),
             KeyCode::PageDown if self.mode == TuiMode::Fullscreen => self.scroll_down(5),
             _ => {}
+        }
+
+        // Any edit re-opens the menu and re-anchors the selection; navigation
+        // and Esc leave the composer untouched and keep their state.
+        if self.composer.text() != before {
+            self.command_selection = 0;
+            self.command_menu_dismissed = false;
         }
     }
 
@@ -543,9 +568,74 @@ impl App {
     }
 
     fn on_escape(&mut self) {
+        if !self.command_matches().is_empty() {
+            self.command_menu_dismissed = true;
+            return;
+        }
         if self.busy {
             self.session.interrupt();
         }
+    }
+
+    fn on_enter(&mut self) {
+        // A visible menu is authoritative: Enter runs the highlighted command
+        // even when only a prefix has been typed.
+        self.complete_command_selection();
+        self.try_submit();
+    }
+
+    /// The partial command name after the leading `/`, or `None` when the
+    /// composer does not hold an unfinished slash command.
+    fn command_query(&self) -> Option<String> {
+        let text = self.composer.text();
+        let rest = text.trim_start().strip_prefix('/')?;
+        if rest.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.to_ascii_lowercase())
+    }
+
+    fn command_matches(&self) -> Vec<&'static CommandSpec> {
+        if self.busy || self.command_menu_dismissed {
+            return Vec::new();
+        }
+        let Some(query) = self.command_query() else {
+            return Vec::new();
+        };
+        suggestions(&query)
+    }
+
+    fn command_menu_open(&self) -> bool {
+        !self.command_matches().is_empty()
+    }
+
+    /// Move the menu selection by one row, wrapping at both ends. Returns false
+    /// when the menu is closed so the caller can fall back to other behavior.
+    fn move_command_selection(&mut self, delta: isize) -> bool {
+        let len = self.command_matches().len();
+        if len == 0 {
+            return false;
+        }
+        let current = self.command_selection.min(len - 1);
+        self.command_selection = if delta < 0 {
+            (current + len - 1) % len
+        } else {
+            (current + 1) % len
+        };
+        true
+    }
+
+    /// Replace the partial name with the selected command. Returns false when
+    /// there is no menu open.
+    fn complete_command_selection(&mut self) -> bool {
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            return false;
+        }
+        let index = self.command_selection.min(matches.len() - 1);
+        self.composer.set_text(format!("/{}", matches[index].name));
+        self.command_selection = 0;
+        true
     }
 
     fn try_submit(&mut self) {
@@ -560,6 +650,8 @@ impl App {
         // Commands share the composer's prompt history, so Up recalls a typo
         // or a command the user wants to repeat.
         self.composer.clear();
+        self.command_selection = 0;
+        self.command_menu_dismissed = false;
         if self.prompts.last() != Some(&text) {
             self.prompts.push(text.clone());
         }
@@ -675,12 +767,18 @@ impl App {
     }
 
     fn on_up(&mut self) {
+        if self.move_command_selection(-1) {
+            return;
+        }
         if !self.composer.move_up() && self.composer.is_single_line() {
             self.history_prev();
         }
     }
 
     fn on_down(&mut self) {
+        if self.move_command_selection(1) {
+            return;
+        }
         if self.prompt_index.is_some() {
             if !self.composer.move_down() {
                 self.history_next();
@@ -755,41 +853,51 @@ impl App {
         let composer_height = (desired_rows as u16 + 1).min(max_composer_height);
         let visible_composer_rows = composer_height.saturating_sub(1) as usize;
 
+        let menu = self.command_matches();
+        let menu_height = (menu.len() as u16)
+            .min(MAX_COMMAND_MENU_ROWS as u16)
+            .min(area.height.saturating_sub(composer_height + 2));
+
         let chunks = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(menu_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
         .split(area);
 
         self.render_chat(frame, chunks[0], width);
+        self.render_command_menu(frame, chunks[1], &menu);
         self.render_composer(
             frame,
-            chunks[1],
+            chunks[2],
             composer_width,
             visible_composer_rows,
             &composer_rows,
         );
-        self.render_footer(frame, chunks[2]);
+        self.render_footer(frame, chunks[3]);
     }
 
     fn render_inline_pane(
         &self,
         frame: &mut Frame,
         live_tail: Option<Line<'static>>,
-        composer_width: usize,
+        menu: &[&'static CommandSpec],
+        menu_height: u16,
         composer_rows: &[String],
-        visible_composer_rows: usize,
     ) {
         let area = frame.area();
         if area.width == 0 || area.height == 0 {
             return;
         }
 
+        let composer_width = (area.width as usize).saturating_sub(2).max(1);
+        let visible_composer_rows = composer_rows.len().clamp(1, MAX_COMPOSER_ROWS);
         let live_height = u16::from(live_tail.is_some());
         let composer_height = visible_composer_rows as u16 + 1;
         let chunks = Layout::vertical([
             Constraint::Length(live_height),
+            Constraint::Length(menu_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -798,14 +906,31 @@ impl App {
         if let Some(line) = live_tail {
             frame.render_widget(Paragraph::new(Text::from(vec![line])), chunks[0]);
         }
+        self.render_command_menu(frame, chunks[1], menu);
         self.render_composer(
             frame,
-            chunks[1],
+            chunks[2],
             composer_width,
             visible_composer_rows,
             composer_rows,
         );
-        self.render_footer(frame, chunks[2]);
+        self.render_footer(frame, chunks[3]);
+    }
+
+    /// Draw the slash-command candidates directly above the composer. The list
+    /// is windowed around the selection when it is taller than `area`.
+    fn render_command_menu(&self, frame: &mut Frame, area: Rect, matches: &[&'static CommandSpec]) {
+        if matches.is_empty() || area.width == 0 || area.height == 0 {
+            return;
+        }
+        let selected = self.command_selection.min(matches.len() - 1);
+        let window = command_menu_window(matches.len(), selected, area.height as usize);
+        let lines = matches[window.clone()]
+            .iter()
+            .enumerate()
+            .map(|(offset, spec)| command_menu_line(spec, window.start + offset == selected))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
     }
 
     fn render_chat(&mut self, frame: &mut Frame, area: Rect, width: usize) {
@@ -941,14 +1066,16 @@ impl App {
         } else {
             "ready".to_string()
         };
-        let hints = if self.show_ctrl_c_hint() {
+        let hints = if self.command_menu_open() {
+            "↑↓ select · Tab complete · Enter run · Esc close"
+        } else if self.show_ctrl_c_hint() {
             "Ctrl+C again to quit"
         } else if self.busy {
             "streaming…"
         } else if self.mode == TuiMode::Fullscreen {
-            "Enter send · /help commands · Ctrl+J newline · wheel/PgUp/PgDn scroll"
+            "Enter · / commands · Ctrl+J newline · wheel scroll"
         } else {
-            "Enter send · /help commands · Ctrl+J newline · PgUp/PgDn terminal scrollback"
+            "Enter · / commands · Ctrl+J newline · PgUp/PgDn scroll"
         };
 
         let hint_width = (display_width(hints) as u16 + 1).min(area.width);
@@ -982,6 +1109,54 @@ impl App {
             parts[1],
         );
     }
+}
+
+/// The slice of command candidates to render so the selected row stays
+/// visible inside a window of `height` rows.
+fn command_menu_window(len: usize, selected: usize, height: usize) -> std::ops::Range<usize> {
+    if len == 0 || height == 0 {
+        return 0..0;
+    }
+    let height = height.min(len);
+    let selected = selected.min(len - 1);
+    let start = selected.saturating_sub(height - 1).min(len - height);
+    start..start + height
+}
+
+/// One command row: marker, aligned command name, summary, and aliases.
+fn command_menu_line(spec: &'static CommandSpec, selected: bool) -> Line<'static> {
+    let marker = if selected { "▸ " } else { "  " };
+    let (marker_style, name_style, text_style) = if selected {
+        (
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    } else {
+        (
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+        )
+    };
+
+    let mut spans = vec![
+        Span::styled(marker, marker_style),
+        Span::styled(format!("/{:<8}", spec.name), name_style),
+        Span::styled(spec.summary, text_style),
+    ];
+    let alias_hint = spec.alias_hint();
+    if !alias_hint.is_empty() {
+        spans.push(Span::styled(
+            alias_hint,
+            Style::default().fg(theme::DIM).add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The inline pane always spans the terminal width and is pinned to the bottom.
@@ -1094,10 +1269,52 @@ fn ansi_foreground(color: Color) -> String {
 mod tests {
     use super::*;
     use crate::core::mock::MockModelClient;
+    use ratatui::backend::TestBackend;
 
     fn test_app() -> App {
         let session = AgentSession::spawn(Arc::new(MockModelClient::new(Duration::ZERO)));
         App::new(session, "mock".to_string(), TuiMode::Fullscreen)
+    }
+
+    fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| app.render_fullscreen(frame))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let line: String = (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                line.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn command_menu_renders_above_the_composer() {
+        let mut app = test_app();
+        app.composer.set_text("/".to_string());
+
+        let lines = render_lines(&mut app, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("▸ /help"), "{rendered}");
+        assert!(rendered.contains("/help"), "{rendered}");
+        assert!(rendered.contains("/clear"), "{rendered}");
+        assert!(rendered.contains("/quit"), "{rendered}");
+        assert!(rendered.contains("↑↓ select"), "{rendered}");
+
+        let menu_row = lines
+            .iter()
+            .position(|line| line.contains("/help"))
+            .expect("menu row");
+        let composer_row = lines
+            .iter()
+            .position(|line| line.contains("›"))
+            .expect("composer row");
+        assert!(menu_row < composer_row, "{rendered}");
     }
 
     #[tokio::test]
@@ -1158,25 +1375,104 @@ mod tests {
         assert!(app.follow);
     }
 
+    #[tokio::test]
+    async fn slash_opens_a_filtered_command_menu() {
+        let mut app = test_app();
+
+        app.composer.set_text("/".to_string());
+        assert_eq!(app.command_matches().len(), 3);
+
+        app.composer.set_text("/cl".to_string());
+        let matches = app.command_matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "clear");
+
+        app.composer.set_text("/re".to_string());
+        let matches = app.command_matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "clear", "aliases should match too");
+
+        app.composer.set_text("/help me".to_string());
+        assert!(app.command_matches().is_empty());
+
+        app.composer.set_text("/".to_string());
+        app.busy = true;
+        assert!(app.command_matches().is_empty(), "no menu while streaming");
+    }
+
+    #[tokio::test]
+    async fn arrows_and_tab_navigate_and_complete_the_menu() {
+        let mut app = test_app();
+        app.composer.set_text("/".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.command_selection, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "/clear");
+
+        app.composer.set_text("/".to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.command_selection, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.command_selection, 1);
+    }
+
+    #[tokio::test]
+    async fn enter_runs_the_selected_command() {
+        let mut app = test_app();
+        app.composer.set_text("/he".to_string());
+
+        app.on_enter();
+
+        assert!(!app.busy);
+        assert!(app.composer.is_empty());
+        match app.history.last() {
+            Some(HistoryCell::Notice(text)) => assert!(text.contains("/clear")),
+            other => panic!("expected the help notice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn escape_dismisses_the_menu_without_clearing_input() {
+        let mut app = test_app();
+        app.composer.set_text("/".to_string());
+        assert!(app.command_menu_open());
+
+        app.on_escape();
+
+        assert!(!app.command_menu_open());
+        assert_eq!(app.composer.text(), "/");
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn command_menu_window_keeps_the_selection_visible() {
+        assert_eq!(command_menu_window(3, 0, 6), 0..3);
+        assert_eq!(command_menu_window(10, 9, 3), 7..10);
+        assert_eq!(command_menu_window(0, 0, 3), 0..0);
+    }
+
     #[test]
     fn inline_pane_height_counts_live_and_footer() {
-        assert_eq!(inline_pane_height(24, 1, false), 3);
-        assert_eq!(inline_pane_height(24, 1, true), 4);
-        assert_eq!(inline_pane_height(24, 3, true), 6);
+        assert_eq!(inline_pane_height(24, 1, false, 0), 3);
+        assert_eq!(inline_pane_height(24, 1, true, 0), 4);
+        assert_eq!(inline_pane_height(24, 3, true, 0), 6);
+        assert_eq!(inline_pane_height(24, 1, false, 3), 6);
     }
 
     #[test]
     fn inline_pane_height_caps_composer_rows() {
         assert_eq!(
-            inline_pane_height(40, 20, false),
+            inline_pane_height(40, 20, false, 0),
             MAX_COMPOSER_ROWS as u16 + 2
         );
     }
 
     #[test]
     fn inline_pane_height_never_exceeds_terminal() {
-        assert_eq!(inline_pane_height(2, 8, true), 2);
-        assert_eq!(inline_pane_height(0, 1, false), 1);
+        assert_eq!(inline_pane_height(2, 8, true, 0), 2);
+        assert_eq!(inline_pane_height(0, 1, false, 0), 1);
+        assert_eq!(inline_pane_height(3, 1, false, 6), 3);
     }
 
     #[test]
