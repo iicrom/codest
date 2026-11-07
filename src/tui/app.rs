@@ -62,8 +62,10 @@ use ratatui::widgets::Paragraph;
 use tokio::time::MissedTickBehavior;
 
 use crate::core::AgentSession;
+use crate::core::CommandInput;
 use crate::core::EventMsg;
 use crate::core::ModelClient;
+use crate::core::SlashCommand;
 use crate::tui::TuiMode;
 use crate::tui::chat;
 use crate::tui::chat::HistoryCell;
@@ -242,10 +244,10 @@ impl App {
         )));
         let hint = match mode {
             TuiMode::Fullscreen => {
-                "Enter send · Ctrl+J newline · wheel/PgUp/PgDn scroll · Ctrl+C twice to quit"
+                "Enter send · /help commands · Ctrl+J newline · wheel/PgUp/PgDn scroll · Ctrl+C twice to quit"
             }
             TuiMode::Inline => {
-                "Enter send · Ctrl+J newline · PgUp/PgDn terminal scrollback · Ctrl+C twice to quit"
+                "Enter send · /help commands · Ctrl+J newline · PgUp/PgDn terminal scrollback · Ctrl+C twice to quit"
             }
         };
         history.push(HistoryCell::Notice(hint.to_string()));
@@ -555,19 +557,68 @@ impl App {
             return;
         }
 
+        // Commands share the composer's prompt history, so Up recalls a typo
+        // or a command the user wants to repeat.
         self.composer.clear();
         if self.prompts.last() != Some(&text) {
             self.prompts.push(text.clone());
         }
-        self.prompt_index = None;
-        self.draft.clear();
-        self.last_ctrl_c = None;
+        self.reset_input_navigation();
+
+        match CommandInput::parse(&text) {
+            CommandInput::Command(command) => {
+                self.run_command(command);
+                return;
+            }
+            CommandInput::Invalid(error) => {
+                self.history.push(HistoryCell::Error(error.to_string()));
+                return;
+            }
+            CommandInput::Message => {}
+        }
 
         self.history.push(HistoryCell::User(text.clone()));
         self.live = Some(String::new());
         self.busy = true;
         self.follow = true;
         self.session.submit_user_turn(text);
+    }
+
+    /// Run a command locally. Commands never reach the model, except `/clear`,
+    /// which asks the worker to drop the context as well.
+    fn run_command(&mut self, command: SlashCommand) {
+        match command {
+            SlashCommand::Help => {
+                self.history
+                    .push(HistoryCell::Notice(SlashCommand::help_text()));
+            }
+            SlashCommand::Clear => {
+                self.clear_transcript();
+                self.session.clear_conversation();
+            }
+            SlashCommand::Quit => self.quit = true,
+        }
+    }
+
+    fn reset_input_navigation(&mut self) {
+        self.prompt_index = None;
+        self.draft.clear();
+        self.last_ctrl_c = None;
+    }
+
+    /// Reset the visible transcript and the inline-mode printing bookkeeping.
+    /// `/clear` intentionally keeps the composer's input history.
+    fn clear_transcript(&mut self) {
+        self.history.clear();
+        self.history
+            .push(HistoryCell::Notice("conversation cleared".to_string()));
+        self.live = None;
+        self.inline_final_text = None;
+        self.live_committed = 0;
+        self.printed_cells = 0;
+        self.follow = true;
+        self.scroll = 0;
+        self.max_scroll = 0;
     }
 
     fn handle_agent_event(&mut self, event: crate::core::Event) {
@@ -596,6 +647,11 @@ impl App {
                 self.finalize_live();
                 self.busy = false;
                 self.last_ctrl_c = None;
+            }
+            EventMsg::ConversationCleared => {
+                // The TUI already reset its transcript synchronously when
+                // `/clear` was typed; this confirms the core also dropped the
+                // context and keeps non-TUI front-ends in sync.
             }
             EventMsg::ShutdownComplete => {
                 self.quit = true;
@@ -890,9 +946,9 @@ impl App {
         } else if self.busy {
             "streaming…"
         } else if self.mode == TuiMode::Fullscreen {
-            "Enter send · Ctrl+J newline · wheel/PgUp/PgDn scroll"
+            "Enter send · /help commands · Ctrl+J newline · wheel/PgUp/PgDn scroll"
         } else {
-            "Enter send · Ctrl+J newline · PgUp/PgDn terminal scrollback"
+            "Enter send · /help commands · Ctrl+J newline · PgUp/PgDn terminal scrollback"
         };
 
         let hint_width = (display_width(hints) as u16 + 1).min(area.width);
@@ -1037,6 +1093,70 @@ fn ansi_foreground(color: Color) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::mock::MockModelClient;
+
+    fn test_app() -> App {
+        let session = AgentSession::spawn(Arc::new(MockModelClient::new(Duration::ZERO)));
+        App::new(session, "mock".to_string(), TuiMode::Fullscreen)
+    }
+
+    #[tokio::test]
+    async fn slash_help_prints_a_notice_without_starting_a_turn() {
+        let mut app = test_app();
+        app.composer.set_text("/help".to_string());
+        app.try_submit();
+
+        assert!(!app.busy);
+        assert!(app.composer.is_empty());
+        match app.history.last() {
+            Some(HistoryCell::Notice(text)) => {
+                assert!(text.contains("/clear"));
+                assert!(text.contains("/quit"));
+            }
+            other => panic!("expected a help notice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_command_reports_an_error_without_starting_a_turn() {
+        let mut app = test_app();
+        app.composer.set_text("/nope".to_string());
+        app.try_submit();
+
+        assert!(!app.busy);
+        match app.history.last() {
+            Some(HistoryCell::Error(text)) => assert!(text.contains("unknown command")),
+            other => panic!("expected an error cell, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_text_still_starts_a_turn() {
+        let mut app = test_app();
+        app.composer.set_text("hello".to_string());
+        app.try_submit();
+
+        assert!(app.busy);
+        assert!(matches!(app.history.last(), Some(HistoryCell::User(text)) if text == "hello"));
+    }
+
+    #[tokio::test]
+    async fn clear_resets_the_transcript_immediately() {
+        let mut app = test_app();
+        app.history
+            .push(HistoryCell::Assistant("old reply".to_string()));
+
+        app.composer.set_text("/clear".to_string());
+        app.try_submit();
+
+        assert_eq!(app.history.len(), 1);
+        assert!(matches!(
+            app.history.last(),
+            Some(HistoryCell::Notice(text)) if text == "conversation cleared"
+        ));
+        assert_eq!(app.printed_cells, 0);
+        assert!(app.follow);
+    }
 
     #[test]
     fn inline_pane_height_counts_live_and_footer() {

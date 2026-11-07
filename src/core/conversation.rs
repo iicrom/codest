@@ -40,6 +40,11 @@ impl Conversation {
         self.messages.push(Message::assistant(text));
     }
 
+    /// Drop every message, keeping the system prompt.
+    pub fn clear(&mut self) {
+        self.messages.clear();
+    }
+
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -68,5 +73,20 @@ mod tests {
         assert_eq!(snapshot[0].content, "be brief");
         assert_eq!(snapshot[1].content, "hi");
         assert_eq!(snapshot[2].content, "hello");
+    }
+
+    #[test]
+    fn clear_drops_messages_but_keeps_system_prompt() {
+        let mut conv = Conversation::new("be brief");
+        conv.push_user("hi");
+        conv.push_assistant("hello");
+
+        conv.clear();
+
+        assert!(conv.is_empty());
+        assert_eq!(conv.len(), 0);
+        let snapshot = conv.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].content, "be brief");
     }
 }

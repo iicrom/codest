@@ -60,6 +60,8 @@ impl Message {
 pub enum Op {
     /// Start one turn with a new user message.
     UserTurn { text: String },
+    /// Drop the transcript, keeping the system prompt.
+    ClearConversation,
     /// Cancel the in-flight turn, keeping any text streamed so far.
     Interrupt,
     /// Stop the agent worker.
@@ -81,6 +83,8 @@ pub enum EventMsg {
     Error { message: String },
     /// The turn is over; the front-end may accept the next submission.
     TurnComplete,
+    /// The conversation history was dropped (system prompt retained).
+    ConversationCleared,
     /// The worker has stopped.
     ShutdownComplete,
 }

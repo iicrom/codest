@@ -6,11 +6,13 @@
 //! * [`protocol`] defines the SQ/EQ message bus (`Op` submissions in, `Event`
 //!   events out) exactly like `codex_protocol::protocol`.
 //! * [`conversation`] is the message history.
+//! * [`commands`] parses the built-in slash commands shared by every front-end.
 //! * [`model`] is the abstraction over a streaming model backend, with two
 //!   implementations: [`mock`] (offline) and [`openai_compat`] (HTTP + SSE).
 //! * [`session`] is the worker task that owns the conversation and turns
 //!   submissions into events. The TUI only ever sees [`session::AgentSession`].
 
+pub mod commands;
 pub mod conversation;
 pub mod mock;
 pub mod model;
@@ -18,6 +20,7 @@ pub mod openai_compat;
 pub mod protocol;
 pub mod session;
 
+pub use commands::{CommandError, CommandInput, SlashCommand};
 pub use conversation::Conversation;
 pub use model::{ModelClient, ModelError};
 pub use protocol::{Event, EventMsg, Message, Op, Role, Submission};
