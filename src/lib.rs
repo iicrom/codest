@@ -7,12 +7,16 @@
 //! * [`cli`] parses arguments and configures the OpenAI-compatible endpoint.
 //! * [`core`] owns the submission/event protocol, conversation state, and the
 //!   model client. It has no terminal or rendering dependencies.
+//! * [`plugins`] is the compile-time extension layer: static command metadata,
+//!   lifecycle hooks, and data-only effects.
 //! * [`tui`] owns the terminal event loop, chat transcript, and composer. It
-//!   talks to the core exclusively through [`core::AgentSession`].
+//!   talks to the core exclusively through [`core::AgentSession`] and applies
+//!   plugin effects itself.
 //!
 //! Keeping the boundary sharp is the whole point of this extraction: the core
 //! can be driven by any front-end, and the TUI can be tested without a model.
 
 pub mod cli;
 pub mod core;
+pub mod plugins;
 pub mod tui;

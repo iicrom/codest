@@ -64,10 +64,13 @@ use tokio::time::MissedTickBehavior;
 use crate::core::AgentSession;
 use crate::core::CommandInput;
 use crate::core::CommandSpec;
+use crate::core::DEFAULT_SYSTEM_PROMPT;
 use crate::core::EventMsg;
+use crate::core::Invocation;
 use crate::core::ModelClient;
-use crate::core::SlashCommand;
-use crate::core::suggestions;
+use crate::plugins::PluginEffect;
+use crate::plugins::PluginHost;
+use crate::plugins::PluginInfo;
 use crate::tui::TuiMode;
 use crate::tui::chat;
 use crate::tui::chat::HistoryCell;
@@ -93,11 +96,13 @@ pub async fn run(
     let _guard = TerminalGuard { mode };
     let mut terminal = Some(setup_terminal(mode)?);
 
-    let session = match system_prompt {
-        Some(prompt) => AgentSession::spawn_with_system_prompt(client.clone(), prompt),
-        None => AgentSession::spawn(client.clone()),
-    };
-    let mut app = App::new(session, client.label(), mode);
+    let plugins = PluginHost::builtin()?;
+    let base_prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let system_prompt = plugins.system_prompt(&base_prompt);
+    let session = AgentSession::spawn_with_system_prompt(client.clone(), system_prompt);
+    let mut app = App::new(session, client.label(), mode, plugins);
+    let effects = app.plugins.startup(app.plugin_info());
+    app.apply_effects(effects);
 
     let result = app.event_loop(&mut terminal).await;
     finish_terminal(&mut terminal, &app, mode);
@@ -205,6 +210,7 @@ fn inline_pane_height(rows: u16, composer_rows: usize, has_live: bool, menu_rows
 
 struct App {
     session: AgentSession,
+    plugins: PluginHost,
     model_label: String,
     mode: TuiMode,
     history: Vec<HistoryCell>,
@@ -241,7 +247,7 @@ struct App {
 }
 
 impl App {
-    fn new(session: AgentSession, model_label: String, mode: TuiMode) -> Self {
+    fn new(session: AgentSession, model_label: String, mode: TuiMode, plugins: PluginHost) -> Self {
         let mut history = Vec::new();
         history.push(HistoryCell::Notice(
             "codest — a minimal TUI agent distilled from codex".to_string(),
@@ -266,6 +272,7 @@ impl App {
 
         Self {
             session,
+            plugins,
             model_label,
             mode,
             history,
@@ -602,7 +609,7 @@ impl App {
         let Some(query) = self.command_query() else {
             return Vec::new();
         };
-        suggestions(&query)
+        self.plugins.suggestions(&query)
     }
 
     fn command_menu_open(&self) -> bool {
@@ -657,9 +664,9 @@ impl App {
         }
         self.reset_input_navigation();
 
-        match CommandInput::parse(&text) {
-            CommandInput::Command(command) => {
-                self.run_command(command);
+        match self.plugins.parse(&text) {
+            CommandInput::Command(invocation) => {
+                self.run_command(invocation);
                 return;
             }
             CommandInput::Invalid(error) => {
@@ -669,26 +676,70 @@ impl App {
             CommandInput::Message => {}
         }
 
+        self.submit_user_turn(text);
+    }
+
+    /// Dispatch a command to its owning plugin and apply the requested effects.
+    fn run_command(&mut self, invocation: Invocation) {
+        let effects = self
+            .plugins
+            .dispatch_command(&invocation, self.plugin_info());
+        self.apply_effects(effects);
+    }
+
+    /// Start a user turn. Hooks run before the turn is queued so they cannot
+    /// race the model request; `busy` is already true, so nested submissions
+    /// are ignored.
+    fn submit_user_turn(&mut self, text: String) {
         self.history.push(HistoryCell::User(text.clone()));
         self.live = Some(String::new());
         self.busy = true;
         self.follow = true;
-        self.session.submit_user_turn(text);
+
+        let effects = self.plugins.user_message(&text, self.plugin_info());
+        self.apply_effects(effects);
+
+        if !self.quit {
+            self.session.submit_user_turn(text);
+        }
     }
 
-    /// Run a command locally. Commands never reach the model, except `/clear`,
-    /// which asks the worker to drop the context as well.
-    fn run_command(&mut self, command: SlashCommand) {
-        match command {
-            SlashCommand::Help => {
-                self.history
-                    .push(HistoryCell::Notice(SlashCommand::help_text()));
+    fn plugin_info(&self) -> PluginInfo<'_> {
+        PluginInfo {
+            model: &self.model_label,
+            mode: self.mode.label(),
+            transcript_len: self.history.len(),
+            plugin_ids: self.plugins.plugin_ids(),
+        }
+    }
+
+    /// Apply plugin effects in order. `SubmitUserTurn` is honored only while
+    /// the agent is idle, which turns recursive submissions into a no-op.
+    fn apply_effects(&mut self, effects: Vec<PluginEffect>) {
+        for effect in effects {
+            match effect {
+                PluginEffect::Notice(text) => {
+                    self.history.push(HistoryCell::Notice(text));
+                }
+                PluginEffect::Error(text) => {
+                    self.history.push(HistoryCell::Error(text));
+                }
+                PluginEffect::ClearConversation => {
+                    self.clear_transcript();
+                    self.session.clear_conversation();
+                }
+                PluginEffect::Quit => self.quit = true,
+                PluginEffect::SetComposer(text) => {
+                    self.composer.set_text(text);
+                    self.command_selection = 0;
+                    self.command_menu_dismissed = false;
+                }
+                PluginEffect::SubmitUserTurn(text) => {
+                    if !self.busy && !text.trim().is_empty() {
+                        self.submit_user_turn(text);
+                    }
+                }
             }
-            SlashCommand::Clear => {
-                self.clear_transcript();
-                self.session.clear_conversation();
-            }
-            SlashCommand::Quit => self.quit = true,
         }
     }
 
@@ -736,14 +787,19 @@ impl App {
                 self.history.push(HistoryCell::Error(message));
             }
             EventMsg::TurnComplete => {
+                let message = self.live.clone().unwrap_or_default();
                 self.finalize_live();
+                let effects = self.plugins.turn_complete(&message, self.plugin_info());
                 self.busy = false;
                 self.last_ctrl_c = None;
+                self.apply_effects(effects);
             }
             EventMsg::ConversationCleared => {
                 // The TUI already reset its transcript synchronously when
-                // `/clear` was typed; this confirms the core also dropped the
-                // context and keeps non-TUI front-ends in sync.
+                // `/clear` ran; this confirms the core also dropped the
+                // context and lets plugins observe the reset.
+                let effects = self.plugins.conversation_cleared(self.plugin_info());
+                self.apply_effects(effects);
             }
             EventMsg::ShutdownComplete => {
                 self.quit = true;
@@ -1273,7 +1329,12 @@ mod tests {
 
     fn test_app() -> App {
         let session = AgentSession::spawn(Arc::new(FakeModelClient::new(Duration::ZERO)));
-        App::new(session, "test-model".to_string(), TuiMode::Fullscreen)
+        App::new(
+            session,
+            "test-model".to_string(),
+            TuiMode::Fullscreen,
+            PluginHost::builtin().expect("builtin plugins"),
+        )
     }
 
     fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
@@ -1376,11 +1437,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_effects_are_applied_in_order() {
+        let mut app = test_app();
+        app.apply_effects(vec![
+            PluginEffect::SetComposer("/help".to_string()),
+            PluginEffect::Notice("hello".to_string()),
+            PluginEffect::Quit,
+        ]);
+
+        assert_eq!(app.composer.text(), "/help");
+        assert!(matches!(app.history.last(), Some(HistoryCell::Notice(text)) if text == "hello"));
+        assert!(app.quit);
+    }
+
+    #[tokio::test]
+    async fn submit_effect_only_starts_a_turn_while_idle() {
+        let mut app = test_app();
+        app.apply_effects(vec![PluginEffect::SubmitUserTurn("hello".to_string())]);
+        assert!(app.busy);
+        assert!(matches!(app.history.last(), Some(HistoryCell::User(text)) if text == "hello"));
+
+        let mut app = test_app();
+        app.busy = true;
+        let before = app.history.len();
+        app.apply_effects(vec![PluginEffect::SubmitUserTurn("ignored".to_string())]);
+        assert_eq!(app.history.len(), before);
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_plugin_context() {
+        let mut app = test_app();
+        app.composer.set_text("/status".to_string());
+        app.try_submit();
+
+        assert!(!app.busy);
+        match app.history.last() {
+            Some(HistoryCell::Notice(text)) => {
+                assert!(text.contains("backend: test-model"), "{text}");
+                assert!(
+                    text.contains("plugins: help, clear, quit, status"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected a status notice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn slash_opens_a_filtered_command_menu() {
         let mut app = test_app();
 
         app.composer.set_text("/".to_string());
-        assert_eq!(app.command_matches().len(), 3);
+        assert_eq!(app.command_matches().len(), 4);
 
         app.composer.set_text("/cl".to_string());
         let matches = app.command_matches();
@@ -1412,9 +1520,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 2);
+        assert_eq!(app.command_selection, 3);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 1);
+        assert_eq!(app.command_selection, 2);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # codest
 
-`codest`（简称 `cst`）是一个从 [codex](https://github.com/openai/codex) 的 `tui` + `core` 架构中提取出来的**最小 TUI chat agent**。它只保留最基本的对话能力：输入消息、流式输出、取消当前回合、滚动历史，不包含工具调用、沙箱、审批、MCP、会话持久化等 codex 的完整能力。
+`codest`（简称 `cst`）是一个从 [codex](https://github.com/openai/codex) 的 `tui` + `core` 架构中提取出来的**最小 TUI chat agent**。它只保留最基本的对话能力：输入消息、流式输出、取消当前回合、滚动历史，并带一套**编译期静态插件系统**；不包含工具调用、沙箱、审批、MCP、会话持久化等 codex 的完整能力。
 
 项目目录仍为 `../cst`（即 `codex` 的兄弟目录），与 codex 仓库完全独立。
 
@@ -109,13 +109,14 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 
 ## 指令
 
-在输入框里输入以 `/` 开头的文本即可执行内置指令；指令在本地处理，不会发送给模型：
+在输入框里输入以 `/` 开头的文本即可执行指令；指令由静态插件提供，在本地处理，不会发送给模型：
 
 | 指令 | 别名 | 行为 |
 | --- | --- | --- |
-| `/help` | `/h`、`/?` | 显示指令列表 |
+| `/help` | `/h`、`/?` | 显示指令列表（包含所有插件贡献的指令） |
 | `/clear` | `/reset` | 清空会话上下文和屏幕上的 transcript |
 | `/quit` | `/exit` | 退出 codest |
+| `/status` | — | 显示 backend、模式、transcript 大小和已加载插件 |
 
 输入 `/` 就会在输入框上方弹出候选列表，继续输入会按指令名或别名前缀实时过滤（不区分大小写）：
 
@@ -123,7 +124,25 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 - `Enter` 先补全再直接执行选中的指令，`Esc` 关闭候选但不影响已输入的内容；
 - 候选只在输入还是“指令名”阶段出现；一旦输入空格或换行，就按普通文本处理。
 
-只有整条输入的第一个非空白字符是 `/` 时才会被当作指令，其他文本照常发给模型。未知指令或多余参数会显示错误提示，不会发给模型。
+只有整条输入的第一个非空白字符是 `/` 时才会被当作指令，其他文本照常发给模型。未知指令、多余参数或缺少参数会显示错误提示，不会发给模型。
+
+## 插件（编译期静态）
+
+codest 的指令和生命周期扩展都来自**编译期链接**的插件，不做运行时加载：
+
+- 插件是普通的 Rust 模块，注册表是 `src/plugins/builtin/mod.rs` 里的一个 `static` 切片；注册顺序就是钩子执行顺序和菜单顺序。
+- 插件可以贡献 slash 命令、系统提示词片段，以及 `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` 钩子。
+- 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、清屏、退出、设置输入框、提交新回合），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
+- 重复插件 id、重复命令名/别名、非法命令名会在启动时被拒绝。
+
+内置的 `/help`、`/clear`、`/quit`、`/status` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)。
+
+新增插件的最小步骤：
+
+1. 在 `src/plugins/builtin/` 下新建模块，声明 `static` 插件值和 `CommandSpec`；
+2. 实现 `Plugin`（至少 `id`，按需实现 `commands` / `run_command` / 钩子）；
+3. 在 `src/plugins/builtin/mod.rs` 的 `BUILTIN_PLUGINS` 里加一项；
+4. 运行 `cargo test`。
 
 ## 从 codex 提取了什么
 
@@ -147,6 +166,8 @@ codex 的 TUI 超过 10 万行、`core` 也有大量工具/沙箱/会话基础�
 codest/
 ├── Cargo.toml
 ├── README.md
+├── docs/
+│   └── plugins.md           # 静态插件系统设计
 ├── scripts/
 │   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务
 │   └── pty_smoke.py          # 离线端到端冒烟测试（pty）
@@ -157,12 +178,20 @@ codest/
     ├── lib.rs
     ├── core/
     │   ├── protocol.rs      # Message / Op / Event
-    │   ├── commands.rs      # 内置斜杠指令解析
+    │   ├── commands.rs      # 命令表 / 解析（指令由插件提供）
     │   ├── conversation.rs  # 线性会话历史
     │   ├── model.rs         # ModelClient trait + 错误类型
     │   ├── openai_compat.rs # HTTP + SSE 流式客户端
     │   ├── test_model.rs    # 仅 cargo test 编译的进程内假模型
     │   └── session.rs       # agent worker + AgentSession
+    ├── plugins/
+    │   ├── mod.rs           # Plugin trait / PluginHost / effects
+    │   └── builtin/
+    │       ├── mod.rs       # 静态注册表
+    │       ├── help.rs      # /help
+    │       ├── clear.rs     # /clear
+    │       ├── quit.rs      # /quit
+    │       └── status.rs    # /status
     └── tui/
         ├── app.rs           # 事件循环 / fullscreen & inline 渲染
         ├── chat.rs          # 历史单元格
@@ -174,7 +203,8 @@ codest/
 ## 已知边界
 
 - 只支持纯文本对话，没有工具调用、文件读写、审批、MCP、图片。
-- 指令系统只有 `/help`、`/clear`、`/quit`，不支持自定义指令或参数。
+- 插件是编译期静态链接的：新增/修改插件需要改代码并重新编译，不支持运行时加载 `.so` 或脚本插件；插件与主程序同权限，没有沙箱隔离。
+- 插件钩子在 TUI 线程同步执行，不能做阻塞 I/O。
 - 没有会话持久化；退出即丢失。
 - 没有网络重试、代理、认证刷新；HTTP 客户端只实现一次请求 + SSE 增量解析。
 - 没有内嵌离线模型：必须配置 API key，或先启动 `scripts/openai_test_server.py` 并把 `--base-url` 指过去。
@@ -184,8 +214,9 @@ codest/
 
 ## 后续可扩展点
 
-1. 在 `Op` 中加入工具调用与审批事件，向 codex 的 SQ/EQ 靠拢。
+1. 在 `Op` 中加入工具调用与审批事件，向 codex 的 SQ/EQ 靠拢，并让插件可以注册工具。
 2. 为 `Conversation` 增加 token 预算与压缩。
 3. 会话持久化（rollout JSONL）与 resume。
 4. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
 5. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。
+6. 用 `inventory`/`linkme` 做分布式静态注册，保持 `Plugin` 契约不变。
