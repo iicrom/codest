@@ -1,8 +1,9 @@
-//! Offline model backend used for local demos and tests.
+//! Deterministic in-process model used by unit tests.
 //!
-//! Codex has a fake/OSS provider story; this is the smaller equivalent: a
-//! deterministic stream with no network access, so the TUI can be exercised
-//! end-to-end without credentials.
+//! This module is compiled only for `cargo test`. The shipped binary has no
+//! offline backend: it always talks to an OpenAI-compatible endpoint. For
+//! manual end-to-end testing, run `scripts/openai_test_server.py` and point
+//! `codest` at it.
 
 use std::time::Duration;
 
@@ -11,30 +12,22 @@ use tokio_util::sync::CancellationToken;
 use crate::core::model::{ModelClient, ModelError, ModelStream};
 use crate::core::protocol::{Message, Role};
 
-/// A deterministic echo model. It streams word-sized chunks so the TUI's
-/// incremental rendering path is exercised exactly like a real backend.
+/// A deterministic echo model. It streams word-sized chunks so session tests
+/// exercise the same incremental path as a real backend.
 #[derive(Debug, Clone)]
-pub struct MockModelClient {
+pub(crate) struct FakeModelClient {
     delay: Duration,
 }
 
-impl Default for MockModelClient {
-    fn default() -> Self {
-        Self {
-            delay: Duration::from_millis(18),
-        }
-    }
-}
-
-impl MockModelClient {
-    pub fn new(delay: Duration) -> Self {
+impl FakeModelClient {
+    pub(crate) fn new(delay: Duration) -> Self {
         Self { delay }
     }
 }
 
-impl ModelClient for MockModelClient {
+impl ModelClient for FakeModelClient {
     fn label(&self) -> String {
-        "mock".to_string()
+        "test-model".to_string()
     }
 
     fn stream_chat(&self, messages: Vec<Message>, cancel: CancellationToken) -> ModelStream {
@@ -67,14 +60,7 @@ fn reply_for(messages: &[Message]) -> String {
         .filter(|text| !text.is_empty())
         .unwrap_or("(empty message)");
 
-    format!(
-        "You said: \"{last_user}\"\n\n\
-         I'm the offline mock model, so no network request was made. \
-         This is the cst TUI running on top of the minimal core: streaming \
-         deltas arrive over the event queue and are rendered as they land.\n\n\
-         Set CST_API_KEY (or pass --api-key) to talk to a real \
-         OpenAI-compatible endpoint."
-    )
+    format!("You said: \"{last_user}\"\n\nThis is the in-process test model.")
 }
 
 /// Split text into stream-sized chunks, keeping whitespace attached to the
@@ -104,22 +90,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_streams_the_full_reply() {
-        let client = MockModelClient::new(Duration::ZERO);
+    async fn streams_the_full_reply() {
+        let client = FakeModelClient::new(Duration::ZERO);
         let mut stream = client.stream_chat(vec![Message::user("ping")], CancellationToken::new());
 
         let mut out = String::new();
         while let Some(item) = stream.next().await {
-            out.push_str(&item.expect("mock stream never fails"));
+            out.push_str(&item.expect("test stream never fails"));
         }
 
         assert!(out.contains("You said: \"ping\""));
-        assert!(out.contains("offline mock model"));
+        assert!(out.contains("in-process test model"));
     }
 
     #[tokio::test]
-    async fn mock_honours_cancellation() {
-        let client = MockModelClient::new(Duration::from_millis(5));
+    async fn honours_cancellation() {
+        let client = FakeModelClient::new(Duration::from_millis(5));
         let cancel = CancellationToken::new();
         let mut stream = client.stream_chat(
             vec![Message::user("a much longer message to stream")],

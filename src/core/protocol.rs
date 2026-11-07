@@ -2,7 +2,7 @@
 //!
 //! Mirrors the shape of `codex_protocol::protocol`: callers submit an [`Op`]
 //! and receive a stream of [`Event`]s. Keeping the bus explicit means the TUI
-//! never calls into model code directly and can be driven by a mock core later.
+//! never calls into model code directly and can be driven by a test core later.
 
 use serde::Deserialize;
 use serde::Serialize;

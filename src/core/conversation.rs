@@ -7,7 +7,7 @@
 use crate::core::protocol::Message;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str =
-    "You are cst, a concise and helpful terminal assistant. Answer in the user's language.";
+    "You are codest, a concise and helpful terminal assistant. Answer in the user's language.";
 
 #[derive(Debug, Clone)]
 pub struct Conversation {

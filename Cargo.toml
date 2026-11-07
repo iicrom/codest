@@ -1,18 +1,23 @@
 [package]
-name = "cst"
+name = "codest"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A minimal TUI chat agent distilled from codex's TUI + core architecture"
 license = "Apache-2.0"
+default-run = "codest"
 
 [lib]
-name = "cst"
+name = "codest"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cst"
+name = "codest"
 path = "src/main.rs"
+
+[[bin]]
+name = "cst"
+path = "src/bin/cst.rs"
 
 [dependencies]
 anyhow = "1"

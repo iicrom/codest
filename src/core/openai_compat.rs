@@ -67,7 +67,8 @@ impl ModelClient for OpenAiCompatClient {
         if self.api_key.trim().is_empty() {
             return Box::pin(futures_util::stream::once(async {
                 Err(ModelError::NotConfigured(
-                    "API key is empty; set CST_API_KEY or use --mock".to_string(),
+                    "API key is empty; set CST_API_KEY / OPENAI_API_KEY or pass --api-key"
+                        .to_string(),
                 ))
             }));
         }

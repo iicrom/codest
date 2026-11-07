@@ -244,7 +244,7 @@ impl App {
     fn new(session: AgentSession, model_label: String, mode: TuiMode) -> Self {
         let mut history = Vec::new();
         history.push(HistoryCell::Notice(
-            "cst — a minimal TUI agent distilled from codex".to_string(),
+            "codest — a minimal TUI agent distilled from codex".to_string(),
         ));
         history.push(HistoryCell::Notice(format!(
             "backend: {model_label} · mode: {}",
@@ -1084,7 +1084,7 @@ impl App {
 
         let left = Line::from(vec![
             Span::styled(
-                " cst",
+                " codest",
                 Style::default()
                     .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
@@ -1268,12 +1268,12 @@ fn ansi_foreground(color: Color) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::mock::MockModelClient;
+    use crate::core::test_model::FakeModelClient;
     use ratatui::backend::TestBackend;
 
     fn test_app() -> App {
-        let session = AgentSession::spawn(Arc::new(MockModelClient::new(Duration::ZERO)));
-        App::new(session, "mock".to_string(), TuiMode::Fullscreen)
+        let session = AgentSession::spawn(Arc::new(FakeModelClient::new(Duration::ZERO)));
+        App::new(session, "test-model".to_string(), TuiMode::Fullscreen)
     }
 
     fn render_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {

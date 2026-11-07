@@ -116,7 +116,7 @@ pub const COMMANDS: [CommandSpec; 3] = [
         name: "quit",
         aliases: &["exit"],
         usage: "/quit",
-        summary: "quit cst",
+        summary: "quit codest",
     },
 ];
 

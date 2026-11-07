@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Offline end-to-end smoke test for the cst TUI.
+"""Offline end-to-end smoke test for the codest TUI.
 
-Spawns the compiled binary in a pseudo-terminal, types a message, waits for the
-mock model to stream a reply, and renders the captured ANSI output to a plain
-text grid so assertions are not confused by cursor-positioning sequences.
+Spawns the compiled binary in a pseudo-terminal, types a message, waits for a
+local OpenAI-compatible server to stream a reply, and renders the captured ANSI
+output to a plain text grid so assertions are not confused by cursor-positioning
+sequences.
+
+The test server is `scripts/openai_test_server.py`; it is started automatically
+on an ephemeral loopback port, so no external network access is required.
 
 Both TUI modes are exercised by default: `fullscreen` must enter the alternate
 screen and capture the mouse, while `inline` must leave the terminal's native
 scrollback in place.
 
-No network access is performed: this always passes `--mock`.
-
 Usage:
     cargo build
-    python3 scripts/pty_smoke.py [path/to/cst] [--mode fullscreen|inline|both]
+    python3 scripts/pty_smoke.py [path/to/codest] [--mode fullscreen|inline|both]
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import os
 import pty
 import re
 import select
+import socket
 import struct
 import subprocess
 import sys
@@ -155,14 +158,65 @@ def render(raw: str) -> str:
     return "\n".join("".join(line).rstrip() for line in grid).rstrip("\n")
 
 
-def run_case(binary: str, mode: str) -> dict[str, bool]:
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for_port(port: int, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(0.05)
+    return False
+
+
+def start_test_server() -> tuple[subprocess.Popen, str]:
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "openai_test_server.py")
+    if not os.path.exists(script):
+        raise RuntimeError(f"test server script not found: {script}")
+    port = free_port()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            script,
+            "--port",
+            str(port),
+            "--delay",
+            "0.005",
+            "--quiet",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if not wait_for_port(port):
+        process.terminate()
+        raise RuntimeError("test server did not start listening")
+    return process, f"http://127.0.0.1:{port}/v1"
+
+
+def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
     process = subprocess.Popen(
-        [binary, "--mock", "--tui-mode", mode],
+        [
+            binary,
+            "--tui-mode",
+            mode,
+            "--base-url",
+            base_url,
+            "--api-key",
+            "test-key",
+            "--model",
+            "test-model",
+        ],
         stdin=slave,
         stdout=slave,
         stderr=slave,
@@ -248,7 +302,7 @@ def run_case(binary: str, mode: str) -> dict[str, bool]:
         "second user message": "› line one" in screen,
         "second reply": 'You said: "line one' in screen,
         "no stray cursor": "▌" not in screen,
-        "mock footer": "cst · mock" in screen,
+        "test server footer": "codest · test-model" in screen,
         "idle state": "ready" in screen,
         "mode notice": f"mode: {mode}" in raw_turn1,
         "clean exit": process.returncode == 0,
@@ -268,7 +322,7 @@ def run_case(binary: str, mode: str) -> dict[str, bool]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("binary", nargs="?", default="target/debug/cst")
+    parser.add_argument("binary", nargs="?", default="target/debug/codest")
     parser.add_argument(
         "--mode",
         choices=["fullscreen", "inline", "both"],
@@ -282,11 +336,19 @@ def main() -> int:
         return 2
 
     modes = ["fullscreen", "inline"] if args.mode == "both" else [args.mode]
+    server, base_url = start_test_server()
     passed = True
-    for mode in modes:
-        checks = run_case(args.binary, mode)
-        passed = passed and all(checks.values())
-        print()
+    try:
+        for mode in modes:
+            checks = run_case(args.binary, mode, base_url)
+            passed = passed and all(checks.values())
+            print()
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            server.kill()
     return 0 if passed else 1
 
 

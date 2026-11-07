@@ -294,9 +294,9 @@ fn finalize_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::mock::MockModelClient;
     use crate::core::protocol::Message;
     use crate::core::protocol::Role;
+    use crate::core::test_model::FakeModelClient;
     use std::time::Duration;
 
     async fn collect_turn(session: &mut AgentSession) -> Vec<Event> {
@@ -313,7 +313,7 @@ mod tests {
 
     #[tokio::test]
     async fn streams_a_turn_end_to_end() {
-        let client = Arc::new(MockModelClient::new(Duration::ZERO));
+        let client = Arc::new(FakeModelClient::new(Duration::ZERO));
         let mut session = AgentSession::spawn(client);
 
         session.submit_user_turn("hello");
@@ -415,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_keeps_partial_output() {
-        let client = Arc::new(MockModelClient::new(Duration::from_millis(5)));
+        let client = Arc::new(FakeModelClient::new(Duration::from_millis(5)));
         let mut session = AgentSession::spawn(client);
 
         session.submit_user_turn("interrupt me");
@@ -443,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_stops_the_worker() {
-        let client = Arc::new(MockModelClient::new(Duration::ZERO));
+        let client = Arc::new(FakeModelClient::new(Duration::ZERO));
         let mut session = AgentSession::spawn(client);
         session.shutdown();
 
