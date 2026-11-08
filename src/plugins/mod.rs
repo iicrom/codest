@@ -28,7 +28,7 @@ use std::fmt;
 use crate::core::commands::CommandTableError;
 use crate::core::commands::{CommandInput, CommandTable};
 
-pub use crate::core::commands::{ArgsPolicy, CommandSpec, Invocation};
+pub use crate::core::commands::{ArgsPolicy, CommandCandidate, CommandSpec, Invocation};
 pub use builtin::BUILTIN_PLUGINS;
 
 /// One compile-time extension.
@@ -219,8 +219,18 @@ pub struct PluginHost {
 }
 
 impl PluginHost {
-    /// Validate plugin ids and build the command table.
+    /// Validate plugin ids and build the command table they contribute.
     pub fn new(plugins: &'static [&'static dyn Plugin]) -> Result<Self, PluginHostError> {
+        Self::with_extra_commands(plugins, &[])
+    }
+
+    /// Build a host whose command table also carries front-end built-in
+    /// commands that no plugin owns (the core session commands). Name
+    /// collisions between plugins and extras are rejected like duplicates.
+    fn with_extra_commands(
+        plugins: &'static [&'static dyn Plugin],
+        extra: &'static [CommandSpec],
+    ) -> Result<Self, PluginHostError> {
         let mut ids = Vec::with_capacity(plugins.len());
         for plugin in plugins {
             let id = plugin.id();
@@ -233,7 +243,10 @@ impl PluginHost {
             ids.push(id);
         }
 
-        let specs = plugins.iter().flat_map(|plugin| plugin.commands());
+        let specs = plugins
+            .iter()
+            .flat_map(|plugin| plugin.commands())
+            .chain(extra.iter());
         let table = CommandTable::new(specs)?;
         Ok(Self {
             plugins,
@@ -242,9 +255,10 @@ impl PluginHost {
         })
     }
 
-    /// The plugins compiled into the binary.
+    /// The plugins compiled into the binary, plus the built-in session
+    /// commands (`/new`, `/sessions`) that the front-end handles itself.
     pub fn builtin() -> Result<Self, PluginHostError> {
-        Self::new(BUILTIN_PLUGINS)
+        Self::with_extra_commands(BUILTIN_PLUGINS, crate::core::sessions::SESSION_COMMANDS)
     }
 
     pub fn plugins(&self) -> &'static [&'static dyn Plugin] {
@@ -281,7 +295,7 @@ impl PluginHost {
         self.table.parse(input)
     }
 
-    pub fn suggestions(&self, query: &str) -> Vec<&'static CommandSpec> {
+    pub fn suggestions(&self, query: &str) -> Vec<CommandCandidate> {
         self.table.suggestions(query)
     }
 
@@ -579,7 +593,12 @@ mod tests {
             .iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["help", "clear", "quit", "status"]);
+        assert_eq!(
+            names,
+            vec![
+                "help", "clear", "quit", "status", "new", "rename", "sessions"
+            ]
+        );
     }
 
     #[test]

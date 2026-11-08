@@ -77,6 +77,22 @@ impl CommandSpec {
     }
 }
 
+/// One completion candidate: a command's primary name or one of its aliases.
+/// `name` is what the menu displays and what Tab/Enter complete to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandCandidate {
+    pub spec: &'static CommandSpec,
+    pub name: &'static str,
+}
+
+impl CommandCandidate {
+    /// Whether `name` is one of the command's aliases rather than its
+    /// primary name.
+    pub fn is_alias(&self) -> bool {
+        self.name != self.spec.name
+    }
+}
+
 /// A parsed command ready to be dispatched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
@@ -194,18 +210,21 @@ impl CommandTable {
         })
     }
 
-    /// Commands whose name or one of its aliases starts with `query`
-    /// (case-insensitive). An empty query returns every command in table order.
-    pub fn suggestions(&self, query: &str) -> Vec<&'static CommandSpec> {
+    /// Completion candidates whose name — primary name or alias alike —
+    /// starts with `query` (case-insensitive), in table order with each
+    /// command's aliases directly after it. An empty query returns every
+    /// candidate.
+    pub fn suggestions(&self, query: &str) -> Vec<CommandCandidate> {
         let query = query.trim().to_ascii_lowercase();
-        self.specs
-            .iter()
-            .copied()
-            .filter(|spec| {
-                spec.name.starts_with(&query)
-                    || spec.aliases.iter().any(|alias| alias.starts_with(&query))
-            })
-            .collect()
+        let mut candidates = Vec::new();
+        for spec in &self.specs {
+            for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+                if name.starts_with(&query) {
+                    candidates.push(CommandCandidate { spec, name });
+                }
+            }
+        }
+        candidates
     }
 
     /// Classify a submission. Leading/trailing whitespace is ignored, and
@@ -477,13 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_suggests_every_command_in_order() {
+    fn empty_query_suggests_every_name_and_alias_in_order() {
         let names = table()
             .suggestions("")
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|candidate| candidate.name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["help", "clear", "echo", "note"]);
+        assert_eq!(
+            names,
+            vec!["help", "h", "?", "clear", "reset", "echo", "note"]
+        );
     }
 
     #[test]
@@ -492,7 +514,7 @@ mod tests {
         let names = table
             .suggestions("cl")
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|candidate| candidate.name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["clear"]);
         assert!(table.suggestions("zzz").is_empty());
@@ -501,14 +523,29 @@ mod tests {
     #[test]
     fn suggestions_match_aliases() {
         let table = table();
-        for (query, expected) in [("h", "help"), ("re", "clear")] {
+        // Aliases are candidates in their own right, next to their command's
+        // primary name.
+        for (query, expected) in [
+            ("h", vec!["help", "h"]),
+            ("?", vec!["?"]),
+            ("re", vec!["reset"]),
+        ] {
             let names = table
                 .suggestions(query)
                 .into_iter()
-                .map(|spec| spec.name)
+                .map(|candidate| candidate.name)
                 .collect::<Vec<_>>();
-            assert_eq!(names, vec![expected], "query {query}");
+            assert_eq!(names, expected, "query {query}");
         }
+    }
+
+    #[test]
+    fn alias_candidates_know_their_command() {
+        let table = table();
+        let reset = &table.suggestions("reset")[0];
+        assert_eq!(reset.spec.name, "clear");
+        assert!(reset.is_alias());
+        assert!(!table.suggestions("clear")[0].is_alias());
     }
 
     #[test]
@@ -516,7 +553,7 @@ mod tests {
         let names = table()
             .suggestions("HE")
             .into_iter()
-            .map(|spec| spec.name)
+            .map(|candidate| candidate.name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["help"]);
     }

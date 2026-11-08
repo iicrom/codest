@@ -12,6 +12,7 @@
 
 use std::io::Stdout;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -62,19 +63,25 @@ use ratatui::widgets::Paragraph;
 use tokio::time::MissedTickBehavior;
 
 use crate::core::AgentSession;
+use crate::core::CommandCandidate;
 use crate::core::CommandInput;
-use crate::core::CommandSpec;
 use crate::core::DEFAULT_SYSTEM_PROMPT;
 use crate::core::EventMsg;
 use crate::core::Invocation;
 use crate::core::ModelClient;
+use crate::core::SessionBootstrap;
+use crate::core::rollout;
+use crate::core::rollout::LoadedSession;
 use crate::plugins::PluginEffect;
 use crate::plugins::PluginHost;
 use crate::plugins::PluginInfo;
+use crate::tui::RestoreMode;
 use crate::tui::TuiMode;
 use crate::tui::chat;
 use crate::tui::chat::HistoryCell;
 use crate::tui::composer::Composer;
+use crate::tui::session::SessionView;
+use crate::tui::session::truncated;
 use crate::tui::theme;
 use crate::tui::wrap::display_width;
 
@@ -91,6 +98,7 @@ pub async fn run(
     client: Arc<dyn ModelClient>,
     system_prompt: Option<String>,
     mode: TuiMode,
+    restore: RestoreMode,
 ) -> Result<()> {
     // Created before setup so a partial setup still restores the terminal.
     let _guard = TerminalGuard { mode };
@@ -99,14 +107,76 @@ pub async fn run(
     let plugins = PluginHost::builtin()?;
     let base_prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
     let system_prompt = plugins.system_prompt(&base_prompt);
-    let session = AgentSession::spawn_with_system_prompt(client.clone(), system_prompt);
-    let mut app = App::new(session, client.label(), mode, plugins);
+
+    // The workspace's saved sessions are always loaded so `/sessions` shows
+    // the same list no matter how codest was started. Plain startup opens a
+    // fresh session on top; the restore modes continue where the last run
+    // left off. Everything from this run is persisted best-effort under
+    // ~/.codest/sessions/<workspace-hash>/.
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let sessions_dir = rollout::workspace_sessions_dir(&workspace);
+    let loaded = rollout::load_workspace_sessions(&sessions_dir).unwrap_or_else(|error| {
+        eprintln!("codest: cannot load saved sessions: {error}");
+        Vec::new()
+    });
+    let fresh = restore == RestoreMode::None;
+
+    let session = AgentSession::spawn_with_bootstrap(
+        client.clone(),
+        system_prompt.clone(),
+        SessionBootstrap {
+            cwd: workspace.to_string_lossy().into_owned(),
+            rollout_dir: Some(sessions_dir),
+            loaded: loaded.clone(),
+            fresh,
+        },
+    );
+
+    let (views, active_view) = build_views(&client.label(), mode, &loaded, fresh);
+    let mut app = App::new(session, client.label(), mode, plugins, views, active_view);
+    if restore == RestoreMode::Picker {
+        app.open_session_menu();
+    }
     let effects = app.plugins.startup(app.plugin_info());
     app.apply_effects(effects);
 
     let result = app.event_loop(&mut terminal).await;
     finish_terminal(&mut terminal, &app, mode);
     result
+}
+
+/// Starting views: one per restored session (oldest first) plus, on a plain
+/// startup, the fresh session being typed into. The startup banner belongs
+/// to this run rather than any session, so it goes into the active view.
+fn build_views(
+    model_label: &str,
+    mode: TuiMode,
+    loaded: &[LoadedSession],
+    fresh: bool,
+) -> (Vec<SessionView>, usize) {
+    let mut views: Vec<SessionView> = loaded.iter().map(SessionView::restored).collect();
+    if fresh || views.is_empty() {
+        views.push(SessionView::initial(model_label, mode));
+        let active = views.len() - 1;
+        if active > 0 {
+            views[active].history.push(HistoryCell::Notice(format!(
+                "{} saved session{} available via /sessions",
+                loaded.len(),
+                if loaded.len() == 1 { "" } else { "s" }
+            )));
+        }
+        return (views, active);
+    }
+
+    let active = views.len() - 1;
+    let mut cells = SessionView::initial(model_label, mode).history;
+    cells.push(HistoryCell::Notice(format!(
+        "resumed {} saved session{}",
+        loaded.len(),
+        if loaded.len() == 1 { "" } else { "s" }
+    )));
+    views[active].history.splice(0..0, cells);
+    (views, active)
 }
 
 fn setup_terminal(mode: TuiMode) -> Result<Tui> {
@@ -213,32 +283,25 @@ struct App {
     plugins: PluginHost,
     model_label: String,
     mode: TuiMode,
-    history: Vec<HistoryCell>,
-    /// Assistant text currently streaming (not yet committed to history).
-    live: Option<String>,
+    /// One view per recorded session; `views[i]` mirrors core conversation i.
+    /// Append-only: `/new` adds one and switches to it, nothing is removed.
+    views: Vec<SessionView>,
+    /// Creation-order index of the session being viewed and edited.
+    active_view: usize,
+    /// Open `/sessions` picker: the selected view index; `None` when closed.
+    session_menu: Option<usize>,
     composer: Composer,
     /// Selected row in the slash-command menu.
     command_selection: usize,
     /// True after Esc dismissed the menu for the current input.
     command_menu_dismissed: bool,
     busy: bool,
-    /// When true the transcript sticks to the bottom as new lines arrive.
-    follow: bool,
-    scroll: usize,
-    max_scroll: usize,
     tick: usize,
     quit: bool,
     prompts: Vec<String>,
     prompt_index: Option<usize>,
     draft: String,
     last_ctrl_c: Option<Instant>,
-    /// Inline mode: how many history cells have been flushed to scrollback.
-    printed_cells: usize,
-    /// Inline mode: how many wrapped lines of `live` already went to scrollback.
-    live_committed: usize,
-    /// Inline mode: final assistant text whose remaining lines still need to be
-    /// flushed after a turn ends.
-    inline_final_text: Option<String>,
     /// Inline mode: current pane rectangle (always pinned to the bottom row).
     inline_top: u16,
     inline_height: u16,
@@ -247,25 +310,14 @@ struct App {
 }
 
 impl App {
-    fn new(session: AgentSession, model_label: String, mode: TuiMode, plugins: PluginHost) -> Self {
-        let mut history = Vec::new();
-        history.push(HistoryCell::Notice(
-            "codest — a minimal TUI agent distilled from codex".to_string(),
-        ));
-        history.push(HistoryCell::Notice(format!(
-            "backend: {model_label} · mode: {}",
-            mode.label()
-        )));
-        let hint = match mode {
-            TuiMode::Fullscreen => {
-                "Enter send · type / for commands · Ctrl+J newline · wheel/PgUp/PgDn scroll · Ctrl+C twice to quit"
-            }
-            TuiMode::Inline => {
-                "Enter send · type / for commands · Ctrl+J newline · PgUp/PgDn terminal scrollback · Ctrl+C twice to quit"
-            }
-        };
-        history.push(HistoryCell::Notice(hint.to_string()));
-
+    fn new(
+        session: AgentSession,
+        model_label: String,
+        mode: TuiMode,
+        plugins: PluginHost,
+        views: Vec<SessionView>,
+        active_view: usize,
+    ) -> Self {
         let (inline_columns, inline_rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let inline_height = inline_pane_height(inline_rows, 1, false, 0);
         let inline_top = inline_rows.saturating_sub(inline_height);
@@ -275,29 +327,34 @@ impl App {
             plugins,
             model_label,
             mode,
-            history,
-            live: None,
+            views,
+            active_view,
+            session_menu: None,
             composer: Composer::new(),
             command_selection: 0,
             command_menu_dismissed: false,
             busy: false,
-            follow: true,
-            scroll: 0,
-            max_scroll: 0,
             tick: 0,
             quit: false,
             prompts: Vec::new(),
             prompt_index: None,
             draft: String::new(),
             last_ctrl_c: None,
-            printed_cells: 0,
-            live_committed: 0,
-            inline_final_text: None,
             inline_top,
             inline_height,
             inline_rows,
             inline_columns,
         }
+    }
+
+    /// The view of the session being edited; only the active session is ever
+    /// busy or streaming, because session commands wait for an idle agent.
+    fn view(&self) -> &SessionView {
+        &self.views[self.active_view]
+    }
+
+    fn view_mut(&mut self) -> &mut SessionView {
+        &mut self.views[self.active_view]
     }
 
     async fn event_loop(&mut self, terminal: &mut Option<Tui>) -> Result<()> {
@@ -362,9 +419,9 @@ impl App {
         let composer_width = width.saturating_sub(2).max(1);
         let composer_rows = self.composer.visual_rows(composer_width);
         let desired_rows = composer_rows.len().clamp(1, MAX_COMPOSER_ROWS);
-        let has_live = self.live.is_some();
-        let menu = self.command_matches();
-        let menu_rows = menu.len().min(MAX_COMMAND_MENU_ROWS);
+        let has_live = self.view().live.is_some();
+        let menu = self.menu_lines(MAX_COMMAND_MENU_ROWS);
+        let menu_rows = menu.len();
         let pane_height = inline_pane_height(rows, desired_rows, has_live, menu_rows);
         let live_height = u16::from(has_live);
         let composer_height = desired_rows as u16 + 1;
@@ -418,7 +475,7 @@ impl App {
         self.inline_rows = rows;
         self.inline_columns = size.width;
 
-        let live_tail = self.live.as_ref().map(|text| {
+        let live_tail = self.view().live.as_ref().map(|text| {
             chat::assistant_lines(text, width, self.busy)
                 .pop()
                 .unwrap_or_else(|| Line::from(""))
@@ -431,34 +488,37 @@ impl App {
     }
 
     /// Collect transcript lines that have not reached the terminal scrollback
-    /// yet, advancing the bookkeeping that prevents reprinting them.
+    /// yet, advancing the bookkeeping that prevents reprinting them. Only the
+    /// active session's view is flushed; a background view catches up when it
+    /// becomes active again.
     fn take_inline_pending(&mut self, width: usize) -> Vec<Line<'static>> {
+        let view = self.view_mut();
         let mut pending: Vec<Line<'static>> = Vec::new();
 
         // Remaining lines of an assistant message that just finished.
-        if let Some(text) = self.inline_final_text.take() {
+        if let Some(text) = view.inline_final_text.take() {
             let lines = chat::assistant_lines(&text, width, false);
-            let start = self.live_committed.min(lines.len());
+            let start = view.live_committed.min(lines.len());
             pending.extend(lines[start..].iter().cloned());
             pending.push(Line::from(""));
-            self.live_committed = 0;
+            view.live_committed = 0;
         }
 
         // Transcript cells that have not been written to scrollback yet.
-        while self.printed_cells < self.history.len() {
-            pending.extend(self.history[self.printed_cells].lines(width));
+        while view.printed_cells < view.history.len() {
+            pending.extend(view.history[view.printed_cells].lines(width));
             pending.push(Line::from(""));
-            self.printed_cells += 1;
+            view.printed_cells += 1;
         }
 
         // Stable lines of the in-flight assistant message. The last wrapped
         // line stays in the pane so it can keep growing without reprinting.
-        if let Some(live) = &self.live {
+        if let Some(live) = &view.live {
             let lines = chat::assistant_lines(live, width, false);
             let stable = lines.len().saturating_sub(1);
-            if stable > self.live_committed {
-                pending.extend(lines[self.live_committed..stable].iter().cloned());
-                self.live_committed = stable;
+            if stable > view.live_committed {
+                pending.extend(lines[view.live_committed..stable].iter().cloned());
+                view.live_committed = stable;
             }
         }
 
@@ -499,6 +559,22 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // The `/sessions` picker is modal for navigation keys: ↑↓ move, plain
+        // Enter switches, Esc closes. Everything else (typing, Ctrl+C, ...)
+        // still reaches its normal handler while the menu is open.
+        if self.session_menu.is_some() {
+            match key.code {
+                KeyCode::Up => return self.move_session_selection(-1),
+                KeyCode::Down => return self.move_session_selection(1),
+                KeyCode::Enter if !ctrl && !alt && !shift => return self.confirm_session_switch(),
+                KeyCode::Esc => {
+                    self.session_menu = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         match key.code {
             KeyCode::Char('c') if ctrl => self.on_ctrl_c(),
@@ -602,8 +678,8 @@ impl App {
         Some(rest.to_ascii_lowercase())
     }
 
-    fn command_matches(&self) -> Vec<&'static CommandSpec> {
-        if self.busy || self.command_menu_dismissed {
+    fn command_matches(&self) -> Vec<CommandCandidate> {
+        if self.busy || self.command_menu_dismissed || self.session_menu.is_some() {
             return Vec::new();
         }
         let Some(query) = self.command_query() else {
@@ -670,7 +746,9 @@ impl App {
                 return;
             }
             CommandInput::Invalid(error) => {
-                self.history.push(HistoryCell::Error(error.to_string()));
+                self.view_mut()
+                    .history
+                    .push(HistoryCell::Error(error.to_string()));
                 return;
             }
             CommandInput::Message => {}
@@ -679,22 +757,98 @@ impl App {
         self.submit_user_turn(text);
     }
 
-    /// Dispatch a command to its owning plugin and apply the requested effects.
+    /// Dispatch a command. The built-in session commands are front-end
+    /// behavior and never reach the plugin host; their specs live in the
+    /// shared command table so parsing, the command menu, and `/help` agree.
     fn run_command(&mut self, invocation: Invocation) {
+        match invocation.spec.name {
+            "new" => return self.start_new_session(),
+            "rename" => return self.rename_session(&invocation.args),
+            "sessions" => return self.open_session_menu(),
+            _ => {}
+        }
         let effects = self
             .plugins
             .dispatch_command(&invocation, self.plugin_info());
         self.apply_effects(effects);
     }
 
+    /// `/new`: archive the current session and start a fresh one. The view
+    /// switches immediately; the core confirms with `SessionStarted`, and
+    /// because ops are FIFO the next turn lands on the new conversation.
+    fn start_new_session(&mut self) {
+        self.session.new_session();
+        let index = self.views.len();
+        self.views.push(SessionView::started());
+        self.active_view = index;
+    }
+
+    /// `/sessions` (alias `/resume`): open the picker over the recorded
+    /// sessions, starting from the active one.
+    fn open_session_menu(&mut self) {
+        self.command_menu_dismissed = true;
+        self.session_menu = Some(self.active_view);
+    }
+
+    /// `/rename <name>`: name the current session for the session menu. By
+    /// default a session is named after its first user message; an explicit
+    /// rename overrides that. The op is recorded in the session's rollout so
+    /// the name survives restarts.
+    fn rename_session(&mut self, args: &str) {
+        // The menu renders one row per session, so keep the name single-line.
+        let name = args.replace(['\r', '\n'], " ");
+        self.session.rename_session(self.active_view, &name);
+        let view = self.view_mut();
+        view.name = Some(name.clone());
+        view.history.push(HistoryCell::Notice(format!(
+            "session renamed to \"{name}\""
+        )));
+    }
+
+    fn move_session_selection(&mut self, delta: isize) {
+        let Some(selection) = self.session_menu else {
+            return;
+        };
+        let len = self.views.len();
+        self.session_menu = Some(if delta < 0 {
+            (selection + len - 1) % len
+        } else {
+            (selection + 1) % len
+        });
+    }
+
+    /// Confirm the picker: switching to the already-active session just
+    /// closes the menu.
+    fn confirm_session_switch(&mut self) {
+        let Some(selection) = self.session_menu.take() else {
+            return;
+        };
+        if selection != self.active_view {
+            self.switch_to_session(selection);
+        }
+    }
+
+    /// Switch the front-end to a recorded session and tell the core. Ops are
+    /// FIFO, so the next user turn is answered with the restored context.
+    fn switch_to_session(&mut self, index: usize) {
+        self.active_view = index;
+        let view = self.view_mut();
+        view.follow = true;
+        view.scroll = view.max_scroll;
+        view.history
+            .push(HistoryCell::Notice("Session resumed".to_string()));
+        self.session.switch_session(index);
+    }
+
     /// Start a user turn. Hooks run before the turn is queued so they cannot
     /// race the model request; `busy` is already true, so nested submissions
     /// are ignored.
     fn submit_user_turn(&mut self, text: String) {
-        self.history.push(HistoryCell::User(text.clone()));
-        self.live = Some(String::new());
+        let view = self.view_mut();
+        view.history.push(HistoryCell::User(text.clone()));
+        view.live = Some(String::new());
+        view.follow = true;
         self.busy = true;
-        self.follow = true;
 
         let effects = self.plugins.user_message(&text, self.plugin_info());
         self.apply_effects(effects);
@@ -708,7 +862,7 @@ impl App {
         PluginInfo {
             model: &self.model_label,
             mode: self.mode.label(),
-            transcript_len: self.history.len(),
+            transcript_len: self.view().history.len(),
             plugin_ids: self.plugins.plugin_ids(),
         }
     }
@@ -719,10 +873,10 @@ impl App {
         for effect in effects {
             match effect {
                 PluginEffect::Notice(text) => {
-                    self.history.push(HistoryCell::Notice(text));
+                    self.view_mut().history.push(HistoryCell::Notice(text));
                 }
                 PluginEffect::Error(text) => {
-                    self.history.push(HistoryCell::Error(text));
+                    self.view_mut().history.push(HistoryCell::Error(text));
                 }
                 PluginEffect::ClearConversation => {
                     self.clear_transcript();
@@ -749,45 +903,50 @@ impl App {
         self.last_ctrl_c = None;
     }
 
-    /// Reset the visible transcript and the inline-mode printing bookkeeping.
-    /// `/clear` intentionally keeps the composer's input history.
+    /// Reset the active view's transcript and the inline-mode printing
+    /// bookkeeping. `/clear` intentionally keeps the composer's input history
+    /// and only affects the current session.
     fn clear_transcript(&mut self) {
-        self.history.clear();
-        self.history
+        let view = self.view_mut();
+        view.history.clear();
+        view.history
             .push(HistoryCell::Notice("conversation cleared".to_string()));
-        self.live = None;
-        self.inline_final_text = None;
-        self.live_committed = 0;
-        self.printed_cells = 0;
-        self.follow = true;
-        self.scroll = 0;
-        self.max_scroll = 0;
+        view.live = None;
+        view.inline_final_text = None;
+        view.live_committed = 0;
+        view.printed_cells = 0;
+        view.follow = true;
+        view.scroll = 0;
+        view.max_scroll = 0;
     }
 
     fn handle_agent_event(&mut self, event: crate::core::Event) {
         match event.msg {
             EventMsg::TurnStarted => {
                 self.busy = true;
-                if self.live.is_none() {
-                    self.live = Some(String::new());
+                if self.view().live.is_none() {
+                    self.view_mut().live = Some(String::new());
                 }
             }
             EventMsg::AgentMessageDelta { delta } => {
-                self.live.get_or_insert_with(String::new).push_str(&delta);
+                self.view_mut()
+                    .live
+                    .get_or_insert_with(String::new)
+                    .push_str(&delta);
             }
             EventMsg::AgentMessage { message } => {
-                self.live = Some(message);
+                self.view_mut().live = Some(message);
             }
             EventMsg::TurnAborted { .. } => {
                 self.finalize_live();
-                self.history.push(HistoryCell::Interrupted);
+                self.view_mut().history.push(HistoryCell::Interrupted);
             }
             EventMsg::Error { message } => {
                 self.finalize_live();
-                self.history.push(HistoryCell::Error(message));
+                self.view_mut().history.push(HistoryCell::Error(message));
             }
             EventMsg::TurnComplete => {
-                let message = self.live.clone().unwrap_or_default();
+                let message = self.view().live.clone().unwrap_or_default();
                 self.finalize_live();
                 let effects = self.plugins.turn_complete(&message, self.plugin_info());
                 self.busy = false;
@@ -801,6 +960,13 @@ impl App {
                 let effects = self.plugins.conversation_cleared(self.plugin_info());
                 self.apply_effects(effects);
             }
+            EventMsg::SessionStarted { .. }
+            | EventMsg::SessionSwitched { .. }
+            | EventMsg::SessionRenamed { .. } => {
+                // `/new`, the session picker, and `/rename` already applied
+                // their view changes synchronously; these events confirm the
+                // core (and the rollout file) did the same.
+            }
             EventMsg::ShutdownComplete => {
                 self.quit = true;
             }
@@ -808,17 +974,17 @@ impl App {
     }
 
     fn finalize_live(&mut self) {
-        let Some(text) = self.live.take() else {
+        let Some(text) = self.view_mut().live.take() else {
             return;
         };
         if text.trim().is_empty() {
             return;
         }
         match self.mode {
-            TuiMode::Fullscreen => self.history.push(HistoryCell::Assistant(text)),
+            TuiMode::Fullscreen => self.view_mut().history.push(HistoryCell::Assistant(text)),
             // Inline mode already printed the stable lines. Queue the remainder
             // so it lands in scrollback before any following error/notice cell.
-            TuiMode::Inline => self.inline_final_text = Some(text),
+            TuiMode::Inline => self.view_mut().inline_final_text = Some(text),
         }
     }
 
@@ -876,14 +1042,16 @@ impl App {
     }
 
     fn scroll_up(&mut self, amount: usize) {
-        self.follow = false;
-        self.scroll = self.scroll.saturating_sub(amount).min(self.max_scroll);
+        let view = self.view_mut();
+        view.follow = false;
+        view.scroll = view.scroll.saturating_sub(amount).min(view.max_scroll);
     }
 
     fn scroll_down(&mut self, amount: usize) {
-        self.scroll = (self.scroll + amount).min(self.max_scroll);
-        if self.scroll >= self.max_scroll {
-            self.follow = true;
+        let view = self.view_mut();
+        view.scroll = (view.scroll + amount).min(view.max_scroll);
+        if view.scroll >= view.max_scroll {
+            view.follow = true;
         }
     }
 
@@ -909,10 +1077,8 @@ impl App {
         let composer_height = (desired_rows as u16 + 1).min(max_composer_height);
         let visible_composer_rows = composer_height.saturating_sub(1) as usize;
 
-        let menu = self.command_matches();
-        let menu_height = (menu.len() as u16)
-            .min(MAX_COMMAND_MENU_ROWS as u16)
-            .min(area.height.saturating_sub(composer_height + 2));
+        let menu_height =
+            (self.menu_row_count() as u16).min(area.height.saturating_sub(composer_height + 2));
 
         let chunks = Layout::vertical([
             Constraint::Min(1),
@@ -922,8 +1088,9 @@ impl App {
         ])
         .split(area);
 
+        let menu = self.menu_lines(menu_height as usize);
         self.render_chat(frame, chunks[0], width);
-        self.render_command_menu(frame, chunks[1], &menu);
+        self.render_menu(frame, chunks[1], &menu);
         self.render_composer(
             frame,
             chunks[2],
@@ -938,7 +1105,7 @@ impl App {
         &self,
         frame: &mut Frame,
         live_tail: Option<Line<'static>>,
-        menu: &[&'static CommandSpec],
+        menu: &[Line<'static>],
         menu_height: u16,
         composer_rows: &[String],
     ) {
@@ -962,7 +1129,7 @@ impl App {
         if let Some(line) = live_tail {
             frame.render_widget(Paragraph::new(Text::from(vec![line])), chunks[0]);
         }
-        self.render_command_menu(frame, chunks[1], menu);
+        self.render_menu(frame, chunks[1], menu);
         self.render_composer(
             frame,
             chunks[2],
@@ -973,53 +1140,91 @@ impl App {
         self.render_footer(frame, chunks[3]);
     }
 
-    /// Draw the slash-command candidates directly above the composer. The list
-    /// is windowed around the selection when it is taller than `area`.
-    fn render_command_menu(&self, frame: &mut Frame, area: Rect, matches: &[&'static CommandSpec]) {
-        if matches.is_empty() || area.width == 0 || area.height == 0 {
-            return;
+    /// Rows the menu above the composer needs: the `/sessions` picker when it
+    /// is open, otherwise the slash-command candidates. Empty when neither is
+    /// visible.
+    fn menu_row_count(&self) -> usize {
+        if self.session_menu.is_some() {
+            self.views.len().min(MAX_COMMAND_MENU_ROWS)
+        } else {
+            self.command_matches().len().min(MAX_COMMAND_MENU_ROWS)
+        }
+    }
+
+    /// The menu lines, windowed around the selection so it stays visible
+    /// within `height` rows.
+    fn menu_lines(&self, height: usize) -> Vec<Line<'static>> {
+        if let Some(selected) = self.session_menu {
+            let window = command_menu_window(self.views.len(), selected, height);
+            return window
+                .map(|index| {
+                    session_menu_line(
+                        index,
+                        &self.views[index],
+                        index == self.active_view,
+                        index == selected,
+                    )
+                })
+                .collect();
+        }
+
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            return Vec::new();
         }
         let selected = self.command_selection.min(matches.len() - 1);
-        let window = command_menu_window(matches.len(), selected, area.height as usize);
-        let lines = matches[window.clone()]
+        let window = command_menu_window(matches.len(), selected, height);
+        matches[window.clone()]
             .iter()
             .enumerate()
-            .map(|(offset, spec)| command_menu_line(spec, window.start + offset == selected))
-            .collect::<Vec<_>>();
-        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+            .map(|(offset, candidate)| {
+                command_menu_line(candidate, window.start + offset == selected)
+            })
+            .collect()
+    }
+
+    /// Draw the menu (session picker or command candidates) above the composer.
+    fn render_menu(&self, frame: &mut Frame, area: Rect, lines: &[Line<'static>]) {
+        if lines.is_empty() || area.width == 0 || area.height == 0 {
+            return;
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines.to_vec())), area);
     }
 
     fn render_chat(&mut self, frame: &mut Frame, area: Rect, width: usize) {
         if area.height == 0 {
-            self.max_scroll = 0;
+            self.view_mut().max_scroll = 0;
             return;
         }
+
+        let busy = self.busy;
+        let view = self.view_mut();
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(""));
 
-        for (index, cell) in self.history.iter().enumerate() {
+        for (index, cell) in view.history.iter().enumerate() {
             lines.extend(cell.lines(width));
-            let has_more = index + 1 < self.history.len() || self.live.is_some();
+            let has_more = index + 1 < view.history.len() || view.live.is_some();
             if has_more {
                 lines.push(Line::from(""));
             }
         }
 
-        if let Some(live) = &self.live {
-            lines.extend(chat::assistant_lines(live, width, self.busy));
+        if let Some(live) = &view.live {
+            lines.extend(chat::assistant_lines(live, width, busy));
         }
 
         let height = area.height as usize;
-        self.max_scroll = lines.len().saturating_sub(height);
+        view.max_scroll = lines.len().saturating_sub(height);
 
-        if self.follow {
-            self.scroll = self.max_scroll;
+        if view.follow {
+            view.scroll = view.max_scroll;
         } else {
-            self.scroll = self.scroll.min(self.max_scroll);
+            view.scroll = view.scroll.min(view.max_scroll);
         }
 
-        let start = self.scroll.min(lines.len());
+        let start = view.scroll.min(lines.len());
         let end = (start + height).min(lines.len());
         let visible = lines[start..end].to_vec();
 
@@ -1122,7 +1327,9 @@ impl App {
         } else {
             "ready".to_string()
         };
-        let hints = if self.command_menu_open() {
+        let hints = if self.session_menu.is_some() {
+            "↑↓ select · Enter switch · Esc close"
+        } else if self.command_menu_open() {
             "↑↓ select · Tab complete · Enter run · Esc close"
         } else if self.show_ctrl_c_hint() {
             "Ctrl+C again to quit"
@@ -1180,7 +1387,8 @@ fn command_menu_window(len: usize, selected: usize, height: usize) -> std::ops::
 }
 
 /// One command row: marker, aligned command name, summary, and aliases.
-fn command_menu_line(spec: &'static CommandSpec, selected: bool) -> Line<'static> {
+fn command_menu_line(candidate: &CommandCandidate, selected: bool) -> Line<'static> {
+    let spec = candidate.spec;
     let marker = if selected { "▸ " } else { "  " };
     let (marker_style, name_style, text_style) = if selected {
         (
@@ -1202,14 +1410,78 @@ fn command_menu_line(spec: &'static CommandSpec, selected: bool) -> Line<'static
 
     let mut spans = vec![
         Span::styled(marker, marker_style),
-        Span::styled(format!("/{:<8}", spec.name), name_style),
+        // Fixed wide name column (headroom for future longer commands) so the
+        // summary always keeps its own column and a separating space.
+        Span::styled(format!("/{:<24}", candidate.name), name_style),
         Span::styled(spec.summary, text_style),
     ];
-    let alias_hint = spec.alias_hint();
-    if !alias_hint.is_empty() {
+    let hint = if candidate.is_alias() {
+        format!(" (alias of /{})", spec.name)
+    } else {
+        spec.alias_hint()
+    };
+    if !hint.is_empty() {
         spans.push(Span::styled(
-            alias_hint,
+            hint,
             Style::default().fg(theme::DIM).add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// One row of the `/sessions` picker: marker, 1-based session number, a
+/// first-message preview, the cell count, and a marker on the active session.
+/// One row of the `/sessions` picker: marker, 1-based session number, the
+/// session name (the `/rename` name, else its first user message), the cell
+/// count, and a marker on the active session.
+fn session_menu_line(
+    index: usize,
+    view: &SessionView,
+    current: bool,
+    selected: bool,
+) -> Line<'static> {
+    let marker = if selected { "▸ " } else { "  " };
+    let (marker_style, number_style, text_style) = if selected {
+        (
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    } else {
+        (
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+        )
+    };
+
+    let mut spans = vec![
+        Span::styled(marker, marker_style),
+        Span::styled(format!("{} · ", index + 1), number_style),
+    ];
+    let name = view
+        .display_name()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("session {}", index + 1));
+    spans.push(Span::styled(
+        format!("{} · ", truncated(&name, 32)),
+        text_style,
+    ));
+    let cells = view.history.len();
+    spans.push(Span::styled(
+        format!("{cells} cell{}", if cells == 1 { "" } else { "s" }),
+        Style::default().fg(theme::DIM),
+    ));
+    if current {
+        spans.push(Span::styled(
+            " · current",
+            Style::default()
+                .fg(theme::DIM)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     Line::from(spans)
@@ -1334,6 +1606,8 @@ mod tests {
             "test-model".to_string(),
             TuiMode::Fullscreen,
             PluginHost::builtin().expect("builtin plugins"),
+            vec![SessionView::initial("test-model", TuiMode::Fullscreen)],
+            0,
         )
     }
 
@@ -1354,18 +1628,88 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn build_views_restores_sessions_and_banners_the_active_one() {
+        use crate::core::Message;
+
+        let loaded_session =
+            |id: &str, messages: Vec<Message>, name: Option<String>| LoadedSession {
+                meta: crate::core::SessionMeta {
+                    version: 1,
+                    id: id.to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    cwd: "/tmp/demo".to_string(),
+                    system_prompt: "be brief".to_string(),
+                    name: None,
+                },
+                path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+                messages,
+                name,
+            };
+
+        let loaded = vec![
+            loaded_session(
+                "one",
+                vec![Message::user("hello"), Message::assistant("hi")],
+                None,
+            ),
+            loaded_session("named", vec![], Some("my chat".to_string())),
+        ];
+        let (views, active) = build_views("test-model", TuiMode::Fullscreen, &loaded, false);
+        assert_eq!(views.len(), 2);
+        assert_eq!(active, 1);
+        // Messages replay into transcript cells, already counted as printed.
+        assert_eq!(views[0].history.len(), 2);
+        assert!(matches!(&views[0].history[0], HistoryCell::User(text) if text == "hello"));
+        assert_eq!(views[0].printed_cells, 2);
+        assert_eq!(views[1].name.as_deref(), Some("my chat"));
+        // The active view carries this run's banner plus the resumed notice.
+        assert!(
+            matches!(&views[1].history[0], HistoryCell::Notice(text) if text.contains("codest"))
+        );
+        assert!(matches!(
+            &views[1].history.last(),
+            Some(HistoryCell::Notice(text)) if text.contains("resumed 2 saved sessions")
+        ));
+
+        // A plain startup restores the saved sessions and opens a fresh one;
+        // the fresh view points at the list instead of claiming a resume.
+        let (views, active) = build_views("test-model", TuiMode::Fullscreen, &loaded, true);
+        assert_eq!(views.len(), 3);
+        assert_eq!(active, 2);
+        assert!(matches!(
+            &views[2].history.last(),
+            Some(HistoryCell::Notice(text))
+                if text.contains("2 saved sessions available via /sessions")
+        ));
+
+        // Nothing restored anywhere falls back to the fresh initial view.
+        let (views, active) = build_views("test-model", TuiMode::Fullscreen, &[], true);
+        assert_eq!(views.len(), 1);
+        assert_eq!(active, 0);
+        assert!(
+            matches!(&views[0].history[0], HistoryCell::Notice(text) if text.contains("codest"))
+        );
+    }
+
     #[tokio::test]
     async fn command_menu_renders_above_the_composer() {
         let mut app = test_app();
         app.composer.set_text("/".to_string());
 
-        let lines = render_lines(&mut app, 80, 20);
+        // Wide enough that the alias hints are not clipped.
+        let lines = render_lines(&mut app, 110, 20);
         let rendered = lines.join("\n");
+        // Eleven names (seven commands plus four aliases) share a six-row
+        // window; the first page shows /help with its aliases and the first
+        // commands, aliases labeled with the command they point at.
         assert!(rendered.contains("▸ /help"), "{rendered}");
-        assert!(rendered.contains("/help"), "{rendered}");
+        assert!(rendered.contains("/h "), "{rendered}");
         assert!(rendered.contains("/clear"), "{rendered}");
-        assert!(rendered.contains("/quit"), "{rendered}");
+        assert!(rendered.contains("(alias of /help)"), "{rendered}");
         assert!(rendered.contains("↑↓ select"), "{rendered}");
+        assert!(!rendered.contains("/reset"), "{rendered}");
+        assert!(!rendered.contains("/sessions "), "{rendered}");
 
         let menu_row = lines
             .iter()
@@ -1376,6 +1720,17 @@ mod tests {
             .position(|line| line.contains("›"))
             .expect("composer row");
         assert!(menu_row < composer_row, "{rendered}");
+
+        // Moving the selection pages the window onto the tail; the longest
+        // command name still gets a separating space before its summary.
+        for _ in 0..10 {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let lines = render_lines(&mut app, 110, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("▸ /resume"), "{rendered}");
+        assert!(rendered.contains("/sessions "), "{rendered}");
+        assert!(rendered.contains("(alias of /sessions)"), "{rendered}");
     }
 
     #[tokio::test]
@@ -1386,7 +1741,7 @@ mod tests {
 
         assert!(!app.busy);
         assert!(app.composer.is_empty());
-        match app.history.last() {
+        match app.view().history.last() {
             Some(HistoryCell::Notice(text)) => {
                 assert!(text.contains("/clear"));
                 assert!(text.contains("/quit"));
@@ -1402,7 +1757,7 @@ mod tests {
         app.try_submit();
 
         assert!(!app.busy);
-        match app.history.last() {
+        match app.view().history.last() {
             Some(HistoryCell::Error(text)) => assert!(text.contains("unknown command")),
             other => panic!("expected an error cell, got {other:?}"),
         }
@@ -1415,25 +1770,29 @@ mod tests {
         app.try_submit();
 
         assert!(app.busy);
-        assert!(matches!(app.history.last(), Some(HistoryCell::User(text)) if text == "hello"));
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::User(text)) if text == "hello"
+        ));
     }
 
     #[tokio::test]
     async fn clear_resets_the_transcript_immediately() {
         let mut app = test_app();
-        app.history
+        app.view_mut()
+            .history
             .push(HistoryCell::Assistant("old reply".to_string()));
 
         app.composer.set_text("/clear".to_string());
         app.try_submit();
 
-        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.view().history.len(), 1);
         assert!(matches!(
-            app.history.last(),
+            app.view().history.last(),
             Some(HistoryCell::Notice(text)) if text == "conversation cleared"
         ));
-        assert_eq!(app.printed_cells, 0);
-        assert!(app.follow);
+        assert_eq!(app.view().printed_cells, 0);
+        assert!(app.view().follow);
     }
 
     #[tokio::test]
@@ -1446,7 +1805,10 @@ mod tests {
         ]);
 
         assert_eq!(app.composer.text(), "/help");
-        assert!(matches!(app.history.last(), Some(HistoryCell::Notice(text)) if text == "hello"));
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Notice(text)) if text == "hello"
+        ));
         assert!(app.quit);
     }
 
@@ -1455,13 +1817,16 @@ mod tests {
         let mut app = test_app();
         app.apply_effects(vec![PluginEffect::SubmitUserTurn("hello".to_string())]);
         assert!(app.busy);
-        assert!(matches!(app.history.last(), Some(HistoryCell::User(text)) if text == "hello"));
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::User(text)) if text == "hello"
+        ));
 
         let mut app = test_app();
         app.busy = true;
-        let before = app.history.len();
+        let before = app.view().history.len();
         app.apply_effects(vec![PluginEffect::SubmitUserTurn("ignored".to_string())]);
-        assert_eq!(app.history.len(), before);
+        assert_eq!(app.view().history.len(), before);
     }
 
     #[tokio::test]
@@ -1471,7 +1836,7 @@ mod tests {
         app.try_submit();
 
         assert!(!app.busy);
-        match app.history.last() {
+        match app.view().history.last() {
             Some(HistoryCell::Notice(text)) => {
                 assert!(text.contains("backend: test-model"), "{text}");
                 assert!(
@@ -1488,17 +1853,33 @@ mod tests {
         let mut app = test_app();
 
         app.composer.set_text("/".to_string());
-        assert_eq!(app.command_matches().len(), 4);
+        assert_eq!(
+            app.command_matches().len(),
+            11,
+            "seven commands plus four aliases"
+        );
 
         app.composer.set_text("/cl".to_string());
         let matches = app.command_matches();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].name, "clear");
 
-        app.composer.set_text("/re".to_string());
+        app.composer.set_text("/se".to_string());
         let matches = app.command_matches();
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].name, "clear", "aliases should match too");
+        assert_eq!(matches[0].name, "sessions");
+
+        app.composer.set_text("/re".to_string());
+        let matches = app.command_matches();
+        assert_eq!(
+            matches.len(),
+            2,
+            "`/re` offers the /rename and /resume aliases"
+        );
+        // Aliases are candidates in their own right and complete to themselves.
+        assert_eq!(matches[0].name, "rename");
+        assert_eq!(matches[1].name, "resume");
+        assert_eq!(matches[1].spec.name, "sessions");
 
         app.composer.set_text("/help me".to_string());
         assert!(app.command_matches().is_empty());
@@ -1516,13 +1897,15 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.command_selection, 1);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.composer.text(), "/clear");
+        // The candidate under the selection is `/help`'s alias, and it
+        // completes to the alias itself.
+        assert_eq!(app.composer.text(), "/h");
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 3);
+        assert_eq!(app.command_selection, 10);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 2);
+        assert_eq!(app.command_selection, 9);
     }
 
     #[tokio::test]
@@ -1534,7 +1917,7 @@ mod tests {
 
         assert!(!app.busy);
         assert!(app.composer.is_empty());
-        match app.history.last() {
+        match app.view().history.last() {
             Some(HistoryCell::Notice(text)) => assert!(text.contains("/clear")),
             other => panic!("expected the help notice, got {other:?}"),
         }
@@ -1551,6 +1934,141 @@ mod tests {
         assert!(!app.command_menu_open());
         assert_eq!(app.composer.text(), "/");
         assert!(!app.quit);
+    }
+
+    #[tokio::test]
+    async fn new_session_archives_the_current_transcript() {
+        let mut app = test_app();
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("earlier chat".to_string()));
+
+        app.composer.set_text("/new".to_string());
+        app.try_submit();
+
+        assert_eq!(app.views.len(), 2);
+        assert_eq!(app.active_view, 1);
+        assert!(!app.busy);
+        assert!(
+            matches!(app.view().history.first(), Some(HistoryCell::Notice(text)) if text == "New session started"),
+            "{:?}",
+            app.view().history
+        );
+        assert!(matches!(
+            app.views[0].history.last(),
+            Some(HistoryCell::User(text)) if text == "earlier chat"
+        ));
+
+        // `/resume` opens the same picker under its alias.
+        app.composer.set_text("/resume".to_string());
+        app.try_submit();
+        assert_eq!(app.session_menu, Some(1));
+    }
+
+    #[tokio::test]
+    async fn session_menu_switches_back_and_forth() {
+        let mut app = test_app();
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("old talk".to_string()));
+        app.composer.set_text("/new".to_string());
+        app.try_submit();
+
+        app.composer.set_text("/sessions".to_string());
+        app.try_submit();
+        assert_eq!(app.session_menu, Some(1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.session_menu, Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.session_menu.is_none());
+        assert_eq!(app.active_view, 0);
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Notice(text)) if text == "Session resumed"
+        ));
+
+        // Confirming on the already-active session only closes the menu.
+        app.composer.set_text("/sessions".to_string());
+        app.try_submit();
+        assert_eq!(app.session_menu, Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.session_menu.is_none());
+        assert_eq!(app.active_view, 0);
+        let resumed = app
+            .view()
+            .history
+            .iter()
+            .filter(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("resumed")))
+            .count();
+        assert_eq!(resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn session_commands_are_noops_while_busy() {
+        let mut app = test_app();
+        app.busy = true;
+
+        app.composer.set_text("/new".to_string());
+        app.try_submit();
+        assert_eq!(app.views.len(), 1);
+
+        app.composer.set_text("/sessions".to_string());
+        app.try_submit();
+        assert!(app.session_menu.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_menu_renders_rows_with_the_current_marker() {
+        let mut app = test_app();
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("old talk".to_string()));
+        app.composer.set_text("/new".to_string());
+        app.try_submit();
+        app.composer.set_text("/sessions".to_string());
+        app.try_submit();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        let lines = render_lines(&mut app, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("▸ 1"), "{rendered}");
+        assert!(rendered.contains("old talk"), "{rendered}");
+        assert!(rendered.contains("current"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn rename_names_the_session_in_the_menu() {
+        let mut app = test_app();
+        app.composer.set_text("/rename my chat".to_string());
+        app.try_submit();
+
+        assert_eq!(app.view().name.as_deref(), Some("my chat"));
+        match app.view().history.last() {
+            Some(HistoryCell::Notice(text)) => assert!(text.contains("my chat")),
+            other => panic!("expected a rename notice, got {other:?}"),
+        }
+
+        // The menu shows the explicit name for session 1 and the index-based
+        // fallback for a session without a name or user message.
+        app.composer.set_text("/new".to_string());
+        app.try_submit();
+        app.composer.set_text("/sessions".to_string());
+        app.try_submit();
+        let lines = render_lines(&mut app, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("my chat"), "{rendered}");
+        assert!(rendered.contains("session 2"), "{rendered}");
+
+        // `/rename` needs a name; the failed attempt changes nothing.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.composer.set_text("/rename".to_string());
+        app.try_submit();
+        match app.view().history.last() {
+            Some(HistoryCell::Error(text)) => assert!(text.contains("needs arguments")),
+            other => panic!("expected an error cell, got {other:?}"),
+        }
+        assert_eq!(app.view().name.as_deref(), None);
     }
 
     #[test]

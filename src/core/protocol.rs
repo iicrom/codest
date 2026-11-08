@@ -66,6 +66,13 @@ pub enum Op {
     Interrupt,
     /// Stop the agent worker.
     Shutdown,
+    /// Archive the active conversation and start a fresh session. Sessions are
+    /// indexed by creation order and are never removed.
+    NewSession,
+    /// Make the session at `session` (creation-order index) active again.
+    SwitchSession { session: usize },
+    /// Name the session at `session` (see `/rename`); recorded in its rollout.
+    RenameSession { session: usize, name: String },
 }
 
 /// Events emitted by the agent.
@@ -85,6 +92,12 @@ pub enum EventMsg {
     TurnComplete,
     /// The conversation history was dropped (system prompt retained).
     ConversationCleared,
+    /// A fresh session was created by `Op::NewSession` and is now active.
+    SessionStarted { session: usize },
+    /// The active session was switched to the given creation-order index.
+    SessionSwitched { session: usize },
+    /// The session at `session` was named via `Op::RenameSession`.
+    SessionRenamed { session: usize, name: String },
     /// The worker has stopped.
     ShutdownComplete,
 }

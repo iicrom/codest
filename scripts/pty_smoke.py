@@ -30,6 +30,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 
@@ -205,6 +206,8 @@ def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
 
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
+    # Keep smoke-test sessions out of the user's real ~/.codest.
+    env["CODEST_HOME"] = tempfile.mkdtemp(prefix="codest-pty-")
     process = subprocess.Popen(
         [
             binary,

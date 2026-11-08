@@ -8,6 +8,7 @@
 pub mod app;
 pub mod chat;
 pub mod composer;
+pub mod session;
 pub mod theme;
 pub mod wrap;
 
@@ -37,4 +38,17 @@ impl TuiMode {
             TuiMode::Inline => "inline",
         }
     }
+}
+
+/// How the TUI picks its starting sessions from the workspace's saved
+/// rollouts under `~/.codest/sessions/<workspace-hash>/`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RestoreMode {
+    /// Start a fresh session; saved ones stay on disk until requested.
+    #[default]
+    None,
+    /// Continue the most recent saved session (`--continue`).
+    Continue,
+    /// Load every saved session and open the picker at startup (`--resume`).
+    Picker,
 }

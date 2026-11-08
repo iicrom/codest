@@ -5,6 +5,7 @@
 //! first-pass chat agent, so the history is intentionally just a `Vec<Message>`.
 
 use crate::core::protocol::Message;
+use crate::core::protocol::Role;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "You are codest, a concise and helpful terminal assistant. Answer in the user's language.";
@@ -38,6 +39,15 @@ impl Conversation {
 
     pub fn push_assistant(&mut self, text: impl Into<String>) {
         self.messages.push(Message::assistant(text));
+    }
+
+    /// Append a pre-built message, keeping the system prompt untouched.
+    /// Used when replaying a restored session's rollout.
+    pub fn push_message(&mut self, message: Message) {
+        match message.role {
+            Role::System => {}
+            Role::User | Role::Assistant => self.messages.push(message),
+        }
     }
 
     /// Drop every message, keeping the system prompt.

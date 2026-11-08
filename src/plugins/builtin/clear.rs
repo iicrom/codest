@@ -8,7 +8,7 @@ pub struct Clear;
 
 static COMMANDS: [CommandSpec; 1] = [CommandSpec::new(
     "clear",
-    &["reset"],
+    &[],
     "/clear",
     "clear the conversation context and transcript",
     ArgsPolicy::None,

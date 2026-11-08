@@ -13,6 +13,7 @@ use clap::Parser;
 
 use crate::core::ModelClient;
 use crate::core::openai_compat::OpenAiCompatClient;
+use crate::tui::RestoreMode;
 use crate::tui::TuiMode;
 
 #[derive(Parser, Debug)]
@@ -34,6 +35,15 @@ struct Args {
     #[arg(long)]
     system: Option<String>,
 
+    /// Continue the most recent saved session of this workspace.
+    #[arg(long, short = 'c', conflicts_with = "resume")]
+    continue_: bool,
+
+    /// Load every saved session of this workspace and open the session picker
+    /// at startup.
+    #[arg(long)]
+    resume: bool,
+
     /// Terminal UI mode: fullscreen (alternate screen) or inline (scrollback).
     #[arg(long, value_enum, env = "CST_TUI_MODE", default_value = "fullscreen")]
     tui_mode: TuiMode,
@@ -48,7 +58,14 @@ pub async fn run(program: &'static str) -> anyhow::Result<()> {
     let matches = command.get_matches();
     let args = Args::from_arg_matches(&matches)?;
     let client = build_client(&args)?;
-    crate::tui::run(client, args.system, args.tui_mode).await
+    let restore = if args.continue_ {
+        RestoreMode::Continue
+    } else if args.resume {
+        RestoreMode::Picker
+    } else {
+        RestoreMode::None
+    };
+    crate::tui::run(client, args.system, args.tui_mode, restore).await
 }
 
 fn build_client(args: &Args) -> anyhow::Result<Arc<dyn ModelClient>> {

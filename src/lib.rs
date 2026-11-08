@@ -11,7 +11,9 @@
 //!   lifecycle hooks, and data-only effects.
 //! * [`tui`] owns the terminal event loop, chat transcript, and composer. It
 //!   talks to the core exclusively through [`core::AgentSession`] and applies
-//!   plugin effects itself.
+//!   plugin effects itself. Multi-session support (`/new`, `/sessions`) is a
+//!   built-in part of this layer: the core worker records every conversation,
+//!   and the TUI keeps one rendered view per session.
 //!
 //! Keeping the boundary sharp is the whole point of this extraction: the core
 //! can be driven by any front-end, and the TUI can be tested without a model.

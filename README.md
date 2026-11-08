@@ -49,6 +49,13 @@ cargo run
 cargo run -- --api-key sk-... --base-url https://api.openai.com/v1 --model gpt-4o-mini
 ```
 
+恢复上次在这个工作区的对话：
+
+```bash
+cargo run -- --continue    # 直接继续最近一次保存的会话
+cargo run -- --resume      # 打开会话选择菜单（见"多会话"）
+```
+
 > `CST_API_KEY` / `CST_BASE_URL` / `CST_MODEL` / `CST_TUI_MODE` 中的 `CST` 就是 codest 的简写，保持不变。
 >
 > 没有 API key 时 codest 会直接报错并提示如何启动本地测试服务，不再回退到任何内嵌 mock。
@@ -114,17 +121,52 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 | 指令 | 别名 | 行为 |
 | --- | --- | --- |
 | `/help` | `/h`、`/?` | 显示指令列表（包含所有插件贡献的指令） |
-| `/clear` | `/reset` | 清空会话上下文和屏幕上的 transcript |
+| `/clear` | — | 清空会话上下文和屏幕上的 transcript |
 | `/quit` | `/exit` | 退出 codest |
 | `/status` | — | 显示 backend、模式、transcript 大小和已加载插件 |
+| `/new` | — | 归档当前对话，开启一个新的空会话 |
+| `/rename <name>` | — | 重命名当前会话；默认名取该会话第一句用户输入 |
+| `/sessions` | `/resume` | 打开会话列表菜单，切换并继续以前的会话 |
 
 输入 `/` 就会在输入框上方弹出候选列表，继续输入会按指令名或别名前缀实时过滤（不区分大小写）：
 
+- 指令的别名和主名一样是独立候选：别名行标注 `(alias of /主名)`，`Tab`/`Enter` 直接补全为别名本身；
 - `↑` / `↓` 在候选之间循环选择，`Tab` 补全选中的指令；
 - `Enter` 先补全再直接执行选中的指令，`Esc` 关闭候选但不影响已输入的内容；
 - 候选只在输入还是“指令名”阶段出现；一旦输入空格或换行，就按普通文本处理。
 
 只有整条输入的第一个非空白字符是 `/` 时才会被当作指令，其他文本照常发给模型。未知指令、多余参数或缺少参数会显示错误提示，不会发给模型。
+
+## 多会话
+
+codest 支持多轮独立对话：会话按创建顺序编号（从 1 开始）且不会被删除，模型上下文和屏幕 transcript 都按会话各自记录。
+
+| 指令 | 行为 |
+| --- | --- |
+| `/new` | 归档当前会话，开启一个新的空会话并切换过去 |
+| `/rename <name>` | 重命名当前会话，用于会话列表展示 |
+| `/sessions`（`/resume`） | 打开会话列表菜单：`↑`/`↓` 选择、`Enter` 切换并继续、`Esc` 关闭 |
+
+- 会话默认以该会话的第一句用户输入命名（参考 dsh），`/rename` 可以随时改名。
+- 同一时刻只有一个会话在生成；生成中的输入会被忽略，`/new` 与 `/sessions` 都要在回合结束后使用（必要时先 `Esc` 中断）。
+- 切换会恢复该会话的模型上下文，后续对话继续在原历史上进行；`/clear` 只影响当前会话。
+- 会话列表每行显示会话名、记录条数，当前会话标有 `current`。
+- `/new`、`/rename` 与 `/sessions` 是本体常驻命令，不属于插件系统。
+
+### 会话持久化（rollout）
+
+每次对话都按 codex 的 rollout 方案蒸馏后落盘：工作区级隔离，跨次启动可恢复。
+
+- 存储在 `~/.codest/sessions/<工作区哈希>/rollout-<id>.jsonl`（根目录可用 `CODEST_HOME` 覆盖，镜像 codex 的 `CODEX_HOME`；工作区哈希 = 启动目录的 FNV-1a）；
+- 文件是 append-only JSONL：首行是会话元数据（id、创建时间、工作区、系统提示词），之后用户消息、完成的助手消息、`/clear`、`/rename` 各记一行——回放这些行即可精确重建当时的对话；
+- 还没有输入过的空会话不写 rollout 文件：文件在该会话收到第一条用户消息时才创建，随手开一下 `/new` 不会在磁盘上留垃圾；
+- 写入是尽力而为：落盘失败只影响持久化，不影响对话（会话留在内存）；
+- 每次启动都会加载本工作区已保存的会话，`/sessions` 在任何启动方式下都是同一份列表。默认激活一个新会话；也可以显式指定恢复方式：
+
+```bash
+codest --continue        # 直接激活最近一次保存的会话（-c 等价）
+codest --resume          # 同 --continue，并在启动时打开会话选择菜单
+```
 
 ## 插件（编译期静态）
 
@@ -149,7 +191,9 @@ codest 的指令和生命周期扩展都来自**编译期链接**的插件，不
 | codex 模块 | codest 对应模块 | 说明 |
 | --- | --- | --- |
 | `codex-rs/protocol`（SQ/EQ） | `src/core/protocol.rs` | `Op` / `Event` 消息总线，UI 不直接调用模型 |
-| `codex-rs/core` 的会话循环 | `src/core/session.rs` | worker 持有会话历史与取消 token，产出事件 |
+| `codex-rs/core` 的会话循环 | `src/core/session.rs` | worker 持有全部会话历史与取消 token，产出事件 |
+| codex 的多会话管理 | `src/core/sessions.rs` + `src/tui/session.rs` | 会话命令 spec 与每会话视图状态（`/new`、`/sessions`） |
+| codex 的 rollout 持久化 | `src/core/rollout.rs` | 会话 JSONL 落盘与回放（`~/.codest/sessions/<工作区哈希>/`） |
 | `codex-rs/core/src/client.rs` | `src/core/model.rs` | 流式模型客户端抽象 |
 | codex 的 Responses client | `src/core/openai_compat.rs` | 最小 OpenAI 兼容 Chat Completions + SSE 解析 |
 | codex 的 fake/OSS provider | `scripts/openai_test_server.py` | 本地 OpenAI 兼容测试服务（crate 内不再内置 mock 后端） |
@@ -179,11 +223,13 @@ codest/
     ├── core/
     │   ├── protocol.rs      # Message / Op / Event
     │   ├── commands.rs      # 命令表 / 解析（指令由插件提供）
+    │   ├── sessions.rs      # 内置 /new /rename /sessions 命令 spec（多会话）
     │   ├── conversation.rs  # 线性会话历史
     │   ├── model.rs         # ModelClient trait + 错误类型
     │   ├── openai_compat.rs # HTTP + SSE 流式客户端
+    │   ├── rollout.rs       # 会话持久化（JSONL rollout 落盘 / 回放）
     │   ├── test_model.rs    # 仅 cargo test 编译的进程内假模型
-    │   └── session.rs       # agent worker + AgentSession
+    │   └── session.rs       # agent worker（持有全部会话）+ AgentSession
     ├── plugins/
     │   ├── mod.rs           # Plugin trait / PluginHost / effects
     │   └── builtin/
@@ -194,6 +240,7 @@ codest/
     │       └── status.rs    # /status
     └── tui/
         ├── app.rs           # 事件循环 / fullscreen & inline 渲染
+        ├── session.rs       # 每会话视图状态（SessionView）
         ├── chat.rs          # 历史单元格
         ├── composer.rs      # 输入编辑器
         ├── theme.rs         # 颜色
@@ -205,7 +252,7 @@ codest/
 - 只支持纯文本对话，没有工具调用、文件读写、审批、MCP、图片。
 - 插件是编译期静态链接的：新增/修改插件需要改代码并重新编译，不支持运行时加载 `.so` 或脚本插件；插件与主程序同权限，没有沙箱隔离。
 - 插件钩子在 TUI 线程同步执行，不能做阻塞 I/O。
-- 没有会话持久化；退出即丢失。
+- 会话按 rollout 保存在 `~/.codest/sessions/<工作区哈希>/`（`CODEST_HOME` 可覆盖），跨次启动可用 `--continue` / `--resume` 恢复；没有并发写锁（同时开多个 codest 写同一工作区没有保护）、没有归档/删除/搜索，也没有跨工作区的会话迁移。
 - 没有网络重试、代理、认证刷新；HTTP 客户端只实现一次请求 + SSE 增量解析。
 - 没有内嵌离线模型：必须配置 API key，或先启动 `scripts/openai_test_server.py` 并把 `--base-url` 指过去。
 - `fullscreen` 只有滚轮滚动，应用内鼠标选区/复制尚未实现；选区用终端原生能力（通常按住 `Shift` 拖拽）。

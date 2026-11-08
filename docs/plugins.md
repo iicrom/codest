@@ -113,6 +113,11 @@ pub fn new(plugins: &'static [&'static dyn Plugin]) -> Result<Self, PluginHostEr
 校验失败是启动错误，不是运行时警告——静态注册的问题应该在测试/启动时立刻暴露。
 命令名规则：小写 ASCII 字母、数字、`-`、`_`、`?`（`?` 用于 `/help` 的 `/?` 别名）。
 
+`PluginHost::builtin()` 在插件命令之外，还会把 `core::sessions::SESSION_COMMANDS`
+（内置的 `/new`、`/rename`、`/sessions`，即多会话支持）合并进命令表，因此解析、
+候选菜单和 `/help` 对它们一视同仁。这些命令不属于任何插件：它们是前端的常驻
+行为，由 TUI 在 dispatch 给插件之前按命令名拦截处理。
+
 ## 5. 扩展契约
 
 ### 5.1 `Plugin` trait
@@ -294,7 +299,7 @@ ConversationCleared
 | 插件 | 命令 | 作用 |
 | --- | --- | --- |
 | `help` | `/help` (`/h`, `/?`) | 渲染 `CommandTable` 的帮助文本 |
-| `clear` | `/clear` (`/reset`) | 请求清空 transcript 和上下文 |
+| `clear` | `/clear` | 请求清空 transcript 和上下文 |
 | `quit` | `/quit` (`/exit`) | 请求退出 |
 | `status` | `/status` | 展示 backend、模式、transcript 大小、命令数、插件列表 |
 
