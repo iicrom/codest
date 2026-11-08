@@ -34,7 +34,7 @@ cargo test                    # 单元测试离线运行，使用进程内假模
 python3 scripts/pty_smoke.py  # 伪终端冒烟测试：自动拉起测试服务，fullscreen / inline 都会跑
 ```
 
-连接一个 OpenAI 兼容的流式接口（`CST_BASE_URL`/`CST_API_KEY` 需成对提供，只给其一时 codest 会在发送时提示补全）：
+连接一个 OpenAI 兼容的流式接口（`CST_BASE_URL`/`CST_API_KEY` 需成对提供，只给其一时 codest 会在发送时提示补全）。无论是否指定 `--model`，codest 都会对该端点做模型发现（尽力而为）：`/model` 菜单补全端点的模型列表，窗口长度等元数据（footer 的上下文显示）也从发现结果带入：
 
 ```bash
 export CST_API_KEY=sk-...
@@ -66,8 +66,8 @@ cargo run -- --resume      # 打开会话选择菜单（见"多会话"）
 
 `scripts/openai_test_server.py` 是只依赖 Python 标准库的简易 OpenAI Chat Completions 服务端，用于在没有 key、没有外网的情况下端到端验证 TUI 和 SSE 客户端：
 
-- `POST /chat/completions` 支持 `"stream": true` 的 SSE 增量输出，也支持普通 JSON 响应；
-- `GET /models` 返回 OpenAI 形状的模型目录（供 `fetch_models` 发现）；
+- `POST /chat/completions` 支持 `"stream": true` 的 SSE 增量输出，也支持普通 JSON 响应；流式响应末尾附带 usage（`prompt_tokens: 42 / completion_tokens: 7`），供 footer 与 rollout 的用量链路验证；
+- `GET /models` 返回 OpenAI 形状的模型目录（供 `fetch_models` 发现），`test-model` 带 `context_length`（OpenRouter 拼写）、`second-model` 带 `context_window`，两种字段拼写都覆盖；
 - `GET /health` 返回 `{"status":"ok"}`；
 - 不校验 API key，回复内容为最后一条用户消息，便于确认流式渲染；
 - `--delay` 控制 token 间隔，`--port 0` 使用随机端口并打印实际地址。
@@ -332,7 +332,7 @@ codest/
 - 会话按 rollout 保存在 `~/.codest/sessions/<工作区哈希>/`（`CODEST_HOME` 可覆盖），跨次启动可用 `--continue` / `--resume` 恢复；没有并发写锁（同时开多个 codest 写同一工作区没有保护）、没有归档/删除/搜索，也没有跨工作区的会话迁移。
 - 没有网络重试、代理、认证刷新；HTTP 客户端只实现一次请求 + SSE 增量解析。API key 支持 `$VAR` 模板引用环境变量，但没有 OAuth/凭据存储，token 轮换需在协议工厂内部自行解决。
 - 没有外网也能玩：`protocol = "test"` 提供进程内 echo 后端；真实端点仍需 API key 或先启动 `scripts/openai_test_server.py`。
-- 思考内容（`reasoning_content`）以暗色渲染在回答上方，`/thinking` 随时折叠/展开；`/effort` 以 `reasoning_effort` 字段随请求发送（等级表取模型声明的 `reasoning`，未声明时用内置默认集）。模型元数据可带 `default_level`（providers.toml 声明或 models API 返回均可）：选中该模型时自动作为初始推理等级，footer 常显当前值。usage（`TurnUsage`）已入事件总线但 TUI 暂不展示。思考内容仅用于显示：不进模型上下文、不写 rollout。
+- 思考内容（`reasoning_content`）以暗色渲染在回答上方，`/thinking` 随时折叠/展开；`/effort` 以 `reasoning_effort` 字段随请求发送（等级表取模型声明的 `reasoning`，未声明时用内置默认集）。模型元数据可带 `default_level`（providers.toml 声明或 models API 返回均可）：选中该模型时自动作为初始推理等级，footer 常显当前值。footer 常显上下文窗口与用量：有 `context_window` 时总长始终显示（测量前 `—/100.0k`，测量后 `13.0k/100.0k (6%)`，占用 ≥90% 变强调色；无窗口只显示 `13.0k tok`），`/model` 菜单每行列出各自的窗口长度，`/status` 输出用量、窗口与会话累计；models API 的 `context_length`/`context_window` 字段会自动填充 `ModelInfo::context_window`。每轮完成的模型与 usage 以 `turn_usage` 变体写入 rollout（后端未报 usage 的轮次不记录），`/clear` 一并重置；`--continue`/`--resume` 回放为初始统计（含最后使用的模型选择：provider 已不在配置中时保持当前选择并提示），恢复的会话立即显示上下文占用，会话间切换同样恢复该会话的模型（已在位时不重复切换）。思考内容仅用于显示：不进模型上下文、不写 rollout。
 - 没有配置任何 provider 时以空路由启动：发消息得到添加指引（内容保留在输入框），不会发出请求。
 - `fullscreen` 只有滚轮滚动，应用内鼠标选区/复制尚未实现；选区用终端原生能力（通常按住 `Shift` 拖拽）。
 - `inline` 下已经写进 scrollback 的行不会随窗口宽度重新换行。
@@ -342,7 +342,7 @@ codest/
 
 1. 在 `Op` 中加入工具调用与审批事件，向 codex 的 SQ/EQ 靠拢，并让插件可以注册工具。
 2. 为 `Conversation` 增加 token 预算与压缩（消费 `ModelInfo::context_window` 与 `TurnUsage`）。
-3. `/status` 的 token 统计（`TurnUsage` 已入事件总线）与 `/effort` 写回 `config.toml` 作为全局默认。
+3. `/effort` 写回 `config.toml` 作为全局默认。
 4. `/model` 菜单内添加/编辑端点（表单向导或 `$EDITOR`），写回 `providers.toml`。
 5. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
 6. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。

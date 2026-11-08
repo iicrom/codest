@@ -73,6 +73,9 @@ use crate::core::NO_MODEL_GUIDANCE;
 use crate::core::NO_MODEL_SELECTED;
 use crate::core::Selection;
 use crate::core::SessionBootstrap;
+use crate::core::context_percent;
+use crate::core::format_context_usage;
+use crate::core::format_tokens;
 use crate::core::reasoning;
 use crate::core::rollout;
 use crate::core::rollout::LoadedSession;
@@ -133,6 +136,11 @@ pub async fn run(
     });
     let fresh = restore == RestoreMode::None;
 
+    // A restored session remembers the model it last used: adopt it for this
+    // run so the backend, the footer, and the effort seeding all pick up
+    // where the session left off — before anything renders.
+    let selection = restore_model_selection(&pool, selection, &loaded, fresh);
+
     let session = AgentSession::spawn_with_pool(
         pool.clone(),
         selection.as_ref(),
@@ -182,6 +190,45 @@ pub async fn run(
     let result = app.event_loop(&mut terminal).await;
     finish_terminal(&mut terminal, &app, mode);
     result
+}
+
+/// The selection this run starts with, after restore: a restored session
+/// remembers the model it last used, and on the restore modes the active
+/// (most recent) session's selection wins over the configured default.
+/// Best-effort — a selection that no longer parses or builds a client (the
+/// provider was removed from providers.toml, say) keeps the configured one.
+/// A plain startup (`fresh`) never overrides.
+fn restore_model_selection(
+    pool: &ModelPool,
+    selection: Option<Selection>,
+    loaded: &[LoadedSession],
+    fresh: bool,
+) -> Option<Selection> {
+    if fresh {
+        return selection;
+    }
+    let saved = loaded.last().and_then(|session| session.model.clone())?;
+    if selection
+        .as_ref()
+        .is_some_and(|active| active.as_str() == saved.as_str())
+    {
+        return selection;
+    }
+    match pool
+        .registry()
+        .parse_selection(&saved)
+        .ok()
+        .filter(|parsed| pool.client(parsed).is_ok())
+    {
+        Some(parsed) => Some(parsed),
+        None => {
+            eprintln!(
+                "codest: note: saved session model `{saved}` is not configured; \
+                 keeping the current selection"
+            );
+            selection
+        }
+    }
 }
 
 /// Starting views: one per restored session (oldest first) plus, on a plain
@@ -382,6 +429,8 @@ struct ModelMenu {
 
 struct ModelMenuItem {
     selection: Selection,
+    /// Declared or discovered context window, shown in the picker row.
+    context_window: Option<u64>,
     current: bool,
 }
 
@@ -1111,6 +1160,10 @@ impl App {
             .into_iter()
             .map(|selection| ModelMenuItem {
                 current: selection.as_str() == self.model_label,
+                context_window: self
+                    .pool
+                    .model_info(&selection)
+                    .and_then(|model| model.context_window),
                 selection,
             })
             .collect();
@@ -1212,6 +1265,40 @@ impl App {
             levels.push(default.to_string());
         }
         levels
+    }
+
+    /// The active model's declared context window (providers.toml or the
+    /// models API), if known.
+    fn context_window(&self) -> Option<u64> {
+        self.route
+            .as_ref()
+            .and_then(|route| self.pool.model_info(route))
+            .and_then(|model| model.context_window)
+    }
+
+    /// Tokens the next request will roughly carry: the last measured turn's
+    /// input (the transcript as sent) plus its output. `None` before the
+    /// first measured turn of this run.
+    fn context_tokens(&self) -> Option<u64> {
+        self.view()
+            .last_usage
+            .map(|(input, output)| input.saturating_add(output))
+    }
+
+    /// The footer's context readout. With a known window the total is always
+    /// shown — `—/200.0k` before the first measured turn, `13.0k/200.0k (6%)`
+    /// once one completes —; without a window only measured usage appears
+    /// (`13.0k tok`). The boolean flags a nearly full window (≥90%) for a
+    /// warning color.
+    fn context_segment(&self) -> Option<(String, bool)> {
+        match (self.context_tokens(), self.context_window()) {
+            (Some(used), window) => {
+                let warn = window.is_some_and(|window| context_percent(used, window) >= 90);
+                Some((format_context_usage(used, window), warn))
+            }
+            (None, Some(window)) => Some((format!("—/{}", format_tokens(window)), false)),
+            (None, None) => None,
+        }
     }
 
     /// `/effort <level|off>`: validate the argument against the active
@@ -1340,10 +1427,15 @@ impl App {
     }
 
     fn plugin_info(&self) -> PluginInfo<'_> {
+        let view = self.view();
         PluginInfo {
             model: &self.model_label,
             mode: self.mode.label(),
-            transcript_len: self.view().history.len(),
+            transcript_len: view.history.len(),
+            context_window: self.context_window(),
+            last_usage: view.last_usage,
+            total_input: view.total_input,
+            total_output: view.total_output,
             plugin_ids: self.plugins.plugin_ids(),
         }
     }
@@ -1400,6 +1492,11 @@ impl App {
         view.follow = true;
         view.scroll = 0;
         view.max_scroll = 0;
+        // The dropped turns' usage no longer describes the context; the
+        // replayed rollout resets the same counters on `/clear`.
+        view.last_usage = None;
+        view.total_input = 0;
+        view.total_output = 0;
     }
 
     fn handle_agent_event(&mut self, event: crate::core::Event) {
@@ -1426,8 +1523,13 @@ impl App {
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
             }
-            EventMsg::TurnUsage { .. } => {
-                // Surfaced for future status/context work; nothing to render.
+            EventMsg::TurnUsage { input, output } => {
+                // Record per session view: the last turn's usage doubles as
+                // the current context size, the sums accumulate for /status.
+                let view = self.view_mut();
+                view.last_usage = Some((input, output));
+                view.total_input = view.total_input.saturating_add(input);
+                view.total_output = view.total_output.saturating_add(output);
             }
             EventMsg::ModelSwitched { model } => {
                 // `/model` already updated the label optimistically; this is
@@ -1901,16 +2003,26 @@ impl App {
         };
 
         let effort_label = self.effort.as_deref().unwrap_or(reasoning::EFFORT_OFF);
+        let context = self.context_segment();
         // The left side (label · state) wins: on a narrow terminal the right
         // hint is what degrades, never the state word.
-        let left_plain = format!(" codest · {} · effort {effort_label}  │  {state}", self.model_label);
+        let left_plain = match &context {
+            Some((text, _)) => format!(
+                " codest · {} · effort {effort_label} · {text}  │  {state}",
+                self.model_label
+            ),
+            None => format!(
+                " codest · {} · effort {effort_label}  │  {state}",
+                self.model_label
+            ),
+        };
         let left_width = (display_width(&left_plain) as u16 + 1).min(area.width);
         let hint_width = (display_width(hints) as u16 + 1)
             .min(area.width.saturating_sub(left_width));
         let parts =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(hint_width)]).split(area);
 
-        let left = Line::from(vec![
+        let mut left = vec![
             Span::styled(
                 " codest",
                 Style::default()
@@ -1925,13 +2037,20 @@ impl App {
                 format!(" · effort {effort_label}"),
                 Style::default().fg(theme::DIM),
             ),
-            Span::styled("  │  ", Style::default().fg(theme::DIM)),
-            Span::styled(
-                state,
-                Style::default().fg(if self.busy { theme::ACCENT } else { theme::DIM }),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(left), parts[0]);
+        ];
+        if let Some((text, warn)) = &context {
+            // A nearly full window renders in the accent color as a warning.
+            left.push(Span::styled(
+                format!(" · {text}"),
+                Style::default().fg(if *warn { theme::ACCENT } else { theme::DIM }),
+            ));
+        }
+        left.push(Span::styled("  │  ", Style::default().fg(theme::DIM)));
+        left.push(Span::styled(
+            state,
+            Style::default().fg(if self.busy { theme::ACCENT } else { theme::DIM }),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(left)), parts[0]);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hints,
@@ -2057,7 +2176,8 @@ fn session_menu_line(
 }
 
 /// One row of the `/model` picker: marker, 1-based number, the
-/// `provider/model` selection, and a marker on the active model.
+/// `provider/model` selection, its context window when known, and a marker
+/// on the active model.
 fn model_menu_line(number: usize, item: &ModelMenuItem, selected: bool) -> Line<'static> {
     let marker = if selected { "▸ " } else { "  " };
     let (marker_style, number_style, text_style) = if selected {
@@ -2086,6 +2206,12 @@ fn model_menu_line(number: usize, item: &ModelMenuItem, selected: bool) -> Line<
             text_style,
         ),
     ];
+    if let Some(window) = item.context_window {
+        spans.push(Span::styled(
+            format!(" · {} ctx", format_tokens(window)),
+            Style::default().fg(theme::DIM),
+        ));
+    }
     if item.current {
         spans.push(Span::styled(
             " · current",
@@ -2379,6 +2505,49 @@ mod tests {
         )
     }
 
+    /// A pool whose `test/one` model declares a context window, for the
+    /// context-usage footer and `/status` tests.
+    fn context_pool() -> Arc<ModelPool> {
+        let mut one = ModelInfo::from_id("one");
+        one.context_window = Some(200_000);
+        let instance = ProviderInstance {
+            name: "test".to_string(),
+            protocol: Some("test".to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![one, ModelInfo::from_id("two")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
+        Arc::new(ModelPool::new(registry))
+    }
+
+    fn test_app_context() -> App {
+        let pool = context_pool();
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            Some(&Selection::new("test", "one")),
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            "test/one".to_string(),
+            TuiMode::Fullscreen,
+            PluginHost::builtin().expect("builtin plugins"),
+            vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
+            0,
+        )
+    }
+
     #[tokio::test]
     async fn a_model_default_level_seeds_the_footer_effort() {
         let mut app = test_app_meta();
@@ -2490,8 +2659,12 @@ mod tests {
     fn build_views_restores_sessions_and_banners_the_active_one() {
         use crate::core::Message;
 
-        let loaded_session =
-            |id: &str, messages: Vec<Message>, name: Option<String>| LoadedSession {
+        let loaded_session = |id: &str,
+                              messages: Vec<Message>,
+                              name: Option<String>,
+                              last_usage: Option<(u64, u64)>|
+         -> LoadedSession {
+            LoadedSession {
                 meta: crate::core::SessionMeta {
                     version: 1,
                     id: id.to_string(),
@@ -2503,17 +2676,23 @@ mod tests {
                     model: None,
                 },
                 path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+                model: None,
+                last_usage,
+                total_input: last_usage.map_or(0, |(input, _)| input),
+                total_output: last_usage.map_or(0, |(_, output)| output),
                 messages,
                 name,
-            };
+            }
+        };
 
         let loaded = vec![
             loaded_session(
                 "one",
                 vec![Message::user("hello"), Message::assistant("hi")],
                 None,
+                Some((1_000, 200)),
             ),
-            loaded_session("named", vec![], Some("my chat".to_string())),
+            loaded_session("named", vec![], Some("my chat".to_string()), None),
         ];
         let (views, active) = build_views("test-model", TuiMode::Fullscreen, &loaded, false);
         assert_eq!(views.len(), 2);
@@ -2522,6 +2701,10 @@ mod tests {
         assert_eq!(views[0].history.len(), 2);
         assert!(matches!(&views[0].history[0], HistoryCell::User(text) if text == "hello"));
         assert_eq!(views[0].printed_cells, 2);
+        // The rollout's recorded usage seeds the view's context accounting.
+        assert_eq!(views[0].last_usage, Some((1_000, 200)));
+        assert_eq!(views[0].total_input, 1_000);
+        assert_eq!(views[0].total_output, 200);
         assert_eq!(views[1].name.as_deref(), Some("my chat"));
         // The active view carries this run's banner plus the resumed notice.
         assert!(
@@ -2549,6 +2732,61 @@ mod tests {
         assert_eq!(active, 0);
         assert!(
             matches!(&views[0].history[0], HistoryCell::Notice(text) if text.contains("codest"))
+        );
+    }
+
+    #[test]
+    fn restore_model_selection_adopts_the_last_saved_model() {
+        let pool = context_pool();
+        let selection = Some(Selection::new("test", "one"));
+        let saved_session = |model: Option<&str>| LoadedSession {
+            meta: crate::core::SessionMeta {
+                version: 1,
+                id: "s".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                cwd: "/tmp/demo".to_string(),
+                system_prompt: "be brief".to_string(),
+                name: None,
+                provider: None,
+                model: None,
+            },
+            path: PathBuf::from("/tmp/s.jsonl"),
+            model: model.map(str::to_string),
+            last_usage: None,
+            total_input: 0,
+            total_output: 0,
+            messages: Vec::new(),
+            name: None,
+        };
+        let saved = vec![saved_session(Some("test/two"))];
+
+        // A plain startup keeps the configured selection.
+        assert_eq!(
+            restore_model_selection(&pool, selection.clone(), &saved, true),
+            selection
+        );
+        // A restore adopts the session's last used model…
+        assert_eq!(
+            restore_model_selection(&pool, selection.clone(), &saved, false),
+            Some(Selection::new("test", "two"))
+        );
+        // …keeps it when it already matches…
+        let already = Some(Selection::new("test", "two"));
+        assert_eq!(
+            restore_model_selection(&pool, already, &saved, false),
+            Some(Selection::new("test", "two"))
+        );
+        // …falls back when the saved provider is gone…
+        let gone = vec![saved_session(Some("ghost/model"))];
+        assert_eq!(
+            restore_model_selection(&pool, selection.clone(), &gone, false),
+            selection
+        );
+        // …and when the session never recorded a model.
+        let unnamed = vec![saved_session(None)];
+        assert_eq!(
+            restore_model_selection(&pool, selection, &unnamed, false),
+            None
         );
     }
 
@@ -2804,6 +3042,152 @@ mod tests {
             EventMsg::ReasoningEffortSwitched { effort: None },
         ));
         assert_eq!(app.effort, None);
+    }
+
+    #[tokio::test]
+    async fn turn_usage_accumulates_per_session_view() {
+        let mut app = test_app();
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnUsage {
+                input: 1_000,
+                output: 200,
+            },
+        ));
+        assert_eq!(app.view().last_usage, Some((1_000, 200)));
+        assert_eq!(app.view().total_input, 1_000);
+        assert_eq!(app.view().total_output, 200);
+
+        // Each turn replaces `last_usage` and grows the session totals.
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-2",
+            EventMsg::TurnUsage {
+                input: 1_300,
+                output: 300,
+            },
+        ));
+        assert_eq!(app.view().last_usage, Some((1_300, 300)));
+        assert_eq!(app.view().total_input, 2_300);
+        assert_eq!(app.view().total_output, 500);
+
+        // A fresh session tracks its own usage from zero…
+        app.start_new_session();
+        assert_eq!(app.view().last_usage, None);
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-3",
+            EventMsg::TurnUsage {
+                input: 500,
+                output: 50,
+            },
+        ));
+        assert_eq!(app.view().last_usage, Some((500, 50)));
+
+        // …and switching back shows the first session's stats untouched.
+        app.switch_to_session(0);
+        assert_eq!(app.view().last_usage, Some((1_300, 300)));
+        assert_eq!(app.view().total_input, 2_300);
+        assert_eq!(app.view().total_output, 500);
+    }
+
+    #[tokio::test]
+    async fn footer_shows_context_usage_against_the_window() {
+        let mut app = test_app_context();
+
+        // No measured turn yet: the window total shows behind an unmeasured
+        // placeholder.
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(lines.join("\n").contains("· —/200.0k"), "{lines:?}");
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnUsage {
+                input: 12_340,
+                output: 660,
+            },
+        ));
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(
+            lines.join("\n").contains("· 13.0k/200.0k (6%)"),
+            "{lines:?}"
+        );
+        assert!(!app.context_segment().unwrap().1);
+
+        // Crossing 90% of the window flags the segment as a warning.
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-2",
+            EventMsg::TurnUsage {
+                input: 180_000,
+                output: 10_000,
+            },
+        ));
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(
+            lines.join("\n").contains("· 190.0k/200.0k (95%)"),
+            "{lines:?}"
+        );
+        assert!(app.context_segment().unwrap().1);
+    }
+
+    #[tokio::test]
+    async fn footer_shows_bare_tokens_without_a_known_window() {
+        let mut app = test_app();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnUsage {
+                input: 12_340,
+                output: 660,
+            },
+        ));
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(lines.join("\n").contains("· 13.0k tok"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn model_menu_lists_the_context_window() {
+        // `context_pool` declares a window only for `test/one`, so the menu
+        // exercises both the annotated and the bare row.
+        let mut app = test_app_context();
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        let lines = render_lines(&mut app, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("1 · test/one · 200.0k ctx · current"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("2 · test/two\n"), "{rendered}");
+
+        // Without declared metadata the row simply omits the window.
+        let mut plain = test_app();
+        plain.composer.set_text("/model".to_string());
+        plain.try_submit();
+        let lines = render_lines(&mut plain, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("1 · test/one · current"), "{rendered}");
+        assert!(!rendered.contains("ctx"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn status_command_reports_context_usage() {
+        let mut app = test_app_context();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnUsage {
+                input: 12_340,
+                output: 660,
+            },
+        ));
+
+        app.composer.set_text("/status".to_string());
+        app.try_submit();
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text))
+                if text.contains("context: 13.0k/200.0k (6%)")
+                    && text.contains("tokens: session in 12.3k / out 660")),
+            "{:?}",
+            app.view().history.last()
+        );
     }
 
     #[tokio::test]

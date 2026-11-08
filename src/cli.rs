@@ -204,10 +204,12 @@ fn synthesized_openai_instance(args: &Args) -> Option<config::ProviderInstance> 
         protocol: None,
         base_url,
         api_key,
-        // With an explicit model the endpoint is fully specified; without
-        // one, models discovery fills the list from `base_url`.
+        // With an explicit model the initial selection is fully specified;
+        // discovery still runs (best-effort): it fills the /model menu with
+        // the endpoint's other models and enriches the metadata — the
+        // context window among them.
         models: model.map(config::ModelInfo::from_id).into_iter().collect(),
-        fetch_models: None,
+        fetch_models: Some(true),
         headers: Default::default(),
         body_overrides: Default::default(),
         requires_api_key: true,
@@ -395,7 +397,8 @@ mod tests {
         assert!(both.models.is_empty(), "no default model id");
         assert!(both.should_fetch_models(), "model list comes from discovery");
 
-        // An explicit model pins the list instead of discovery.
+        // An explicit model pins the initial selection but not the list:
+        // discovery still runs to enrich the menu and the model metadata.
         let with_model = synthesized_openai_instance(&args(&[
             "--base-url",
             "http://x/v1",
@@ -406,7 +409,7 @@ mod tests {
         ]))
         .expect("complete");
         assert_eq!(with_model.models.len(), 1);
-        assert!(!with_model.should_fetch_models());
+        assert!(with_model.should_fetch_models());
 
         // Config-declared instances are never gated for a key (keyless
         // endpoints like ollama are legitimate).

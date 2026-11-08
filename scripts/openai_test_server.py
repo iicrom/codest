@@ -103,7 +103,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
         elif path.endswith("/models"):
             # OpenAI-shaped directory for codest's `fetch_models` discovery;
-            # `default_level` feeds the /effort picker.
+            # `default_level` feeds the /effort picker, the context-window
+            # fields feed the footer/status display. The two entries spell
+            # the window differently on purpose: `context_length` is what
+            # OpenRouter returns, `context_window` the plain spelling.
             self._send_json(
                 200,
                 {
@@ -113,8 +116,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                             "id": "test-model",
                             "name": "Test Model",
                             "default_level": "high",
+                            "context_length": 128000,
                         },
-                        {"id": "second-model"},
+                        {
+                            "id": "second-model",
+                            "context_window": 200000,
+                        },
                     ],
                 },
             )
@@ -244,6 +251,23 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "created": created,
                     "model": model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+            )
+            # A final usage report, mirroring `stream_options.include_usage`:
+            # an empty choices array plus the token counts. Fixed values keep
+            # the smoke test's footer assertions stable.
+            self._send_chunk(
+                {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 42,
+                        "completion_tokens": 7,
+                        "total_tokens": 49,
+                    },
                 }
             )
             self.wfile.write(b"data: [DONE]\n\n")

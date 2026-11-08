@@ -315,6 +315,9 @@ struct ActiveTurn {
     /// Usage reported by the backend for this turn, surfaced with
     /// `TurnUsage` on completion.
     usage: Option<(u64, u64)>,
+    /// The selection that serves this turn, recorded with the usage in the
+    /// rollout. `None` on a fixed backend.
+    model: Option<String>,
 }
 
 /// What the worker starts from: sessions restored from disk plus the rollout
@@ -446,6 +449,10 @@ async fn run_worker(
     let mut backend = backend;
     let mut sessions = Vec::new();
     let mut slots = Vec::new();
+    // The model each session last used, replayed from its rollout. Restored
+    // when the session becomes active again (startup adoption happens in the
+    // front-end; this covers switching between sessions mid-run).
+    let mut session_models: Vec<Option<String>> = Vec::new();
 
     for loaded in &bootstrap.loaded {
         let mut conversation = Conversation::new(loaded.meta.system_prompt.clone());
@@ -468,6 +475,7 @@ async fn run_worker(
         };
         sessions.push(conversation);
         slots.push(slot);
+        session_models.push(loaded.model.clone());
     }
 
     // Plain startup opens one fresh session on top of the restored ones; the
@@ -475,6 +483,7 @@ async fn run_worker(
     if bootstrap.fresh || sessions.is_empty() {
         sessions.push(Conversation::new(system_prompt.clone()));
         slots.push(RolloutSlot::inactive());
+        session_models.push(None);
     }
 
     let mut rollouts = Rollouts {
@@ -548,6 +557,9 @@ async fn run_worker(
                     cancel,
                     assistant: String::new(),
                     usage: None,
+                    model: backend
+                        .selection()
+                        .map(|selection| selection.as_str().to_string()),
                 });
             }
             Op::Interrupt => {
@@ -575,6 +587,27 @@ async fn run_worker(
             Op::SwitchSession { session } => {
                 if session < sessions.len() {
                     current = session;
+                    // A recorded session remembers the model it last used:
+                    // becoming active again restores it, so the footer and
+                    // the next turn pick up where the session left off.
+                    // Best-effort — a selection that no longer resolves
+                    // (provider removed, say) keeps the current model.
+                    if let Some(saved) = session_models[session].clone()
+                        && !backend
+                            .selection()
+                            .is_some_and(|active| active.as_str() == saved.as_str())
+                        && let Ok(parsed) = apply_model_switch(
+                            &mut backend,
+                            &mut rollouts,
+                            current,
+                            &tx,
+                            &mut effort,
+                            &saved,
+                            &submission.id,
+                        )
+                    {
+                        session_models[current] = Some(parsed.as_str().to_string());
+                    }
                     let _ = tx.send(Event::new(
                         submission.id,
                         EventMsg::SessionSwitched { session },
@@ -609,44 +642,24 @@ async fn run_worker(
                     ));
                 }
             }
-            Op::SwitchModel { selection } => match backend.switch(&selection) {
-                Ok(parsed) => {
-                    rollouts.selection = Some(parsed.clone());
-                    rollouts.append(
-                        current,
-                        RolloutItem::ModelSwitched {
-                            provider: parsed.provider.clone(),
-                            model: parsed.model.clone(),
-                        },
-                    );
-                    let _ = tx.send(Event::new(
-                        submission.id.clone(),
-                        EventMsg::ModelSwitched {
-                            model: parsed.as_str(),
-                        },
-                    ));
-                    // Selecting a model that declares a `default_level`
-                    // resets the effort to it; one without keeps the current
-                    // effort. The event keeps the front-end footer in step.
-                    let default_effort = backend
-                        .model_info(&parsed)
-                        .and_then(|model| model.default_level);
-                    if default_effort.is_some() && default_effort != effort {
-                        effort = default_effort.clone();
-                        rollouts.append(
-                            current,
-                            RolloutItem::ReasoningEffortSwitched { effort: effort.clone() },
-                        );
-                        let _ = tx.send(Event::new(
-                            submission.id,
-                            EventMsg::ReasoningEffortSwitched { effort: default_effort },
-                        ));
+            Op::SwitchModel { selection } => {
+                match apply_model_switch(
+                    &mut backend,
+                    &mut rollouts,
+                    current,
+                    &tx,
+                    &mut effort,
+                    &selection,
+                    &submission.id,
+                ) {
+                    Ok(parsed) => {
+                        session_models[current] = Some(parsed.as_str().to_string());
+                    }
+                    Err(message) => {
+                        let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
                     }
                 }
-                Err(message) => {
-                    let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
-                }
-            },
+            }
             Op::SetReasoningEffort { effort: new_effort } => {
                 effort = new_effort.clone();
                 rollouts.append(
@@ -718,6 +731,55 @@ async fn run_turn(
     }
 }
 
+/// Switch the backend to `selection` and record it everywhere: the rollout
+/// item, the `ModelSwitched` event, the model's `default_level` seeding the
+/// effort, and the returned selection for the caller's bookkeeping. Shared
+/// by `Op::SwitchModel` and the per-session model restore on
+/// `Op::SwitchSession`.
+fn apply_model_switch(
+    backend: &mut ModelBackend,
+    rollouts: &mut Rollouts,
+    current: usize,
+    tx: &mpsc::UnboundedSender<Event>,
+    effort: &mut Option<String>,
+    selection: &str,
+    submission_id: &str,
+) -> Result<Selection, String> {
+    let parsed = backend.switch(selection)?;
+    rollouts.selection = Some(parsed.clone());
+    rollouts.append(
+        current,
+        RolloutItem::ModelSwitched {
+            provider: parsed.provider.clone(),
+            model: parsed.model.clone(),
+        },
+    );
+    let _ = tx.send(Event::new(
+        submission_id.to_string(),
+        EventMsg::ModelSwitched {
+            model: parsed.as_str(),
+        },
+    ));
+    // Selecting a model that declares a `default_level` resets the effort to
+    // it; one without keeps the current effort. The event keeps the
+    // front-end footer in step.
+    let default_effort = backend
+        .model_info(&parsed)
+        .and_then(|model| model.default_level);
+    if default_effort.is_some() && default_effort != *effort {
+        *effort = default_effort.clone();
+        rollouts.append(
+            current,
+            RolloutItem::ReasoningEffortSwitched { effort: effort.clone() },
+        );
+        let _ = tx.send(Event::new(
+            submission_id.to_string(),
+            EventMsg::ReasoningEffortSwitched { effort: default_effort },
+        ));
+    }
+    Ok(parsed)
+}
+
 fn finalize_complete(
     turn: &ActiveTurn,
     conversation: &mut Conversation,
@@ -739,6 +801,14 @@ fn finalize_complete(
         },
     ));
     if let Some((input, output)) = turn.usage {
+        rollouts.append(
+            current,
+            RolloutItem::TurnUsage {
+                model: turn.model.clone(),
+                input,
+                output,
+            },
+        );
         let _ = tx.send(Event::new(turn.id.clone(), EventMsg::TurnUsage { input, output }));
     }
     let _ = tx.send(Event::new(turn.id.clone(), EventMsg::TurnComplete));
@@ -1445,6 +1515,141 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].meta.provider.as_deref(), Some("test"));
         assert_eq!(loaded[0].meta.model.as_deref(), Some("one"));
+        assert_eq!(loaded[0].messages.len(), 4); // 2 turns × (user + assistant)
+
+        // Each completed turn records its usage with the selection that
+        // served it (the echo client reports deterministic numbers); the
+        // replay aggregates both into the loaded session's stats.
+        let content = std::fs::read_to_string(&loaded[0].path).expect("read rollout");
+        let mut models = Vec::new();
+        for line in content.lines() {
+            let Ok(parsed) = serde_json::from_str::<crate::core::rollout::RolloutLine>(line)
+            else {
+                continue;
+            };
+            if let crate::core::rollout::RolloutItem::TurnUsage { model, input, output } =
+                parsed.item
+            {
+                assert!(input > 0, "echo usage input is positive");
+                assert!(output > 0, "echo usage output is positive");
+                models.push(model);
+            }
+        }
+        assert_eq!(
+            models,
+            vec![Some("test/one".to_string()), Some("test/two".to_string())]
+        );
+        assert_eq!(
+            loaded[0].last_usage.map(|(input, _)| input > 0),
+            Some(true)
+        );
+        assert!(loaded[0].total_input > 0);
+        assert!(loaded[0].total_output > 0);
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_saved_session_restores_its_model() {
+        let mut two = ModelInfo::from_id("two");
+        two.default_level = Some("high".to_string());
+        let instance = ProviderInstance {
+            name: "test".to_string(),
+            protocol: Some("test".to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![ModelInfo::from_id("one"), two],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry =
+            crate::core::providers::ProviderRegistry::build(&[], vec![instance])
+                .expect("registry");
+        let pool = Arc::new(ModelPool::new(registry));
+
+        // A saved session that last ran on test/two.
+        let loaded = LoadedSession {
+            meta: crate::core::rollout::SessionMeta {
+                version: 1,
+                id: "saved".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                cwd: "/tmp/demo".to_string(),
+                system_prompt: "be brief".to_string(),
+                name: None,
+                provider: Some("test".to_string()),
+                model: Some("two".to_string()),
+            },
+            path: std::path::PathBuf::from("/tmp/saved.jsonl"),
+            model: Some("test/two".to_string()),
+            last_usage: None,
+            total_input: 0,
+            total_output: 0,
+            messages: vec![Message::user("hello"), Message::assistant("hi")],
+            name: None,
+        };
+
+        // Plain startup: the fresh session runs on the configured test/one.
+        let mut session = AgentSession::spawn_with_pool(
+            pool,
+            Some(&Selection::new("test", "one")),
+            "be brief",
+            SessionBootstrap {
+                loaded: vec![loaded],
+                rollout_dir: None,
+                cwd: "/tmp/demo".to_string(),
+                fresh: true,
+            },
+        )
+        .expect("spawn");
+
+        // Becoming active again restores the session's model (and the effort
+        // its `default_level` seeds) before the switch is confirmed.
+        session.switch_session(0);
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().await {
+            let done = matches!(event.msg, EventMsg::SessionSwitched { session: 0 });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(
+            matches!(&events[0].msg, EventMsg::ModelSwitched { model } if model == "test/two"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[1].msg, EventMsg::ReasoningEffortSwitched { effort } if effort.as_deref() == Some("high")),
+            "{events:?}"
+        );
+
+        // Switching to the fresh session (no recorded model) keeps the
+        // current model: only the switch confirmation arrives.
+        session.switch_session(1);
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().await {
+            let done = matches!(event.msg, EventMsg::SessionSwitched { session: 1 });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(&events[0].msg, EventMsg::SessionSwitched { session: 1 }));
+
+        // And back again: the backend already runs the session's model, so
+        // the switch is a no-op — only the confirmation arrives.
+        session.switch_session(0);
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().await {
+            let done = matches!(event.msg, EventMsg::SessionSwitched { session: 0 });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(&events[0].msg, EventMsg::SessionSwitched { session: 0 }));
     }
 
     #[tokio::test]
@@ -1514,6 +1719,9 @@ mod tests {
         assert_eq!(loaded[0].messages.len(), 6);
         let content = std::fs::read_to_string(&loaded[0].path).expect("read rollout");
         assert_eq!(content.matches("reasoning_effort_switched").count(), 2);
+        // The recording client reports no usage, so no per-turn usage record
+        // is written.
+        assert_eq!(content.matches("turn_usage").count(), 0);
     }
 
     #[tokio::test]

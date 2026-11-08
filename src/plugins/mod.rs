@@ -113,6 +113,14 @@ pub struct PluginInfo<'a> {
     pub model: &'a str,
     pub mode: &'a str,
     pub transcript_len: usize,
+    /// The active model's context window, when declared or discovered.
+    pub context_window: Option<u64>,
+    /// Usage of the last completed turn: `(input, output)` tokens. `None`
+    /// before the first measured turn of this run.
+    pub last_usage: Option<(u64, u64)>,
+    /// Cumulative measured tokens across the session's completed turns.
+    pub total_input: u64,
+    pub total_output: u64,
     pub plugin_ids: &'a [&'static str],
 }
 
@@ -150,6 +158,26 @@ impl<'a> PluginContext<'a> {
 
     pub fn transcript_len(&self) -> usize {
         self.info.transcript_len
+    }
+
+    /// The active model's context window, when known.
+    pub fn context_window(&self) -> Option<u64> {
+        self.info.context_window
+    }
+
+    /// The last completed turn's `(input, output)` tokens, if measured.
+    pub fn last_usage(&self) -> Option<(u64, u64)> {
+        self.info.last_usage
+    }
+
+    /// Cumulative measured input tokens across the session.
+    pub fn total_input(&self) -> u64 {
+        self.info.total_input
+    }
+
+    /// Cumulative measured output tokens across the session.
+    pub fn total_output(&self) -> u64 {
+        self.info.total_output
     }
 
     pub fn plugin_ids(&self) -> &[&'static str] {
@@ -511,6 +539,10 @@ mod tests {
             model: "test-model",
             mode: "fullscreen",
             transcript_len: 2,
+            context_window: Some(200_000),
+            last_usage: Some((8_100, 1_200)),
+            total_input: 16_200,
+            total_output: 2_400,
             plugin_ids: host.plugin_ids(),
         }
     }
@@ -745,6 +777,8 @@ mod tests {
         };
         assert!(text.contains("backend: test-model"), "{text}");
         assert!(text.contains("mode: fullscreen"), "{text}");
+        assert!(text.contains("context: 9.3k/200.0k (4%)"), "{text}");
+        assert!(text.contains("tokens: session in 16.2k / out 2.4k"), "{text}");
         assert!(
             text.contains("plugins: help, clear, quit, status"),
             "{text}"

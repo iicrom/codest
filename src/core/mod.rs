@@ -31,6 +31,7 @@ pub mod rollout;
 pub mod session;
 pub mod sessions;
 pub mod sse;
+pub mod tokens;
 
 pub use commands::{
     ArgsPolicy, CommandCandidate, CommandError, CommandInput, CommandSpec, CommandTable,
@@ -51,3 +52,4 @@ pub use reasoning::{DEFAULT_EFFORT_LEVELS, EFFORT_COMMAND, REASONING_COMMANDS, T
 pub use rollout::{LoadedSession, RolloutItem, RolloutWriter, SessionMeta};
 pub use session::{AgentSession, SessionBootstrap};
 pub use sessions::SESSION_COMMANDS;
+pub use tokens::{context_percent, format_context_usage, format_tokens};

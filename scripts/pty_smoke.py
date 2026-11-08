@@ -33,6 +33,7 @@ import sys
 import tempfile
 import termios
 import time
+from pathlib import Path
 
 ROWS = 24
 COLS = 100
@@ -200,6 +201,64 @@ def start_test_server() -> tuple[subprocess.Popen, str]:
     return process, f"http://127.0.0.1:{port}/v1"
 
 
+def continue_check(binary, mode, env, endpoint_args, expected_label, expected_context):
+    """Second run with --continue over the same CODEST_HOME: the restored
+    session must bring back both its last model (footer label) and its
+    recorded usage (footer context segment)."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+    process = subprocess.Popen(
+        [binary, "--tui-mode", mode, "--continue", *endpoint_args],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave)
+    output = bytearray()
+    before_quit = 0
+    try:
+        if not pump(master, output, 1.5):
+            print(f"[{mode}] continue run exited during startup", file=sys.stderr)
+            print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
+            return {"continue restore": False}
+        # Snapshot before quitting: inline mode clears its pane on exit, so
+        # only the pre-quit raw still shows the footer.
+        before_quit = len(output)
+        for _ in range(3):
+            # The process quits on the second Ctrl+C; writing to the closed
+            # master raises EIO, so stop as soon as it is gone.
+            if process.poll() is not None:
+                break
+            try:
+                os.write(master, b"\x03")
+            except OSError:
+                break
+            pump(master, output, 0.4)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        try:
+            os.close(master)
+        except OSError:
+            pass
+    screen = render(output[:before_quit].decode("utf-8", "replace"))
+    print(f"--- {mode} screen (continue) ---")
+    print(screen)
+    passed = (
+        f"codest · {expected_label}" in screen
+        and expected_context in screen
+        and (process.poll() is not None or process.returncode == 0)
+    )
+    print(f"{'PASS' if passed else 'FAIL'}  continue restore")
+    return {"continue restore": passed}
+
+
 def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> dict[str, bool]:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
@@ -212,7 +271,10 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
     if variant == "config":
         # The multi-provider path: a providers.toml instance pointing at the
         # test server plus a config.toml default selection. The flag/env
-        # fallback stays covered by the flag-driven case below.
+        # fallback stays covered by the flag-driven case below. `test-model`
+        # declares its context_window statically; `second-model` is left to
+        # discovery, which picks up the `context_window` the server serves —
+        # so both metadata paths show up in the footer.
         with open(os.path.join(home, "providers.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 "[[providers]]\n"
@@ -220,6 +282,10 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
                 f'base_url = "{base_url}"\n'
                 'api_key = "test-key"\n'
                 "fetch_models = true\n"
+                "\n"
+                "  [[providers.models]]\n"
+                '  id = "test-model"\n'
+                "  context_window = 100000\n"
             )
         with open(os.path.join(home, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write('default = "pytest/test-model"\n')
@@ -310,6 +376,11 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
                 print(f"{'PASS' if passed else 'FAIL'}  {name}")
             return checks
 
+        # Snapshot the startup screen before the first turn: the footer's
+        # window-only placeholder (`—/100.0k`) is only visible until the
+        # first measured turn overwrites it.
+        startup_end = len(output)
+
         # First turn: a single-line message.
         os.write(master, b"hello from pty")
         pump(master, output, 0.4)
@@ -377,12 +448,14 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
             pass
 
     raw = output.decode("utf-8", "replace")
+    raw_startup = output[:startup_end].decode("utf-8", "replace")
     raw_turn1 = output[:turn1_end].decode("utf-8", "replace")
     # The second turn is checked before the wheel section: the scroll test
     # legitimately moves the viewport to the top, which pushes the tail of
     # the transcript below the fold in longer (config) transcripts.
     raw_turn2 = output[:turn2_end].decode("utf-8", "replace")
     raw_before_quit = output[:before_quit].decode("utf-8", "replace")
+    screen_startup = render(raw_startup)
     screen_turn1 = render(raw_turn1)
     screen_turn2 = render(raw_turn2)
     screen = render(raw_before_quit)
@@ -422,6 +495,44 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
         # on a 24-row pty it can sit below the fold; the footer label is the
         # authoritative evidence that the picker switch happened.
         checks["switch notice"] = f"codest · {expected_label}" in screen
+        # Declared context_window + the streamed usage chunk: the footer
+        # shows the measured tokens against the window. The total is visible
+        # from the first frame, before anything is measured.
+        checks["context window before first turn"] = "· —/100.0k" in screen_startup
+        # After the picker switch the active model is the *discovered*
+        # second-model, whose window came from the server's context_window
+        # field — the discovery path, distinct from the declared one above.
+        checks["context window footer"] = "· 49/200.0k (0%)" in screen
+    else:
+        # The flags instance discovers its models: `test-model`'s window comes
+        # from the server's `context_length` field, so the footer shows the
+        # measured tokens against it (42 in + 7 out per streamed turn).
+        checks["context window footer (discovered)"] = "· 49/128.0k (0%)" in screen
+    # The rollout records each completed turn's usage with the serving
+    # model; the test server reports 42 in / 7 out per turn.
+    rollout_text = "".join(
+        path.read_text(encoding="utf-8")
+        for path in Path(home).glob("sessions/*/rollout-*.jsonl")
+    )
+    checks["rollout records turn usage"] = (
+        '"type":"turn_usage"' in rollout_text and '"input":42' in rollout_text
+    )
+    # Second run with --continue over the same home: the restored session
+    # brings back the model it last ran on plus its recorded usage. The
+    # discovered second-model's window survives via the model cache and
+    # re-discovery alike.
+    if variant == "config":
+        checks.update(
+            continue_check(
+                binary, mode, env, endpoint_args, "pytest/second-model", "· 49/200.0k (0%)"
+            )
+        )
+    else:
+        checks.update(
+            continue_check(
+                binary, mode, env, endpoint_args, "untitled/test-model", "· 49/128.0k (0%)"
+            )
+        )
     if mode == "fullscreen":
         checks["alternate screen"] = "\x1b[?1049h" in raw
         checks["mouse capture"] = "\x1b[?1000h" in raw

@@ -80,10 +80,12 @@ fetch_models = true                  # 缺省规则：未声明 models 视为 tr
 
   [[providers.models]]               # 显式声明（静态路径，优先）
   id = "gpt-4o-mini"
-  name = "GPT-4o mini"               # context_window 仍为占位；reasoning /
-  context_window = 128000            # default_level 供 /effort 使用
+  name = "GPT-4o mini"               # context_window 驱动 footer / /status 的
+  context_window = 128000            # 用量显示；reasoning / default_level 供 /effort 使用
   reasoning = ["low", "medium", "high"]
   default_level = "medium"           # 选中该模型时自动作为初始推理等级
+                                     # 声明里缺的字段（如不写 context_window）会由
+                                     # models API 的发现结果补齐，声明值优先
 
 [[providers]]
 name = "glm-local"
@@ -251,7 +253,14 @@ python3 scripts/pty_smoke.py
 - client 不做重试、代理、认证刷新（与单端点时代一致）；`ModelError::NotConfigured`
   仍是"回合报错"而非启动失败，部分配置的 providers.toml 不影响其他实例；
 - `/model` 添加端点的表单向导、`$EDITOR` 流程留待后续（先手改 providers.toml）；
-- `Usage` 的消费方（`/status` token 统计、按 `context_window` 压缩）是现成的
-  下一步；thinking 的暗色渲染与折叠（`/thinking`）、推理等级（`/effort`）已落地；
+- `Usage` 的消费已落地：footer 常显上下文窗口与用量（窗口总长始终显示，最后一轮
+  `input + output` 对无状态 chat-completions 即下一轮请求的近似大小；测量前为
+  `—/100.0k` 占位）、`/model` 菜单每行列出各自的窗口长度、`/status` 输出窗口
+  占用与会话累计；每轮的模型与 usage 以 `turn_usage` 变体进 rollout，恢复时回放
+  为初始统计并恢复最后使用的模型选择（`--continue` 启动即采用；会话间切换尽力
+  恢复，选择已不存在时保持当前模型）；models API 的 `context_length` /
+  `context_window` 字段自动填充 `ModelInfo::context_window`。按 `context_window`
+  自动压缩仍是现成的下一步；thinking 的暗色渲染与折叠（`/thinking`）、推理等级
+  （`/effort`）已落地；
 - 想要 anthropic-messages 之类第二协议时，写一个内置工厂或示范插件即可，注册表
   无需改动。

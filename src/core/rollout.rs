@@ -168,6 +168,16 @@ pub enum RolloutItem {
     ReasoningEffortSwitched {
         effort: Option<String>,
     },
+    /// Token usage of one completed turn, with the selection that served it
+    /// (`None` on a fixed backend). Metadata for attribution and context
+    /// accounting, like [`RolloutItem::ModelSwitched`] — it does not change
+    /// the replayed conversation.
+    TurnUsage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        input: u64,
+        output: u64,
+    },
 }
 
 /// One JSONL line: a timestamp plus the payload's fields flattened in.
@@ -188,6 +198,17 @@ pub struct LoadedSession {
     /// Name after replaying renames; `None` falls back to the first user
     /// message (the default naming rule).
     pub name: Option<String>,
+    /// The selection this session last used (`"provider/model"`), replayed
+    /// from the meta line, [`RolloutItem::ModelSwitched`] items, and per-turn
+    /// usage records — the model a resumed session starts with.
+    pub model: Option<String>,
+    /// Usage of the last recorded turn; `None` when the rollout predates
+    /// usage records or a `/clear` reset them.
+    pub last_usage: Option<(u64, u64)>,
+    /// Cumulative usage across the session's recorded turns (reset by
+    /// [`RolloutItem::Cleared`]).
+    pub total_input: u64,
+    pub total_output: u64,
 }
 
 /// Creates rollout files for new sessions.
@@ -309,6 +330,10 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     let mut meta = None;
     let mut messages = Vec::new();
     let mut name = None;
+    let mut model = None;
+    let mut last_usage = None;
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -319,16 +344,45 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             continue;
         };
         match parsed.item {
-            RolloutItem::SessionMeta(session_meta) => meta = Some(session_meta),
+            RolloutItem::SessionMeta(session_meta) => {
+                // The initial selection, until a later switch or usage record
+                // supersedes it.
+                model = match (
+                    session_meta.provider.as_deref(),
+                    session_meta.model.as_deref(),
+                ) {
+                    (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+                    _ => None,
+                };
+                meta = Some(session_meta);
+            }
             RolloutItem::UserMessage { message } => messages.push(Message::user(message)),
             RolloutItem::AssistantMessage { message } => messages.push(Message::assistant(message)),
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
-            RolloutItem::Cleared => messages.clear(),
+            RolloutItem::Cleared => {
+                messages.clear();
+                // The dropped turns' usage no longer describes the context.
+                last_usage = None;
+                total_input = 0;
+                total_output = 0;
+            }
             // The active model selection and the reasoning effort are
             // metadata for attribution; they do not change the replayed
-            // conversation.
-            RolloutItem::ModelSwitched { .. } => {}
+            // conversation. The selection still tracks the last used model.
+            RolloutItem::ModelSwitched { provider, model: switched } => {
+                model = Some(format!("{provider}/{switched}"));
+            }
             RolloutItem::ReasoningEffortSwitched { .. } => {}
+            RolloutItem::TurnUsage { model: served, input, output } => {
+                // A fixed backend reports no model; that cannot clear the
+                // tracked selection.
+                if served.is_some() {
+                    model = served;
+                }
+                last_usage = Some((input, output));
+                total_input = total_input.saturating_add(input);
+                total_output = total_output.saturating_add(output);
+            }
         }
     }
 
@@ -343,6 +397,10 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
         path: path.to_path_buf(),
         messages,
         name,
+        model,
+        last_usage,
+        total_input,
+        total_output,
     })
 }
 
@@ -511,5 +569,106 @@ mod tests {
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].content, "hello");
+    }
+
+    #[test]
+    fn replay_tracks_the_last_used_model() {
+        let dir = tempdir("model");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer
+            .start_session("be brief", Some("openai"), Some("gpt-4o-mini"))
+            .expect("start");
+        // The meta line seeds the initial selection…
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.model.as_deref(), Some("openai/gpt-4o-mini"));
+
+        // …switches and served turns update it in file order; a usage record
+        // without a model (fixed backend) leaves it alone.
+        rollout
+            .append(&RolloutItem::ModelSwitched {
+                provider: "openai".to_string(),
+                model: "gpt-4o".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::TurnUsage {
+                model: Some("openai/gpt-4o".to_string()),
+                input: 10,
+                output: 2,
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::TurnUsage {
+                model: None,
+                input: 10,
+                output: 2,
+            })
+            .expect("append");
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.model.as_deref(), Some("openai/gpt-4o"));
+
+        rollout
+            .append(&RolloutItem::ModelSwitched {
+                provider: "glm".to_string(),
+                model: "glm-4.7".to_string(),
+            })
+            .expect("append");
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.model.as_deref(), Some("glm/glm-4.7"));
+    }
+
+    #[test]
+    fn turn_usage_round_trips_and_clear_resets_it() {
+        let dir = tempdir("usage");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None).expect("start");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "first".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::TurnUsage {
+                model: Some("openai/gpt-4o-mini".to_string()),
+                input: 1_000,
+                output: 200,
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::AssistantMessage {
+                message: "hi".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::TurnUsage {
+                model: None,
+                input: 1_300,
+                output: 300,
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.last_usage, Some((1_300, 300)));
+        assert_eq!(loaded.total_input, 2_300);
+        assert_eq!(loaded.total_output, 500);
+        // Usage records are metadata: the conversation still replays to two
+        // messages, and the raw line carries the tagged variant name.
+        assert_eq!(loaded.messages.len(), 2);
+        let raw = std::fs::read_to_string(&rollout.path).expect("read");
+        assert!(raw.contains(r#""type":"turn_usage""#), "{raw}");
+        assert!(raw.contains(r#""model":"openai/gpt-4o-mini""#), "{raw}");
+
+        // A clear drops the conversation and the usage accounting with it.
+        rollout.append(&RolloutItem::Cleared).expect("append");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "second".to_string(),
+            })
+            .expect("append");
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.last_usage, None);
+        assert_eq!(loaded.total_input, 0);
+        assert_eq!(loaded.total_output, 0);
+        assert_eq!(loaded.messages.len(), 1);
     }
 }

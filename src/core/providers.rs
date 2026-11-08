@@ -452,19 +452,36 @@ impl ModelPool {
     }
 
     /// One row per selectable model: configured models (declared order)
-    /// first, then fetched models the config does not already declare.
+    /// first, then fetched models the config does not already declare. A
+    /// declared model keeps precedence over its discovered twin, but fields
+    /// the declaration leaves unset are filled in from discovery — a sparse
+    /// `[[providers.models]]` entry still gets the context window (and the
+    /// rest of the advisory metadata) the models API reports.
     pub fn models_of(&self, provider: &str) -> Vec<ModelInfo> {
         let mut models = self
             .registry
             .instance(provider)
             .map(|instance| instance.models.clone())
             .unwrap_or_default();
-        let declared: std::collections::HashSet<String> =
-            models.iter().map(|model| model.id.clone()).collect();
         if let Some(fetched) = self.fetched.lock().expect("pool lock").get(provider) {
             for model in fetched {
-                if !declared.contains(&model.id) {
-                    models.push(model.clone());
+                match models.iter_mut().find(|declared| declared.id == model.id) {
+                    Some(declared) => {
+                        // Declared precedence: fill only what the config left unset.
+                        if declared.name.is_none() {
+                            declared.name = model.name.clone();
+                        }
+                        if declared.context_window.is_none() {
+                            declared.context_window = model.context_window;
+                        }
+                        if declared.reasoning.is_none() {
+                            declared.reasoning = model.reasoning.clone();
+                        }
+                        if declared.default_level.is_none() {
+                            declared.default_level = model.default_level.clone();
+                        }
+                    }
+                    None => models.push(model.clone()),
                 }
             }
         }
@@ -712,10 +729,16 @@ pub fn models_from_openai_list(payload: &serde_json::Value) -> Vec<ModelInfo> {
             .map(str::trim)
             .filter(|level| !level.is_empty())
             .map(str::to_string);
+        // Context window spellings seen in the wild: `context_length`
+        // (OpenRouter) and `context_window`. Both are advisory metadata.
+        let context_window = entry
+            .get("context_length")
+            .or_else(|| entry.get("context_window"))
+            .and_then(serde_json::Value::as_u64);
         models.push(ModelInfo {
             id: id.to_string(),
             name,
-            context_window: None,
+            context_window,
             reasoning: None,
             default_level,
         });
@@ -880,6 +903,44 @@ mod tests {
     }
 
     #[test]
+    fn models_of_fills_sparse_declared_entries_from_discovery() {
+        let mut sparse = ModelInfo::from_id("m1");
+        sparse.context_window = Some(8_000);
+        let instance = ProviderInstance {
+            name: "p".to_string(),
+            protocol: Some(DEFAULT_PROTOCOL.to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![sparse, ModelInfo::from_id("m2")],
+            fetch_models: Some(true),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry =
+            ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
+        let pool = ModelPool::new(registry);
+        let mut fetched_m1 = ModelInfo::from_id("m1");
+        fetched_m1.name = Some("Discovered One".to_string());
+        fetched_m1.context_window = Some(128_000);
+        fetched_m1.default_level = Some("high".to_string());
+        let mut fetched_m2 = ModelInfo::from_id("m2");
+        fetched_m2.context_window = Some(200_000);
+        pool.fetched
+            .lock()
+            .expect("lock")
+            .insert("p".to_string(), vec![fetched_m1, fetched_m2]);
+
+        let models = pool.models_of("p");
+        // The declared window wins; the unset fields come from discovery.
+        assert_eq!(models[0].context_window, Some(8_000));
+        assert_eq!(models[0].name.as_deref(), Some("Discovered One"));
+        assert_eq!(models[0].default_level.as_deref(), Some("high"));
+        // A declaration without any metadata is filled wholesale.
+        assert_eq!(models[1].context_window, Some(200_000));
+    }
+
+    #[test]
     fn cache_round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!(
             "codest-pool-cache-{}-{:x}",
@@ -920,23 +981,31 @@ mod tests {
     fn openai_models_list_parses_and_dedupes() {
         let payload = serde_json::json!({
             "data": [
-                {"id": "m1", "name": "Model One", "default_level": "high"},
+                {"id": "m1", "name": "Model One", "default_level": "high",
+                 "context_length": 128000},
                 {"id": "m1"},
                 {"id": ""},
                 {"no-id": true},
-                {"id": "m2", "default_level": "  "},
-                {"id": "m3", "default_level": "thinking"}
+                {"id": "m2", "default_level": "  ", "context_window": 200000},
+                {"id": "m3", "default_level": "thinking"},
+                {"id": "m4", "context_length": "big"}
             ]
         });
         let models = models_from_openai_list(&payload);
-        assert_eq!(models.len(), 3);
+        assert_eq!(models.len(), 4);
         assert_eq!(models[0].display_name(), "Model One");
         assert_eq!(models[0].default_level.as_deref(), Some("high"));
+        assert_eq!(models[0].context_window, Some(128_000));
         assert_eq!(models[1].id, "m2");
         // A blank default is not a level.
         assert_eq!(models[1].default_level, None);
+        assert_eq!(models[1].context_window, Some(200_000));
         assert_eq!(models[2].id, "m3");
         assert_eq!(models[2].default_level.as_deref(), Some("thinking"));
+        assert_eq!(models[2].context_window, None);
+        // A non-numeric window is ignored, not an error.
+        assert_eq!(models[3].id, "m4");
+        assert_eq!(models[3].context_window, None);
 
         assert!(models_from_openai_list(&serde_json::json!({})).is_empty());
     }

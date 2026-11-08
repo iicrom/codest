@@ -37,6 +37,15 @@ impl ModelClient for EchoModelClient {
         cancel: CancellationToken,
     ) -> ModelStream {
         let reply = reply_for(&messages);
+        // A deterministic stand-in for a real usage report: the transcript
+        // the request carried (system prompt included) and the reply it
+        // produced, counted in chars. Varies across turns, so the context
+        // display has something honest to show offline.
+        let input: u64 = messages
+            .iter()
+            .map(|message| message.content.chars().count() as u64)
+            .sum();
+        let output = reply.chars().count() as u64;
         let delay = self.delay;
 
         Box::pin(async_stream::stream! {
@@ -52,6 +61,10 @@ impl ModelClient for EchoModelClient {
                 }
                 yield Ok::<_, ModelError>(StreamItem::Delta(token));
             }
+            if cancel.is_cancelled() {
+                return;
+            }
+            yield Ok(StreamItem::Usage { input, output });
         })
     }
 }
@@ -95,24 +108,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_the_full_reply() {
+    async fn streams_the_full_reply_then_usage() {
         let client = EchoModelClient::new(Duration::ZERO);
         let mut stream = client.stream_chat(
-            vec![Message::user("ping")],
+            vec![Message::system("be brief"), Message::user("ping")],
             TurnOptions::default(),
             CancellationToken::new(),
         );
 
         let mut out = String::new();
+        let mut usage = None;
         while let Some(item) = stream.next().await {
             match item.expect("test stream never fails") {
                 StreamItem::Delta(delta) => out.push_str(&delta),
-                other => panic!("echo model only streams deltas, got {other:?}"),
+                StreamItem::Usage { input, output } => usage = Some((input, output)),
+                other => panic!("echo model streams deltas and usage, got {other:?}"),
             }
         }
 
         assert!(out.contains("You said: \"ping\""));
         assert!(out.contains("in-process test model"));
+        // The request carried "be brief" (8) + "ping" (4) chars, the reply
+        // is counted in chars too.
+        assert_eq!(usage, Some((12, out.chars().count() as u64)));
     }
 
     #[tokio::test]

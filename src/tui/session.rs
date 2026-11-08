@@ -36,6 +36,14 @@ pub struct SessionView {
     /// Inline mode: final assistant text whose remaining lines still need to be
     /// flushed after a turn ends.
     pub inline_final_text: Option<String>,
+    /// Usage of the last completed turn as reported by the backend:
+    /// `(input, output)` tokens. The input of a chat-completions request
+    /// carries the whole transcript, so this pair doubles as the current
+    /// context size. `None` until the first measured turn in this run.
+    pub last_usage: Option<(u64, u64)>,
+    /// Cumulative measured tokens across the session's completed turns.
+    pub total_input: u64,
+    pub total_output: u64,
 }
 
 impl SessionView {
@@ -87,6 +95,12 @@ impl SessionView {
             }
         }
         view.name = loaded.name.clone().or(loaded.meta.name.clone());
+        // The rollout's recorded usage seeds the footer immediately: a
+        // resumed session shows its restored context size before the first
+        // new turn measures it again.
+        view.last_usage = loaded.last_usage;
+        view.total_input = loaded.total_input;
+        view.total_output = loaded.total_output;
         view.printed_cells = view.history.len();
         view
     }
@@ -103,6 +117,9 @@ impl SessionView {
             printed_cells: 0,
             live_committed: 0,
             inline_final_text: None,
+            last_usage: None,
+            total_input: 0,
+            total_output: 0,
         }
     }
 
