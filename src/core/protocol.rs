@@ -113,6 +113,11 @@ pub enum Op {
     /// `None` clears the override so no effort field is sent at all. Applied
     /// between turns, like `SwitchModel`.
     SetReasoningEffort { effort: Option<String> },
+    /// Apply the named profile's presets (`/profile <name>`): its declared
+    /// selection and effort, in that order. The profile's assembly-time
+    /// values (tools, system prompt) are set at startup and are not touched.
+    /// Applied between turns, like `SwitchModel`; unknown names error.
+    SwitchProfile { name: String },
 }
 
 /// Events emitted by the agent.
@@ -161,6 +166,9 @@ pub enum EventMsg {
     /// The reasoning effort for the following turns is now `effort`
     /// (`None` = no effort field is sent; see `Op::SetReasoningEffort`).
     ReasoningEffortSwitched { effort: Option<String> },
+    /// The named profile is now active (`Op::SwitchProfile`). Its selection
+    /// and effort changes ride along as their own events.
+    ProfileSwitched { name: String },
     /// The worker has stopped.
     ShutdownComplete,
 }

@@ -14,7 +14,9 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::config::ProfileSet;
 use crate::core::config::ModelInfo;
+use crate::core::reasoning::normalize_effort;
 use crate::core::conversation::Conversation;
 use crate::core::conversation::DEFAULT_SYSTEM_PROMPT;
 use crate::core::model::ModelClient;
@@ -297,6 +299,15 @@ impl AgentSession {
         })
     }
 
+    /// Apply the named profile's presets (`/profile <name>`): its declared
+    /// selection and effort. The result arrives as
+    /// [`EventMsg::ProfileSwitched`] (with the selection and effort changes
+    /// riding along as their own events) or an error event; ops are FIFO, so
+    /// a switch never lands mid-turn.
+    pub fn switch_profile(&self, name: impl Into<String>) -> String {
+        self.submit(Op::SwitchProfile { name: name.into() })
+    }
+
     /// Set the reasoning effort sent with the following turns (`/effort`);
     /// `None` clears the override. The result arrives as
     /// [`EventMsg::ReasoningEffortSwitched`]; ops are FIFO, so it never lands
@@ -345,6 +356,23 @@ pub struct SessionBootstrap {
     /// Executes tool calls; the plugin host in a normal run. `None` turns
     /// every call into an error result the model can react to.
     pub executor: Option<Arc<dyn ToolExecutor>>,
+    /// The available profiles, for `Op::SwitchProfile` lookups. Empty means
+    /// none are configured and every profile switch errors.
+    pub profiles: Arc<ProfileSet>,
+    /// The profile this run started with, recorded in new sessions' rollout
+    /// metadata. Run-scoped: switching sessions does not restore it.
+    pub profile: Option<String>,
+    /// The startup effort preset (the active profile's `effort`), seeded
+    /// before the first turn and over the model's `default_level`. `None`
+    /// keeps the model-derived seeding.
+    pub initial_effort: Option<String>,
+}
+
+impl SessionBootstrap {
+    /// An empty profile table for hosts that have none (tests, simple runs).
+    pub fn empty_profiles() -> Arc<ProfileSet> {
+        Arc::new(ProfileSet::new())
+    }
 }
 
 impl std::fmt::Debug for SessionBootstrap {
@@ -356,6 +384,9 @@ impl std::fmt::Debug for SessionBootstrap {
             .field("fresh", &self.fresh)
             .field("tools", &self.tools)
             .field("executor", &self.executor.is_some())
+            .field("profiles", &self.profiles.len())
+            .field("profile", &self.profile)
+            .field("initial_effort", &self.initial_effort)
             .finish()
     }
 }
@@ -398,6 +429,8 @@ struct Rollouts {
     writer: Option<RolloutWriter>,
     system_prompt: String,
     selection: Option<Selection>,
+    /// The profile the run started with, recorded in new sessions' meta line.
+    profile: Option<String>,
     slots: Vec<RolloutSlot>,
 }
 
@@ -430,7 +463,7 @@ impl Rollouts {
                 ),
                 None => (None, None),
             };
-            match writer.start_session(&self.system_prompt, provider, model) {
+            match writer.start_session(&self.system_prompt, provider, model, self.profile.as_deref()) {
                 Ok(mut file) => {
                     for buffered in std::mem::take(&mut slot.pending) {
                         if let Err(error) = file.append(&buffered) {
@@ -468,6 +501,8 @@ async fn run_worker(
     // and front-ends can mirror it with their own per-session view state.
     let tools = std::mem::take(&mut bootstrap.tools);
     let executor = bootstrap.executor.take();
+    let profiles = std::mem::take(&mut bootstrap.profiles);
+    let startup_profile = bootstrap.profile.take();
     let writer = bootstrap
         .rollout_dir
         .map(|dir| RolloutWriter::new(dir, bootstrap.cwd));
@@ -515,19 +550,28 @@ async fn run_worker(
         writer,
         system_prompt: system_prompt.clone(),
         selection: backend.selection().cloned(),
+        profile: startup_profile,
         slots,
     };
     let mut current = sessions.len() - 1;
     let mut active: Option<ActiveTurn> = None;
     // Reasoning effort for the next turn (`Op::SetReasoningEffort`,
     // `/effort`). Worker-level rather than backend-level, so it also applies
-    // to fixed/test backends (which simply ignore it). Seeded from the
+    // to fixed/test backends (which simply ignore it). A startup preset (the
+    // active profile's `effort`) wins outright — including an explicit
+    // `off`, which clears the override; otherwise it is seeded from the
     // initial model's `default_level` when it declares one.
-    let mut effort = backend
-        .selection()
-        .cloned()
-        .and_then(|selection| backend.model_info(&selection))
-        .and_then(|model| model.default_level);
+    let mut effort =
+        match bootstrap.initial_effort.take().map(|value| normalize_effort(&value)) {
+            Some(applied) => applied,
+            None => {
+                backend
+                    .selection()
+                    .cloned()
+                    .and_then(|selection| backend.model_info(&selection))
+                    .and_then(|model| model.default_level)
+            }
+        };
 
     loop {
         if let Some(mut turn) = active.take() {
@@ -708,6 +752,62 @@ async fn run_worker(
                     EventMsg::ReasoningEffortSwitched { effort: new_effort },
                 ));
             }
+            Op::SwitchProfile { name } => {
+                let Some(profile) = profiles.get(&name) else {
+                    let _ = tx.send(Event::new(
+                        submission.id,
+                        EventMsg::Error {
+                            message: format!("no profile `{name}` is configured"),
+                        },
+                    ));
+                    continue;
+                };
+                // The declared selection first (switching models reseeds the
+                // effort from the model's own `default_level`), then the
+                // declared effort, which gets the final say. An unresolvable
+                // selection reports but does not abort the rest of the
+                // preset — the profile still becomes active.
+                if let Some(selection) = profile.default_selection() {
+                    match apply_model_switch(
+                        &mut backend,
+                        &mut rollouts,
+                        current,
+                        &tx,
+                        &mut effort,
+                        selection,
+                        &submission.id,
+                    ) {
+                        Ok(parsed) => {
+                            session_models[current] = Some(parsed.as_str().to_string());
+                        }
+                        Err(message) => {
+                            let _ = tx.send(Event::new(
+                                submission.id.clone(),
+                                EventMsg::Error { message },
+                            ));
+                        }
+                    }
+                }
+                if let Some(level) = &profile.effort {
+                    // The declared value behaves exactly like `/effort`: an
+                    // `off` clears the override, anything else is the level.
+                    let applied = normalize_effort(level);
+                    effort = applied.clone();
+                    rollouts.append(
+                        current,
+                        RolloutItem::ReasoningEffortSwitched { effort: applied.clone() },
+                    );
+                    let _ = tx.send(Event::new(
+                        submission.id.clone(),
+                        EventMsg::ReasoningEffortSwitched { effort: applied },
+                    ));
+                }
+                rollouts.append(current, RolloutItem::ProfileSwitched { name: name.clone() });
+                let _ = tx.send(Event::new(
+                    submission.id,
+                    EventMsg::ProfileSwitched { name },
+                ));
+            }
             Op::Shutdown => {
                 let _ = tx.send(Event::new(submission.id, EventMsg::ShutdownComplete));
                 break;
@@ -810,7 +910,13 @@ async fn run_turn(
                 interrupt.clear();
                 return;
             }
-            execute_tool_call(turn, conversation, rollouts, current, tx, deps, call);
+            // `false` = interrupted while the tool ran; its unrecorded result
+            // is dropped and the turn ends aborted.
+            if !execute_tool_call(turn, conversation, rollouts, current, tx, deps, call).await {
+                finalize_aborted(turn, conversation, rollouts, current, tx);
+                interrupt.clear();
+                return;
+            }
         }
 
         if round >= MAX_TOOL_ROUNDS {
@@ -855,8 +961,12 @@ fn commit_round_text(
 }
 
 /// Run one tool call, record it everywhere, and tell the front-end. Failures
-/// become the tool message's content so the model can react to them.
-fn execute_tool_call(
+/// become the tool message's content so the model can react to them. Returns
+/// `false` when the turn was interrupted while the call ran: nothing is
+/// recorded for it (the caller finalizes the abort), and the abandoned call
+/// keeps running on the blocking pool with its result dropped — a blocking
+/// task cannot be cancelled, only ignored.
+async fn execute_tool_call(
     turn: &mut ActiveTurn,
     conversation: &mut Conversation,
     rollouts: &mut Rollouts,
@@ -864,9 +974,22 @@ fn execute_tool_call(
     tx: &mpsc::UnboundedSender<Event>,
     deps: &TurnContext,
     call: ToolCall,
-) {
-    let outcome = match deps.executor.as_ref() {
-        Some(executor) => executor.execute(&call),
+) -> bool {
+    let outcome = match deps.executor.clone() {
+        // The executor is synchronous plugin code: run it on the blocking
+        // pool so a slow tool cannot stall the worker, and let an interrupt
+        // win over a still-running call.
+        Some(executor) => {
+            let owned = call.clone();
+            tokio::select! {
+                biased;
+                _ = turn.cancel.cancelled() => return false,
+                outcome = tokio::task::spawn_blocking(move || executor.execute(&owned)) => {
+                    outcome
+                        .unwrap_or_else(|error| Err(format!("tool `{}` task failed: {error}", call.name)))
+                }
+            }
+        }
         None => Err(format!(
             "tool `{}` is not available: no tool executor is configured",
             call.name
@@ -897,6 +1020,7 @@ fn execute_tool_call(
             content,
         },
     );
+    true
 }
 
 /// Switch the backend to `selection` and record it everywhere: the rollout
@@ -1321,6 +1445,65 @@ mod tests {
         assert_eq!(seen[1][3].content, "error: nope: missing");
     }
 
+    /// Blocks inside `execute` until released, announcing that it entered —
+    /// the stand-in for a slow tool.
+    struct GateExecutor {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ToolExecutor for GateExecutor {
+        fn execute(&self, _call: &ToolCall) -> Result<String, String> {
+            use std::sync::atomic::Ordering;
+            let _ = self.entered.send(());
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok("released".to_string())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_lands_during_a_slow_tool_call() {
+        use std::sync::atomic::Ordering;
+
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = ScriptedClient::new(vec![vec![StreamItem::ToolCalls(vec![tool_call(
+            "c1", "gate",
+        )])]]);
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(GateExecutor {
+                    entered,
+                    release: release.clone(),
+                })),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        // Wait until the call is running on the blocking pool, then interrupt
+        // mid-call and let the tool finish its wait.
+        entered_rx.recv().await.expect("the tool started");
+        session.interrupt();
+        release.store(true, Ordering::SeqCst);
+
+        let events = collect_turn(&mut session).await;
+        // The abandoned call leaves no trace: no tool-call event, no result,
+        // and no follow-up round against the model.
+        let messages: Vec<&EventMsg> = events.iter().map(|event| &event.msg).collect();
+        assert!(matches!(
+            messages.as_slice(),
+            [EventMsg::TurnStarted, EventMsg::TurnAborted { .. }, EventMsg::TurnComplete]
+        ));
+        assert_eq!(seen.lock().expect("lock").len(), 1);
+    }
+
     #[tokio::test]
     async fn tool_calls_without_an_executor_error_but_keep_the_turn_going() {
         let client = ScriptedClient::new(vec![
@@ -1697,6 +1880,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry =
@@ -1776,6 +1960,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry = crate::core::providers::ProviderRegistry::build(
@@ -1889,6 +2074,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: true,
         };
         let registry = crate::core::providers::ProviderRegistry::build(&[], vec![instance])
@@ -2020,6 +2206,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry =
@@ -2038,6 +2225,7 @@ mod tests {
                 name: None,
                 provider: Some("test".to_string()),
                 model: Some("two".to_string()),
+                profile: None,
             },
             path: std::path::PathBuf::from("/tmp/saved.jsonl"),
             model: Some("test/two".to_string()),
@@ -2046,6 +2234,7 @@ mod tests {
             total_output: 0,
             messages: vec![Message::user("hello"), Message::assistant("hi")],
             name: None,
+            profile: None,
         };
 
         // Plain startup: the fresh session runs on the configured test/one.
@@ -2206,6 +2395,105 @@ mod tests {
         assert_eq!(seen.len(), 1);
         let options = options.lock().expect("lock");
         assert_eq!(options[0].effort, Some("high".to_string()));
+    }
+
+    #[tokio::test]
+    async fn switching_profile_applies_its_presets_and_records_them() {
+        let mut two = ModelInfo::from_id("two");
+        two.default_level = Some("high".to_string());
+        let (seen, options) = recording_handles("rec-profile");
+        let mut profiles = ProfileSet::new();
+        profiles.insert(
+            "deep".to_string(),
+            crate::core::config::Profile {
+                default: Some("rec-profile/two".to_string()),
+                effort: Some("low".to_string()),
+                ..Default::default()
+            },
+        );
+        profiles.insert(
+            "calm".to_string(),
+            crate::core::config::Profile {
+                effort: Some("off".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut session = AgentSession::spawn_with_pool(
+            recording_pool("rec-profile", vec![ModelInfo::from_id("one"), two]),
+            Some(&Selection::new("rec-profile", "one")),
+            "be brief",
+            SessionBootstrap {
+                profiles: Arc::new(profiles),
+                ..SessionBootstrap::default()
+            },
+        )
+        .expect("initial selection resolves");
+
+        // `deep` moves the selection to rec-profile/two — whose default_level
+        // seeds `high` first (the same reseed a `/model` switch does), then
+        // the profile's own effort wins with `low` — and the confirmation
+        // names the profile.
+        session.switch_profile("deep");
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().await {
+            let done = matches!(event.msg, EventMsg::ProfileSwitched { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(
+            matches!(&events[0].msg, EventMsg::ModelSwitched { model } if model == "rec-profile/two"),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[1].msg, EventMsg::ReasoningEffortSwitched { effort } if effort.as_deref() == Some("high")),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[2].msg, EventMsg::ReasoningEffortSwitched { effort } if effort.as_deref() == Some("low")),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[3].msg, EventMsg::ProfileSwitched { name } if name == "deep"),
+            "{events:?}"
+        );
+
+        // A profile without a selection keeps the current model; `off`
+        // clears the effort override exactly like `/effort off`.
+        session.switch_profile("calm");
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().await {
+            let done = matches!(event.msg, EventMsg::ProfileSwitched { .. });
+            events.push(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            matches!(&events[0].msg, EventMsg::ReasoningEffortSwitched { effort } if effort.is_none()),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[1].msg, EventMsg::ProfileSwitched { name } if name == "calm"),
+            "{events:?}"
+        );
+
+        // An unknown name is an error, not a switch.
+        session.switch_profile("nope");
+        let event = session.next_event().await.expect("error event");
+        assert!(matches!(&event.msg, EventMsg::Error { .. }), "{event:?}");
+
+        // The presets actually reached the wire: the last turn options carry
+        // the cleared effort (no `effort` field at all).
+        session.submit_user_turn("hello");
+        collect_turn(&mut session).await;
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        let options = options.lock().expect("lock");
+        assert_eq!(options[0].effort, None);
     }
 
     #[tokio::test]

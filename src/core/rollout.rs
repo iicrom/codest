@@ -137,6 +137,11 @@ pub struct SessionMeta {
     /// The model half of the initial selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The profile this session started with (`--profile`/`profiles.toml`);
+    /// later switches are appended as [`RolloutItem::ProfileSwitched`] items.
+    /// Absent in files written before profiles existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// One persisted record, distilled from codex's `RolloutItem` to what a chat
@@ -189,6 +194,12 @@ pub enum RolloutItem {
         input: u64,
         output: u64,
     },
+    /// The named profile became active (`Op::SwitchProfile`). Metadata for
+    /// attribution — it tracks which preset produced the session's tail, not
+    /// a conversation change.
+    ProfileSwitched {
+        name: String,
+    },
 }
 
 /// One JSONL line: a timestamp plus the payload's fields flattened in.
@@ -220,6 +231,9 @@ pub struct LoadedSession {
     /// [`RolloutItem::Cleared`]).
     pub total_input: u64,
     pub total_output: u64,
+    /// The profile last active in this session, replayed from the meta line
+    /// and [`RolloutItem::ProfileSwitched`] items.
+    pub profile: Option<String>,
 }
 
 /// Creates rollout files for new sessions.
@@ -235,12 +249,14 @@ impl RolloutWriter {
 
     /// Create a new rollout file (meta line included) for a fresh session.
     /// The id comes from the current time; on the unlikely name collision the
-    /// id is regenerated. `provider`/`model` record the initial selection.
+    /// id is regenerated. `provider`/`model` record the initial selection,
+    /// `profile` the profile the run started with.
     pub fn start_session(
         &self,
         system_prompt: &str,
         provider: Option<&str>,
         model: Option<&str>,
+        profile: Option<&str>,
     ) -> io::Result<RolloutFile> {
         std::fs::create_dir_all(&self.dir)?;
         let mut last_error = None;
@@ -258,6 +274,7 @@ impl RolloutWriter {
                 name: None,
                 provider: provider.map(str::to_string),
                 model: model.map(str::to_string),
+                profile: profile.map(str::to_string),
             };
             match OpenOptions::new().create_new(true).append(true).open(&path) {
                 Ok(file) => {
@@ -342,6 +359,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     let mut messages = Vec::new();
     let mut name = None;
     let mut model = None;
+    let mut profile = None;
     let mut last_usage = None;
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
@@ -365,6 +383,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                     (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
                     _ => None,
                 };
+                profile = session_meta.profile.clone();
                 meta = Some(session_meta);
             }
             RolloutItem::UserMessage { message } => messages.push(Message::user(message)),
@@ -401,6 +420,9 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 total_input = total_input.saturating_add(input);
                 total_output = total_output.saturating_add(output);
             }
+            RolloutItem::ProfileSwitched { name } => {
+                profile = Some(name);
+            }
         }
     }
 
@@ -419,6 +441,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
         last_usage,
         total_input,
         total_output,
+        profile,
     })
 }
 
@@ -474,7 +497,7 @@ mod tests {
     fn start_session_writes_meta_and_reloads() {
         let dir = tempdir("start");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None).expect("start");
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
 
         assert!(rollout.path.starts_with(&dir));
         rollout
@@ -502,7 +525,7 @@ mod tests {
     fn replay_applies_clears_and_renames_in_order() {
         let dir = tempdir("replay");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None).expect("start");
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
 
         rollout
             .append(&RolloutItem::UserMessage {
@@ -531,10 +554,10 @@ mod tests {
     fn listing_sorts_oldest_first() {
         let dir = tempdir("list");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let first = writer.start_session("one", None, None).expect("start");
+        let first = writer.start_session("one", None, None, None).expect("start");
         // Ensure distinct ids even with a coarse clock.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = writer.start_session("two", None, None).expect("start");
+        let second = writer.start_session("two", None, None, None).expect("start");
 
         let listed = list_workspace_sessions(&dir).expect("list");
         assert_eq!(listed, vec![first.path, second.path]);
@@ -544,7 +567,7 @@ mod tests {
     fn load_skips_unknown_item_types() {
         let dir = tempdir("unknown");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None).expect("start");
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -569,7 +592,7 @@ mod tests {
     fn reasoning_effort_switched_round_trips_and_replay_ignores_it() {
         let dir = tempdir("effort");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None).expect("start");
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::ReasoningEffortSwitched {
                 effort: Some("high".to_string()),
@@ -590,11 +613,43 @@ mod tests {
     }
 
     #[test]
+    fn profile_round_trips_and_replays_the_last_active_one() {
+        let dir = tempdir("profile");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer
+            .start_session("be brief", None, None, Some("code"))
+            .expect("start");
+        // The meta line seeds the startup profile…
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.profile.as_deref(), Some("code"));
+
+        // …and switches supersede it in file order.
+        rollout
+            .append(&RolloutItem::ProfileSwitched {
+                name: "fast".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "hello".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ProfileSwitched {
+                name: "code".to_string(),
+            })
+            .expect("append");
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.profile.as_deref(), Some("code"));
+        assert_eq!(loaded.messages.len(), 1, "metadata, not conversation");
+    }
+
+    #[test]
     fn replay_tracks_the_last_used_model() {
         let dir = tempdir("model");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
         let mut rollout = writer
-            .start_session("be brief", Some("openai"), Some("gpt-4o-mini"))
+            .start_session("be brief", Some("openai"), Some("gpt-4o-mini"), None)
             .expect("start");
         // The meta line seeds the initial selection…
         let loaded = load_session(&rollout.path).expect("load");
@@ -639,7 +694,7 @@ mod tests {
     fn turn_usage_round_trips_and_clear_resets_it() {
         let dir = tempdir("usage");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None).expect("start");
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "first".to_string(),

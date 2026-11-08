@@ -57,6 +57,11 @@ pub struct ToolCall {
 
 /// Executes tool calls on behalf of the worker. Implemented by the plugin
 /// host, which dispatches to the plugin that declared the tool.
+///
+/// The contract is synchronous (`&self`, plain return), but the turn runner
+/// moves every call onto the blocking pool and watches the interrupt token
+/// while it runs: implementations may block freely, and an interrupted turn
+/// discards the outcome of a still-running call.
 pub trait ToolExecutor: Send + Sync {
     fn execute(&self, call: &ToolCall) -> Result<String, String>;
 }

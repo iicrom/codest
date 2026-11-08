@@ -362,23 +362,29 @@ pub enum PluginHostError {
     DuplicatePluginId { id: &'static str },
     #[error("tool `{name}` is declared more than once")]
     DuplicateTool { name: &'static str },
+    #[error("tool filter names unknown plugin `{id}` (known: {known})")]
+    UnknownFilteredPlugin { id: String, known: String },
     #[error(transparent)]
     CommandTable(#[from] CommandTableError),
 }
 
 /// Owns the static plugin list and the command table they contribute.
 pub struct PluginHost {
-    plugins: &'static [&'static dyn Plugin],
+    plugins: Vec<&'static dyn Plugin>,
     table: CommandTable,
     ids: Vec<&'static str>,
     /// Declared tool names paired with the plugin that owns each one.
     tools: Vec<(&'static str, &'static dyn Plugin)>,
+    /// Which plugins' tools are declared and executable: `None` keeps every
+    /// plugin's tools; `Some(ids)` keeps only the named plugins'. Commands,
+    /// hooks, prompts, and protocols are never filtered.
+    tool_filter: Option<Vec<String>>,
 }
 
 impl PluginHost {
     /// Validate plugin ids and build the command table they contribute.
     pub fn new(plugins: &'static [&'static dyn Plugin]) -> Result<Self, PluginHostError> {
-        Self::with_extra_commands(plugins, &[])
+        Self::with_extra_commands(plugins, &[], None)
     }
 
     /// Build a host whose command table also carries front-end built-in
@@ -388,6 +394,7 @@ impl PluginHost {
     fn with_extra_commands(
         plugins: &'static [&'static dyn Plugin],
         extra: &[&'static [CommandSpec]],
+        tool_filter: Option<Vec<String>>,
     ) -> Result<Self, PluginHostError> {
         let mut ids = Vec::with_capacity(plugins.len());
         for plugin in plugins {
@@ -399,6 +406,20 @@ impl PluginHost {
                 return Err(PluginHostError::DuplicatePluginId { id });
             }
             ids.push(id);
+        }
+
+        // A tool filter naming a plugin that does not exist would silently
+        // strip the wrong tools, so it is a startup error — same discipline
+        // as the configuration files.
+        if let Some(enabled) = &tool_filter {
+            for id in enabled {
+                if !ids.contains(&id.as_str()) {
+                    return Err(PluginHostError::UnknownFilteredPlugin {
+                        id: id.clone(),
+                        known: ids.join(", "),
+                    });
+                }
+            }
         }
 
         let specs = plugins
@@ -421,29 +442,41 @@ impl PluginHost {
         }
 
         Ok(Self {
-            plugins,
+            plugins: plugins.to_vec(),
             table,
             ids,
             tools,
+            tool_filter,
         })
     }
 
     /// The plugins compiled into the binary, plus the built-in front-end
     /// commands (`/new`, `/rename`, `/sessions`, `/model`, `/effort`,
-    /// `/thinking`) that the front-end handles itself.
+    /// `/thinking`, `/profile`) that the front-end handles itself.
     pub fn builtin() -> Result<Self, PluginHostError> {
+        Self::builtin_with_tools(None)
+    }
+
+    /// The builtin host with a profile's tool filter applied: `Some(ids)`
+    /// declares and executes only the named plugins' tools (unknown ids are
+    /// a startup error), `None` keeps every plugin's tools. Everything else
+    /// a plugin contributes is untouched — a profile composes the session,
+    /// it does not uninstall plugins.
+    pub fn builtin_with_tools(enabled: Option<&[String]>) -> Result<Self, PluginHostError> {
         Self::with_extra_commands(
             BUILTIN_PLUGINS,
             &[
                 crate::core::sessions::SESSION_COMMANDS,
                 crate::core::providers::MODEL_COMMANDS,
                 crate::core::reasoning::REASONING_COMMANDS,
+                crate::core::config::PROFILE_COMMANDS,
             ],
+            enabled.map(<[String]>::to_vec),
         )
     }
 
-    pub fn plugins(&self) -> &'static [&'static dyn Plugin] {
-        self.plugins
+    pub fn plugins(&self) -> &[&'static dyn Plugin] {
+        &self.plugins
     }
 
     pub fn plugin_ids(&self) -> &[&'static str] {
@@ -491,7 +524,7 @@ impl PluginHost {
         if !base.trim_end().is_empty() {
             sections.push((String::from("base"), base.trim_end().to_string()));
         }
-        for plugin in self.plugins {
+        for plugin in &self.plugins {
             if let Some(fragment) = plugin
                 .system_prompt()
                 .filter(|fragment| !fragment.trim().is_empty())
@@ -505,12 +538,23 @@ impl PluginHost {
         sections
     }
 
-    /// Every tool the plugins declared, in registration order.
+    /// Every tool the enabled plugins declared, in registration order — the
+    /// tool filter ([`PluginHost::builtin_with_tools`]) applies here, so the
+    /// model only ever sees the tools the profile kept.
     pub fn tools(&self) -> Vec<ToolSpec> {
         self.plugins
             .iter()
+            .filter(|plugin| self.tool_plugin_enabled(plugin.id()))
             .flat_map(|plugin| plugin.tools().iter().copied())
             .collect()
+    }
+
+    /// Whether `id`'s tools pass the host's tool filter.
+    fn tool_plugin_enabled(&self, id: &str) -> bool {
+        match &self.tool_filter {
+            None => true,
+            Some(enabled) => enabled.iter().any(|name| name == id),
+        }
     }
 
     fn tool_owner(&self, name: &str) -> Option<&'static dyn Plugin> {
@@ -518,6 +562,7 @@ impl PluginHost {
             .iter()
             .find(|(tool, _)| *tool == name)
             .map(|(_, plugin)| *plugin)
+            .filter(|plugin| self.tool_plugin_enabled(plugin.id()))
     }
 
     pub fn parse(&self, input: &str) -> CommandInput {
@@ -575,7 +620,7 @@ impl PluginHost {
         mut hook: impl FnMut(&dyn Plugin, &mut PluginContext<'_>),
     ) -> Vec<PluginEffect> {
         let mut ctx = PluginContext::new(&self.table, info);
-        for plugin in self.plugins {
+        for plugin in &self.plugins {
             hook(*plugin, &mut ctx);
         }
         ctx.into_effects()
@@ -925,6 +970,53 @@ mod tests {
     }
 
     #[test]
+    fn tool_filter_keeps_only_the_named_plugins_tools() {
+        // TOOLER declares the `ping` tool; ECHO declares the `/echo` command.
+        // Enabling only echo's tools strips the tool but keeps its command.
+        static FILTERED: &[&dyn Plugin] = &[&ECHO, &TOOLER_PLUGIN];
+        let host = PluginHost::with_extra_commands(
+            FILTERED,
+            &[],
+            Some(vec!["echo".to_string()]),
+        )
+        .expect("valid host");
+        assert!(host.tools().is_empty(), "tooler's tool is filtered out");
+        assert!(
+            matches!(host.parse("/echo hi"), CommandInput::Command(_)),
+            "commands are never filtered"
+        );
+
+        // The filtered tool is not executable either — the model was never
+        // told about it, so a call is a hallucination.
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "ping".to_string(),
+            arguments: "{}".to_string(),
+        };
+        assert_eq!(host.execute(&call), Err("unknown tool `ping`".to_string()));
+
+        // Enabling tooler keeps the tool, and `None` keeps everything.
+        let host = PluginHost::with_extra_commands(
+            FILTERED,
+            &[],
+            Some(vec!["tooler".to_string()]),
+        )
+        .expect("valid host");
+        assert_eq!(host.tools(), vec![PING_TOOL]);
+    }
+
+    #[test]
+    fn an_unknown_tool_filter_id_is_a_startup_error() {
+        let error = PluginHost::builtin_with_tools(Some(&["nope".to_string()])).unwrap_err();
+        assert!(matches!(error, PluginHostError::UnknownFilteredPlugin { .. }));
+        assert!(error.to_string().contains("nope"), "{error}");
+        assert!(
+            error.to_string().contains("help"),
+            "the known ids are listed: {error}"
+        );
+    }
+
+    #[test]
     fn system_prompt_sections_label_base_and_plugins() {
         let host = PluginHost::new(PERSONA_PLUGINS).expect("valid plugins");
         assert_eq!(
@@ -954,7 +1046,7 @@ mod tests {
             names,
             vec![
                 "help", "clear", "quit", "status", "context", "new", "rename", "sessions",
-                "model", "effort", "thinking"
+                "model", "effort", "thinking", "profile"
             ]
         );
     }
@@ -1021,6 +1113,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry = crate::core::providers::ProviderRegistry::build(&factories, vec![instance])

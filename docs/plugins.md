@@ -468,9 +468,14 @@ cargo clippy --all-targets -- -D warnings
 1. **分布式注册**：用 `inventory`/`linkme` 替换静态数组，保持 `Plugin` 契约不变。
 2. **编译期开关**：按 Cargo feature 裁剪内置插件，做“最小 cst”。
 3. **异步 effect**：`PluginEffect::Task` 或 `on_turn_complete` 的 async 版本，
-   让插件做网络/文件操作而不阻塞渲染。
+   让插件做网络/文件操作而不阻塞渲染。工具调用这一半已先行落地——回合
+   循环把每次工具执行放上阻塞池并对中断即时响应（见 `docs/profiles.md`
+   §8）；剩余的是启动/命令 effect 的任务化，等真实插件需要阻塞 I/O 再做。
 4. **工具调用插件**：把 `Op`/`EventMsg` 扩展到 tool call，让插件注册工具，
    这是从“本地指令插件”走向“agent 能力插件”的关键一步。
 5. **渲染扩展**：允许插件提供纯数据 cell（标题、表格、diff），由 TUI 统一渲染，
    而不是让插件直接接触 ratatui。
 6. **配置化启停**：在静态注册的基础上增加按名称/配置过滤的 host 构造方式。
+   设计已并入 profile 方案——`tools` 字段驱动过滤，见 `docs/profiles.md`
+   §4、§8；provider 侧的字段拼写差异同样走数据层（`[providers.wire]`
+   quirk 字段，`docs/profiles.md` §5）。

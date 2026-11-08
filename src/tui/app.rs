@@ -102,14 +102,26 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
 
+/// The profile side of startup: the whole `profiles.toml` table (for
+/// `/profile` listing and `Op::SwitchProfile` lookups) plus the name this
+/// run started with (`--profile`). The active profile's tool filter is
+/// already applied to the plugin host; its prompt and effort presets are
+/// applied in [`run`].
+pub struct ProfileStartup {
+    pub set: Arc<crate::core::config::ProfileSet>,
+    pub active: Option<String>,
+}
+
 /// Run the TUI until the user quits or the agent worker stops.
 ///
 /// `plugins` carries the command table (and the provider factories already
 /// merged into `pool`'s registry); `selection` is the model this run starts
 /// with, or `None` when nothing is configured — the app then opens with an
-/// empty route and guides the user on the first send. Providers with models
-/// discovery enabled are refreshed in the background, best-effort: results
-/// arrive as transcript notices.
+/// empty route and guides the user on the first send. `profiles` carries the
+/// profile set and the name of the profile this run started with (its tool
+/// filter is already applied to `plugins`). Providers with models discovery
+/// enabled are refreshed in the background, best-effort: results arrive as
+/// transcript notices.
 pub async fn run(
     plugins: Arc<PluginHost>,
     pool: Arc<ModelPool>,
@@ -117,14 +129,35 @@ pub async fn run(
     system_prompt: Option<String>,
     mode: TuiMode,
     restore: RestoreMode,
+    profiles: ProfileStartup,
 ) -> Result<()> {
     // Created before setup so a partial setup still restores the terminal.
     let _guard = TerminalGuard { mode };
     let mut terminal = Some(setup_terminal(mode)?);
 
+    // The active profile's prompt addition is the most specific fragment:
+    // it gets the last word, after the plugin fragments, and `/context`
+    // attributes it to `profile:<name>`.
     let base_prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
-    let system_prompt = plugins.system_prompt(&base_prompt);
-    let system_sections = plugins.system_prompt_sections(&base_prompt);
+    let mut system_prompt = plugins.system_prompt(&base_prompt);
+    let mut system_sections = plugins.system_prompt_sections(&base_prompt);
+    let profile_append = profiles
+        .active
+        .as_deref()
+        .and_then(|name| profiles.set.get(name))
+        .and_then(|active| active.prompt.append.as_deref())
+        .filter(|text| !text.trim().is_empty());
+    if let Some(text) = profile_append {
+        if !system_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+        }
+        system_prompt.push_str(text.trim());
+        let name = profiles.active.as_deref().unwrap_or_default();
+        system_sections.push((
+            format!("profile:{name}"),
+            text.trim().to_string(),
+        ));
+    }
 
     // The workspace's saved sessions are always loaded so `/sessions` shows
     // the same list no matter how codest was started. Plain startup opens a
@@ -143,6 +176,26 @@ pub async fn run(
     // run so the backend, the footer, and the effort seeding all pick up
     // where the session left off — before anything renders.
     let selection = restore_model_selection(&pool, selection, &loaded, fresh);
+    // The profile is a fresh-start preset: a restored session restores its
+    // own state instead, though the profile it last used is still shown as
+    // the active one.
+    let initial_effort = if fresh {
+        profiles
+            .active
+            .as_deref()
+            .and_then(|name| profiles.set.get(name))
+            .and_then(|active| active.effort.clone())
+    } else {
+        None
+    };
+    let active_profile = if fresh {
+        profiles.active.clone()
+    } else {
+        loaded
+            .last()
+            .and_then(|session| session.profile.clone())
+            .or_else(|| profiles.active.clone())
+    };
 
     let session = AgentSession::spawn_with_pool(
         pool.clone(),
@@ -155,6 +208,9 @@ pub async fn run(
             fresh,
             tools: plugins.tools(),
             executor: Some(plugins.clone()),
+            profiles: profiles.set.clone(),
+            profile: profiles.active.clone(),
+            initial_effort: initial_effort.clone(),
         },
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -176,6 +232,9 @@ pub async fn run(
         system_sections,
         views,
         active_view,
+        profiles.set,
+        active_profile,
+        initial_effort,
     );
     if restore == RestoreMode::Picker {
         app.open_session_menu();
@@ -405,6 +464,11 @@ struct App {
     /// effort field at all. Updated optimistically, confirmed by
     /// `ReasoningEffortSwitched`.
     effort: Option<String>,
+    /// The available profiles (`~/.codest/profiles.toml`), for `/profile`.
+    profiles: Arc<crate::core::config::ProfileSet>,
+    /// The profile this run or restored session last activated; `None` when
+    /// running without one.
+    active_profile: Option<String>,
     /// The effective system prompt as labeled sections (`base` +
     /// `plugin:<id>`), kept in registration order for the `/context` report.
     system_sections: Vec<(String, String)>,
@@ -497,19 +561,28 @@ impl App {
         system_sections: Vec<(String, String)>,
         views: Vec<SessionView>,
         active_view: usize,
+        profiles: Arc<crate::core::config::ProfileSet>,
+        active_profile: Option<String>,
+        initial_effort: Option<String>,
     ) -> Self {
         let (inline_columns, inline_rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let inline_height = inline_pane_height(inline_rows, 1, false, 0);
         let inline_top = inline_rows.saturating_sub(inline_height);
 
         let route = Selection::parse(&model_label).ok();
-        // A model that declares a `default_level` starts with that effort —
-        // the same value the worker seeds, so footer and requests agree
-        // until `/effort` overrides either side.
-        let effort = route
-            .as_ref()
-            .and_then(|route| pool.model_info(route))
-            .and_then(|model| model.default_level);
+        // A startup effort preset (the active profile's `effort`, normalized
+        // like `/effort` so `off` clears) wins; otherwise a model that
+        // declares a `default_level` starts with that — the same value the
+        // worker seeds, so footer and requests agree until `/effort`
+        // overrides either side.
+        let effort = initial_effort
+            .map(|value| reasoning::normalize_effort(&value))
+            .unwrap_or_else(|| {
+                route
+                    .as_ref()
+                    .and_then(|route| pool.model_info(route))
+                    .and_then(|model| model.default_level)
+            });
 
         let tools = plugins.tools();
         let mut app = Self {
@@ -528,6 +601,8 @@ impl App {
             model_menu: None,
             effort_menu: None,
             effort,
+            profiles,
+            active_profile,
             system_sections,
             request_facts: RequestFacts::default(),
             tools,
@@ -1104,6 +1179,14 @@ impl App {
                 return self.set_effort(&invocation.args);
             }
             "thinking" => return self.toggle_thinking(),
+            // `/profile` with a name applies the profile's presets at the
+            // next turn boundary; with no argument it lists the profiles.
+            "profile" => {
+                if invocation.args.is_empty() {
+                    return self.list_profiles();
+                }
+                return self.request_profile_switch(&invocation.args);
+            }
             _ => {}
         }
         let effects = self
@@ -1383,11 +1466,7 @@ impl App {
             self.view_mut().history.push(HistoryCell::Error(error));
             return;
         }
-        let effort = if value.eq_ignore_ascii_case(reasoning::EFFORT_OFF) {
-            None
-        } else {
-            Some(value.to_ascii_lowercase())
-        };
+        let effort = reasoning::normalize_effort(value);
         self.apply_effort(effort);
     }
 
@@ -1438,6 +1517,71 @@ impl App {
         } else {
             (menu.selected + 1) % len
         };
+    }
+
+    /// `/profile` with no argument: list the available profiles, marking the
+    /// active one with each one's presets.
+    fn list_profiles(&mut self) {
+        if self.profiles.is_empty() {
+            self.view_mut().history.push(HistoryCell::Notice(format!(
+                "no profiles in {}",
+                crate::core::config::profiles_path().display()
+            )));
+            return;
+        }
+        let lines = self
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                let marker = if self.active_profile.as_deref() == Some(name.as_str()) {
+                    "* "
+                } else {
+                    "  "
+                };
+                let mut line = format!("{marker}{name}");
+                if let Some(selection) = profile.default_selection() {
+                    line.push_str(&format!(" — {selection}"));
+                }
+                if let Some(effort) = &profile.effort {
+                    line.push_str(&format!(", effort {effort}"));
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.view_mut().history.push(HistoryCell::Notice(lines));
+    }
+
+    /// `/profile <name>`: apply the profile's presets (declared selection and
+    /// effort) at the next turn boundary. Ops are FIFO, so a switch never
+    /// lands mid-turn; the worker confirms with `ProfileSwitched`, and an
+    /// unresolvable selection arrives as an error cell. Assembly-time values
+    /// (tools, system prompt) are startup-only and untouched.
+    fn request_profile_switch(&mut self, args: &str) {
+        let name = args.trim();
+        let Some(_) = self.profiles.get(name) else {
+            let available = if self.profiles.is_empty() {
+                "none".to_string()
+            } else {
+                self.profiles
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            self.view_mut().history.push(HistoryCell::Error(format!(
+                "no profile `{name}` is configured (available: {available})"
+            )));
+            return;
+        };
+        if self.active_profile.as_deref() == Some(name) {
+            return;
+        }
+        self.active_profile = Some(name.to_string());
+        let view = self.view_mut();
+        view.history
+            .push(HistoryCell::Notice(format!("switched to profile `{name}`")));
+        self.session.switch_profile(name);
     }
 
     /// Confirm the picker: picking the already-active level just closes the
@@ -1641,6 +1785,13 @@ impl App {
                 // `/effort` already updated optimistically; the core confirms
                 // (also covering non-TUI front-ends).
                 self.effort = effort;
+            }
+            EventMsg::ProfileSwitched { name } => {
+                // `/profile` already updated optimistically; the core
+                // confirms (also covering non-TUI front-ends). The preset's
+                // selection and effort changes ride along as their own
+                // events, handled above.
+                self.active_profile = Some(name);
             }
             EventMsg::AgentMessage { message } => {
                 self.view_mut().live = Some(message);
@@ -2507,6 +2658,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2534,6 +2686,40 @@ mod tests {
             Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
+        )
+    }
+
+    /// An app whose worker and `/profile` state share one profile table.
+    fn test_app_with_profiles(profiles: crate::core::config::ProfileSet) -> App {
+        let pool = test_pool();
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            Some(&Selection::new("test", "one")),
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap {
+                profiles: Arc::new(profiles.clone()),
+                ..SessionBootstrap::default()
+            },
+        )
+        .expect("initial selection resolves");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            "test/one".to_string(),
+            TuiMode::Fullscreen,
+            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Vec::new(),
+            vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
+            0,
+            Arc::new(profiles),
+            None,
+            None,
         )
     }
 
@@ -2549,6 +2735,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: true,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2576,6 +2763,9 @@ mod tests {
             Vec::new(),
             vec![SessionView::initial("openai/m1", TuiMode::Fullscreen)],
             0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
         )
     }
 
@@ -2594,6 +2784,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2621,6 +2812,9 @@ mod tests {
             Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
         )
     }
 
@@ -2638,6 +2832,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2665,6 +2860,9 @@ mod tests {
             Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
         )
     }
 
@@ -2707,6 +2905,7 @@ mod tests {
             fetch_models: None,
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: true,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2730,6 +2929,9 @@ mod tests {
             Vec::new(),
             vec![SessionView::initial("no model", TuiMode::Fullscreen)],
             0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
         )
     }
 
@@ -2757,6 +2959,9 @@ mod tests {
             Vec::new(),
             vec![SessionView::initial("no model", TuiMode::Fullscreen)],
             0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
         )
     }
 
@@ -2775,6 +2980,74 @@ mod tests {
                 line.trim_end().to_string()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn profile_command_lists_switches_and_the_event_confirms() {
+        let mut profiles = crate::core::config::ProfileSet::new();
+        profiles.insert(
+            "deep".to_string(),
+            crate::core::config::Profile {
+                default: Some("test/two".to_string()),
+                effort: Some("low".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut app = test_app_with_profiles(profiles);
+        let event = |msg| crate::core::Event::new("sub-1", msg);
+
+        // No argument: the profiles are listed with their presets; nothing is
+        // active yet.
+        app.composer.set_text("/profile".to_string());
+        app.try_submit();
+        assert!(
+            matches!(app.view().history.last(),
+                Some(HistoryCell::Notice(text)) if text.contains("deep") && text.contains("test/two")),
+            "{:?}",
+            app.view().history.last()
+        );
+
+        // An unknown name: an error cell, no switch.
+        app.composer.set_text("/profile nope".to_string());
+        app.try_submit();
+        assert!(matches!(app.view().history.last(), Some(HistoryCell::Error(_))));
+        assert_eq!(app.active_profile, None);
+
+        // A known name: the optimistic notice goes out and the op follows.
+        app.composer.set_text("/profile deep".to_string());
+        app.try_submit();
+        assert!(
+            matches!(app.view().history.last(),
+                Some(HistoryCell::Notice(text)) if text.contains("profile `deep`")),
+            "{:?}",
+            app.view().history.last()
+        );
+        assert_eq!(app.active_profile.as_deref(), Some("deep"));
+
+        // The listing now marks the active profile.
+        app.composer.set_text("/profile".to_string());
+        app.try_submit();
+        assert!(
+            matches!(app.view().history.last(),
+                Some(HistoryCell::Notice(text)) if text.contains("* deep")),
+            "{:?}",
+            app.view().history.last()
+        );
+
+        // The worker's confirmation updates the state silently; the preset's
+        // selection and effort ride along through their own events.
+        app.handle_agent_event(event(EventMsg::ProfileSwitched {
+            name: "deep".to_string(),
+        }));
+        assert_eq!(app.active_profile.as_deref(), Some("deep"));
+        app.handle_agent_event(event(EventMsg::ModelSwitched {
+            model: "test/two".to_string(),
+        }));
+        assert_eq!(app.model_label, "test/two");
+        app.handle_agent_event(event(EventMsg::ReasoningEffortSwitched {
+            effort: Some("low".to_string()),
+        }));
+        assert_eq!(app.effort.as_deref(), Some("low"));
     }
 
     #[test]
@@ -2796,6 +3069,7 @@ mod tests {
                     name: None,
                     provider: None,
                     model: None,
+                    profile: None,
                 },
                 path: PathBuf::from(format!("/tmp/{id}.jsonl")),
                 model: None,
@@ -2804,6 +3078,7 @@ mod tests {
                 total_output: last_usage.map_or(0, |(_, output)| output),
                 messages,
                 name,
+                profile: None,
             }
         };
 
@@ -2871,6 +3146,7 @@ mod tests {
                 name: None,
                 provider: None,
                 model: None,
+                profile: None,
             },
             path: PathBuf::from("/tmp/s.jsonl"),
             model: model.map(str::to_string),
@@ -2879,35 +3155,31 @@ mod tests {
             total_output: 0,
             messages: Vec::new(),
             name: None,
+            profile: None,
         };
         let saved = vec![saved_session(Some("test/two"))];
 
         // A plain startup keeps the configured selection.
-        assert_eq!(
-            restore_model_selection(&pool, selection.clone(), &saved, true),
+        assert_eq!(            restore_model_selection(&pool, selection.clone(), &saved, true),
             selection
         );
         // A restore adopts the session's last used model…
-        assert_eq!(
-            restore_model_selection(&pool, selection.clone(), &saved, false),
+        assert_eq!(            restore_model_selection(&pool, selection.clone(), &saved, false),
             Some(Selection::new("test", "two"))
         );
         // …keeps it when it already matches…
         let already = Some(Selection::new("test", "two"));
-        assert_eq!(
-            restore_model_selection(&pool, already, &saved, false),
+        assert_eq!(            restore_model_selection(&pool, already, &saved, false),
             Some(Selection::new("test", "two"))
         );
         // …falls back when the saved provider is gone…
         let gone = vec![saved_session(Some("ghost/model"))];
-        assert_eq!(
-            restore_model_selection(&pool, selection.clone(), &gone, false),
+        assert_eq!(            restore_model_selection(&pool, selection.clone(), &gone, false),
             selection
         );
         // …and when the session never recorded a model.
         let unnamed = vec![saved_session(None)];
-        assert_eq!(
-            restore_model_selection(&pool, selection, &unnamed, false),
+        assert_eq!(            restore_model_selection(&pool, selection, &unnamed, false),
             None
         );
     }
@@ -2920,7 +3192,7 @@ mod tests {
         // Wide enough that the alias hints are not clipped.
         let lines = render_lines(&mut app, 110, 20);
         let rendered = lines.join("\n");
-        // Fifteen names (eleven commands plus four aliases) share a six-row
+        // Sixteen names (twelve commands plus four aliases) share a six-row
         // window; the first page shows /help with its aliases and the first
         // commands, aliases labeled with the command they point at.
         assert!(rendered.contains("▸ /help"), "{rendered}");
@@ -3646,10 +3918,9 @@ mod tests {
         let mut app = test_app();
 
         app.composer.set_text("/".to_string());
-        assert_eq!(
-            app.command_matches().len(),
-            15,
-            "eleven commands plus four aliases"
+        assert_eq!(            app.command_matches().len(),
+            16,
+            "twelve commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -3664,8 +3935,7 @@ mod tests {
 
         app.composer.set_text("/re".to_string());
         let matches = app.command_matches();
-        assert_eq!(
-            matches.len(),
+        assert_eq!(            matches.len(),
             2,
             "`/re` offers the /rename and /resume aliases"
         );
@@ -3696,9 +3966,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 14);
+        assert_eq!(app.command_selection, 15);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 13);
+        assert_eq!(app.command_selection, 14);
     }
 
     #[tokio::test]
@@ -3881,8 +4151,7 @@ mod tests {
 
     #[test]
     fn inline_pane_height_caps_composer_rows() {
-        assert_eq!(
-            inline_pane_height(40, 20, false, 0),
+        assert_eq!(            inline_pane_height(40, 20, false, 0),
             MAX_COMPOSER_ROWS as u16 + 2
         );
     }

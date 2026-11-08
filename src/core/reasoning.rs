@@ -63,6 +63,19 @@ pub fn validate_effort(value: &str, model_levels: Option<&[String]>) -> Result<(
     ))
 }
 
+/// The effort override a declared value translates to: `off` (and empty)
+/// clears the override entirely, anything else is the lowercased level.
+/// Shared by `/effort`, the startup seeding, and `Op::SwitchProfile` so a
+/// profile's `effort` behaves exactly like `/effort <value>`.
+pub fn normalize_effort(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case(EFFORT_OFF) {
+        None
+    } else {
+        Some(value.to_ascii_lowercase())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +112,14 @@ mod tests {
     fn empty_level_is_rejected_with_guidance() {
         let error = validate_effort("   ", None).unwrap_err();
         assert!(error.contains("empty"), "{error}");
+    }
+
+    #[test]
+    fn normalize_maps_off_and_lowercases_levels() {
+        assert_eq!(normalize_effort("off"), None);
+        assert_eq!(normalize_effort("OFF"), None);
+        assert_eq!(normalize_effort("  "), None);
+        assert_eq!(normalize_effort(""), None);
+        assert_eq!(normalize_effort(" High "), Some("high".to_string()));
     }
 }

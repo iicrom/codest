@@ -14,6 +14,7 @@ pub mod wrap;
 
 use clap::ValueEnum;
 
+pub use app::ProfileStartup;
 pub use app::run;
 
 /// How the TUI owns the terminal.

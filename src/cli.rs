@@ -57,6 +57,12 @@ struct Args {
     #[arg(long)]
     resume: bool,
 
+    /// Start with a profile from `~/.codest/profiles.toml`: its default
+    /// selection, initial effort, plugin tool set, and system-prompt
+    /// addition. An unknown name falls back to no profile with a note.
+    #[arg(long, env = "CST_PROFILE")]
+    profile: Option<String>,
+
     /// Terminal UI mode: fullscreen (alternate screen) or inline (scrollback).
     #[arg(long, value_enum, env = "CST_TUI_MODE", default_value = "fullscreen")]
     tui_mode: TuiMode,
@@ -71,11 +77,25 @@ pub async fn run(program: &'static str) -> anyhow::Result<()> {
     let matches = command.get_matches();
     let args = Args::from_arg_matches(&matches)?;
 
-    let plugins = std::sync::Arc::new(PluginHost::builtin()?);
+    let profiles = std::sync::Arc::new(
+        config::load_profiles(&config::profiles_path())
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
+    );
+    // The active profile borrows through the `Arc`; the TUI gets a clone.
+    let active: Option<(&str, &config::Profile)> = args.profile.as_deref().and_then(|name| {
+        let profile = profiles.get(name);
+        if profile.is_none() {
+            note_missing_profile(name, &profiles);
+        }
+        profile.map(|profile| (name, profile))
+    });
+    let plugins = std::sync::Arc::new(PluginHost::builtin_with_tools(
+        active.and_then(|(_, profile)| profile.tools.as_deref()),
+    )?);
     let global = config::load_global(&config::config_path())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let pool = build_pool(&plugins, &global, &args)?;
-    let selection = initial_selection(pool.registry(), &global, &args)?;
+    let selection = initial_selection(pool.registry(), &global, &args, active.map(|(_, p)| p))?;
 
     // Fail fast on an unusable selection rather than at the first turn.
     if let Some(selection) = &selection {
@@ -96,8 +116,31 @@ pub async fn run(program: &'static str) -> anyhow::Result<()> {
         args.system,
         args.tui_mode,
         restore,
+        crate::tui::ProfileStartup {
+            set: profiles.clone(),
+            active: active.map(|(name, _)| name.to_string()),
+        },
     )
     .await
+}
+
+/// The note for a `--profile` naming nothing: the run continues without a
+/// profile — a wrong name must neither fail the startup nor pass silently.
+fn note_missing_profile(name: &str, profiles: &config::ProfileSet) {
+    let available = if profiles.is_empty() {
+        "none".to_string()
+    } else {
+        profiles
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    eprintln!(
+        "codest: note: no profile `{name}` in {} (available: {available}); \
+         continuing without one",
+        config::profiles_path().display()
+    );
 }
 
 /// Load the configuration files and build the provider pool.
@@ -212,6 +255,7 @@ fn synthesized_openai_instance(args: &Args) -> Option<config::ProviderInstance> 
         fetch_models: Some(true),
         headers: Default::default(),
         body_overrides: Default::default(),
+        wire: None,
         requires_api_key: true,
     })
 }
@@ -232,14 +276,15 @@ fn resolve_provider_name(global: &config::GlobalConfig, args: &Args) -> Option<S
 /// The selection this run starts with; `None` means no route at all (the
 /// front-end guides the user to add a provider).
 ///
-/// Precedence: `--provider`/`--model` > config.toml `default` > the first
-/// model of the first instance. A model id nobody declared yet (it may still
-/// arrive through models discovery) proceeds with a warning; an unknown
-/// *provider* is a hard error.
+/// Precedence: `--provider`/`--model` > the active profile's `default` >
+/// config.toml `default` > the first model of the first instance. A model id
+/// nobody declared yet (it may still arrive through models discovery)
+/// proceeds with a warning; an unknown *provider* is a hard error.
 fn initial_selection(
     registry: &ProviderRegistry,
     global: &config::GlobalConfig,
     args: &Args,
+    profile: Option<&config::Profile>,
 ) -> anyhow::Result<Option<Selection>> {
     // No providers at all: an empty route wins over a stray `default`, so
     // the TUI can still start and guide the user.
@@ -250,6 +295,12 @@ fn initial_selection(
         return Ok(None);
     }
 
+    // The preset this run starts from: the active profile's declared
+    // selection when one is active, else the global default. Flags still
+    // override either half of it.
+    let preset = profile
+        .and_then(config::Profile::default_selection)
+        .or(global.default.as_deref());
     let selection = if let Some(provider) = args.provider.as_deref() {
         let model = args.model.clone().unwrap_or_else(|| {
             registry
@@ -259,7 +310,7 @@ fn initial_selection(
                 .unwrap_or_default()
         });
         Some(Selection::new(provider, model))
-    } else if let Some(default) = global.default.as_deref() {
+    } else if let Some(default) = preset {
         let parsed = registry
             .parse_selection(default)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -342,6 +393,58 @@ mod tests {
         Args::parse_from(argv)
     }
 
+    /// A registry with two providers, each declaring two static models.
+    fn two_provider_registry() -> ProviderRegistry {
+        let instance = |name: &str| config::ProviderInstance {
+            name: name.to_string(),
+            protocol: Some("test".to_string()),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            api_key: Some("k".to_string()),
+            models: vec![
+                config::ModelInfo::from_id("m1"),
+                config::ModelInfo::from_id("m2"),
+            ],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            wire: None,
+            requires_api_key: false,
+        };
+        ProviderRegistry::build(&[], vec![instance("p"), instance("q")]).expect("registry")
+    }
+
+    #[test]
+    fn profile_default_selection_wins_over_the_global_one() {
+        let registry = two_provider_registry();
+        let global = config::GlobalConfig {
+            default: Some("q/m2".to_string()),
+        };
+        let profile = config::Profile {
+            default: Some("p/m2".to_string()),
+            ..Default::default()
+        };
+
+        // The profile's default beats the global default.
+        let selection = initial_selection(&registry, &global, &args(&[]), Some(&profile)).unwrap();
+        assert_eq!(selection, Some(Selection::new("p", "m2")));
+
+        // `--model` still overrides the preset's model half.
+        let selection =
+            initial_selection(&registry, &global, &args(&["--model", "m1"]), Some(&profile))
+                .unwrap();
+        assert_eq!(selection, Some(Selection::new("p", "m1")));
+
+        // `--provider` wins over the preset outright (first declared model).
+        let selection =
+            initial_selection(&registry, &global, &args(&["--provider", "q"]), Some(&profile))
+                .unwrap();
+        assert_eq!(selection, Some(Selection::new("q", "m1")));
+
+        // Without a profile the global default applies again.
+        let selection = initial_selection(&registry, &global, &args(&[]), None).unwrap();
+        assert_eq!(selection, Some(Selection::new("q", "m2")));
+    }
+
     /// A pool over one synthesized-style instance, for gate assertions.
     fn pool_of(instance: config::ProviderInstance) -> Arc<ModelPool> {
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("registry");
@@ -422,6 +525,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         assert_eq!(pool_of(keyless).missing_credential_raw("local"), None);

@@ -104,12 +104,32 @@ base_url = "http://127.0.0.1:8080/v1"
 api_key = "test"
 headers = { "X-Custom" = "v" }     # 静态请求头/请求体覆盖：多数"特殊端点"免插件
 body_overrides = { temperature = 0.5 }
+
+  [providers.wire]                 # 字段拼写级 quirk（受控词汇，自由字段名）
+  thinking_fields = ["reasoning"]  # 该端点的思考文本字段（默认 reasoning_content）
+  effort_field = "none"            # /effort 的请求字段名；"none" = 从不下发
+```
+
+```toml
+# ~/.codest/profiles.toml —— 命名的会话预设（一组"模型+effort+工具+提示词"）
+[profiles.code]
+default = "openai/gpt-4o-mini"     # 初始选择
+effort = "high"                    # 初始 /effort（"off" = 不下发 effort 字段）
+tools = ["prompt_debug"]           # 只声明这些插件的工具；缺省 = 全部；空表 = 无工具
+
+  [profiles.code.prompt]
+  append = "你是资深 Rust 工程师…"  # 追加到 system prompt 末尾（/context 归属 profile:<名>）
+
+[profiles.fast]
+default = "local/qwen2.5"
+effort = "low"
 ```
 
 - **没有内置默认 provider,也没有默认 base_url/model**:flag/env 提供的 `base_url` 与 `api_key` 按**成对**要求合成单端点实例——只给了其中一个时,codest 照常启动并在发送消息或 `/model` 获取列表时提示补全另一个;两者都未提供则为空路由(见下)。显式给了 model 就直接可用;没给 model 则实例不带模型列表,由 `/model` 从该 `base_url` 的 models API 发现(启动时即后台拉取);
 - 文件存在但解析失败会启动报错（带路径与细节），未知字段同样报错；
-- 起始选择优先级：`--provider`/`--model` > config.toml `default` > 第一个实例的第一个模型；
-- 也可以用 `protocol = "test"` 选内置的进程内 echo 后端，完全离线试玩。
+- 起始选择优先级：`--provider`/`--model` > `--profile` 的 `default` > config.toml `default` > 第一个实例的第一个模型；profile 是**预设**而非第二配置层——flag 仍可覆盖其任意字段，恢复的会话恢复自己的状态；
+- `--profile <名>` 启动；`/profile` 在会话内列出/切换（在回合边界生效，rollout 记 `profile_switched`）；profile 的工具集与提示词属装配期，切换只应用其 `default`/`effort`；
+- 也可以用 `protocol = "test"` 选内置的进程内 echo 后端，完全离线试玩。设计见 [`docs/profiles.md`](docs/profiles.md)。
 
 ### `/model` 切换
 
@@ -323,7 +343,7 @@ codest/
     │   ├── model.rs         # ModelClient trait + StreamItem + 错误类型
     │   ├── openai_compat.rs # HTTP + SSE 流式客户端（openai-compat 协议）
     │   ├── sse.rs           # 共享 SSE 帧解析（所有 SSE 协议复用）
-    │   ├── config.rs        # config.toml / providers.toml 解析 + $ENV 模板
+    │   ├── config.rs        # config.toml / providers.toml / profiles.toml 解析 + $ENV 模板
     │   ├── providers.rs     # 协议工厂 / 注册表 / 模型池 / /model 命令 spec
     │   ├── rollout.rs       # 会话持久化（JSONL rollout 落盘 / 回放）
     │   ├── echo_model.rs    # 进程内 echo 模型（测试 + test 协议后端）

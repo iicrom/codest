@@ -6,9 +6,10 @@
 //! response, decode `data:` frames, and yield text deltas.
 //!
 //! The client is protocol-`openai-compat`'s implementation behind the
-//! provider registry: an instance's base URL, key, static headers, and
-//! `body_overrides` are baked in at construction. Besides `delta.content` it
-//! forwards `delta.reasoning_content` as [`StreamItem::Thinking`] and honors
+//! provider registry: an instance's base URL, key, static headers,
+//! `body_overrides`, and wire quirks are baked in at construction. Besides
+//! `delta.content` it forwards the configured reasoning delta fields
+//! (default `delta.reasoning_content`) as [`StreamItem::Thinking`] and honors
 //! usage chunks.
 //!
 //! This module deliberately knows nothing about terminals or conversations.
@@ -22,6 +23,8 @@ use serde_json::Value;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::config::EFFORT_FIELD_NONE;
+use crate::core::config::WireQuirks;
 use crate::core::model::ModelClient;
 use crate::core::model::ModelError;
 use crate::core::model::ModelStream;
@@ -40,6 +43,7 @@ pub struct OpenAiCompatClient {
     model: String,
     headers: Vec<(String, String)>,
     body_overrides: serde_json::Map<String, Value>,
+    quirks: WireQuirks,
 }
 
 impl OpenAiCompatClient {
@@ -55,6 +59,7 @@ impl OpenAiCompatClient {
             model: model.into(),
             headers: Vec::new(),
             body_overrides: serde_json::Map::new(),
+            quirks: WireQuirks::default(),
         })
     }
 
@@ -73,6 +78,22 @@ impl OpenAiCompatClient {
         self
     }
 
+    /// Wire quirks baked in at construction. The default reproduces the
+    /// built-in field spellings; an instance's `[providers.wire]` table
+    /// overrides them without code.
+    pub fn with_quirks(mut self, quirks: WireQuirks) -> Self {
+        self.quirks = quirks;
+        self
+    }
+
+    /// The wire quirks in effect, as baked in at construction. Test-only:
+    /// outside tests the quirks are an implementation detail of
+    /// `request_body` and `parse_sse_frame`.
+    #[cfg(test)]
+    pub(crate) fn quirks(&self) -> &WireQuirks {
+        &self.quirks
+    }
+
     fn build_http() -> Result<Client, ModelError> {
         Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -87,8 +108,9 @@ impl OpenAiCompatClient {
 
     /// The request body: the standard fields with `body_overrides` merged on
     /// top (overrides win), per-turn `tools` included when the plugins
-    /// declared any, and a per-turn `reasoning_effort` merged last so an
-    /// interactive `/effort` beats a static override for that one field.
+    /// declared any, and a per-turn effort merged last under the instance's
+    /// `effort_field` so an interactive `/effort` beats a static override for
+    /// that one field. `effort_field = "none"` never sends the field.
     fn request_body(&self, messages: &[Message], options: &TurnOptions) -> Value {
         let mut body = json!({
             "model": self.model,
@@ -113,8 +135,10 @@ impl OpenAiCompatClient {
         for (key, value) in &self.body_overrides {
             object.insert(key.clone(), value.clone());
         }
-        if let Some(effort) = &options.effort {
-            object.insert("reasoning_effort".to_string(), json!(effort));
+        if let Some(effort) = &options.effort
+            && self.quirks.effort_field != EFFORT_FIELD_NONE
+        {
+            object.insert(self.quirks.effort_field.clone(), json!(effort));
         }
         body
     }
@@ -196,6 +220,7 @@ impl ModelClient for OpenAiCompatClient {
         let body = self.request_body(&messages, &options);
         let http = self.http.clone();
         let headers = self.headers.clone();
+        let quirks = self.quirks.clone();
 
         Box::pin(async_stream::try_stream! {
             let response = {
@@ -227,7 +252,7 @@ impl ModelClient for OpenAiCompatClient {
                         Some(Err(error)) => Err(ModelError::network(error))?,
                         Some(Ok(chunk)) => {
                             for frame in decoder.feed(&chunk) {
-                                match parse_sse_frame(&frame, &mut tool_calls)? {
+                                match parse_sse_frame(&frame, &mut tool_calls, &quirks)? {
                                     Parsed::Delta(item) => yield item,
                                     Parsed::Done => {
                                         if let Some(calls) = tool_calls.finish() {
@@ -245,7 +270,7 @@ impl ModelClient for OpenAiCompatClient {
                 // A well-behaved server ends with a blank line, but tolerate a
                 // final frame that doesn't.
                 if let Some(frame) = decoder.finish() {
-                    match parse_sse_frame(&frame, &mut tool_calls)? {
+                    match parse_sse_frame(&frame, &mut tool_calls, &quirks)? {
                         Parsed::Delta(item) => yield item,
                         Parsed::Done => {}
                         Parsed::Ignore => {}
@@ -365,6 +390,7 @@ impl ToolCallAccumulator {
 fn parse_sse_frame(
     frame: &crate::core::sse::SseFrame,
     tool_calls: &mut ToolCallAccumulator,
+    quirks: &WireQuirks,
 ) -> Result<Parsed, ModelError> {
     let data = frame.data.trim();
     if data.is_empty() {
@@ -399,11 +425,18 @@ fn parse_sse_frame(
         return Ok(Parsed::Delta(StreamItem::Delta(content.to_string())));
     }
 
-    let reasoning = delta
-        .and_then(|delta| delta.get("reasoning_content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !reasoning.is_empty() {
+    // The reasoning delta under the instance's spellings, first hit wins.
+    // An empty `thinking_fields` list opts the instance out entirely.
+    let reasoning = quirks
+        .thinking_fields
+        .iter()
+        .find_map(|field| {
+            delta
+                .and_then(|delta| delta.get(field.as_str()))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        });
+    if let Some(reasoning) = reasoning {
         return Ok(Parsed::Delta(StreamItem::Thinking(reasoning.to_string())));
     }
 
@@ -546,6 +579,7 @@ mod tests {
         let parsed = parse_sse_frame(
             &frame(r#"{"choices":[{"delta":{"content":"hello"}}]}"#),
             &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
         )
         .unwrap();
         assert_eq!(
@@ -554,17 +588,24 @@ mod tests {
         );
 
         assert_eq!(
-            parse_sse_frame(&frame(""), &mut ToolCallAccumulator::default()).unwrap(),
+            parse_sse_frame(&frame(""), &mut ToolCallAccumulator::default(), &WireQuirks::default())
+                .unwrap(),
             Parsed::Ignore
         );
         assert_eq!(
-            parse_sse_frame(&frame("[DONE]"), &mut ToolCallAccumulator::default()).unwrap(),
+            parse_sse_frame(
+                &frame("[DONE]"),
+                &mut ToolCallAccumulator::default(),
+                &WireQuirks::default()
+            )
+            .unwrap(),
             Parsed::Done
         );
 
         let error = parse_sse_frame(
             &frame(r#"{"error":{"message":"bad key"}}"#),
             &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("bad key"));
@@ -572,6 +613,7 @@ mod tests {
         let parsed = parse_sse_frame(
             &frame(r#"{"choices":[{"delta":{"reasoning_content":"thinking…"}}]}"#),
             &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
         )
         .unwrap();
         assert_eq!(
@@ -583,6 +625,7 @@ mod tests {
         let parsed = parse_sse_frame(
             &frame(r#"{"choices":[{"delta":{}}]}"#),
             &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
         )
         .unwrap();
         assert_eq!(parsed, Parsed::Ignore);
@@ -597,6 +640,7 @@ mod tests {
         let parsed = parse_sse_frame(
             &frame(r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#),
             &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
         )
         .unwrap();
         assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 10, output: 4 }));
@@ -604,6 +648,7 @@ mod tests {
         let parsed = parse_sse_frame(
             &frame(r#"{"usage":{"input_tokens":7,"output_tokens":2}}"#),
             &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
         )
         .unwrap();
         assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 7, output: 2 }));
@@ -612,9 +657,80 @@ mod tests {
         let parsed = parse_sse_frame(
             &frame(r#"{"usage":{}}"#),
             &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
         )
         .unwrap();
         assert_eq!(parsed, Parsed::Ignore);
+    }
+
+    #[test]
+    fn thinking_fields_follow_the_instance_quirks() {
+        let frame = |data: &str| crate::core::sse::SseFrame {
+            event: None,
+            data: data.to_string(),
+        };
+
+        // Alternative spellings parse as Thinking, first hit wins.
+        let quirks = WireQuirks {
+            thinking_fields: vec!["reasoning".to_string(), "thinking".to_string()],
+            ..Default::default()
+        };
+        for field in ["reasoning", "thinking"] {
+            let data = format!(r#"{{"choices":[{{"delta":{{"{field}":"thinking…"}}}}]}}"#);
+            let parsed = parse_sse_frame(
+                &frame(&data),
+                &mut ToolCallAccumulator::default(),
+                &quirks,
+            )
+            .unwrap();
+            assert_eq!(
+                parsed,
+                Parsed::Delta(StreamItem::Thinking("thinking…".to_string()))
+            );
+        }
+
+        // An empty list opts the instance out of thinking parsing entirely.
+        let quirks = WireQuirks {
+            thinking_fields: Vec::new(),
+            ..Default::default()
+        };
+        let parsed = parse_sse_frame(
+            &frame(r#"{"choices":[{"delta":{"reasoning_content":"thinking…"}}]}"#),
+            &mut ToolCallAccumulator::default(),
+            &quirks,
+        )
+        .unwrap();
+        assert_eq!(parsed, Parsed::Ignore);
+    }
+
+    #[test]
+    fn effort_field_follows_the_instance_quirks() {
+        let options = |effort: Option<&str>| TurnOptions {
+            effort: effort.map(str::to_string),
+            tools: Vec::new(),
+        };
+
+        // An alternative spelling renames the request field.
+        let quirks = WireQuirks {
+            effort_field: "reasoning".to_string(),
+            ..Default::default()
+        };
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m")
+            .unwrap()
+            .with_quirks(quirks);
+        let body = client.request_body(&[Message::user("hi")], &options(Some("high")));
+        assert_eq!(body["reasoning"], "high");
+        assert!(body.get("reasoning_effort").is_none());
+
+        // `none` never sends the field, even with an effort selected.
+        let quirks = WireQuirks {
+            effort_field: EFFORT_FIELD_NONE.to_string(),
+            ..Default::default()
+        };
+        let client = client.with_quirks(quirks);
+        let body = client.request_body(&[Message::user("hi")], &options(Some("high")));
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -624,7 +740,7 @@ mod tests {
             data: data.to_string(),
         };
         let feed = |accumulator: &mut ToolCallAccumulator, data: &str| {
-            parse_sse_frame(&frame(data), accumulator).unwrap()
+            parse_sse_frame(&frame(data), accumulator, &WireQuirks::default()).unwrap()
         };
 
         let mut accumulator = ToolCallAccumulator::default();

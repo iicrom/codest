@@ -203,6 +203,8 @@ pub enum RegistryError {
     DuplicateModel { name: String, model: String },
     #[error("protocol `{id}` is registered more than once")]
     DuplicateProtocol { id: String },
+    #[error("provider `{name}`: {message}")]
+    InvalidWireQuirks { name: String, message: String },
 }
 
 /// The built-in factories plus every plugin-contributed one, and the
@@ -254,6 +256,15 @@ impl ProviderRegistry {
                     name: instance.name.clone(),
                     protocol: instance.protocol_id().to_string(),
                     known: known_protocol_ids(&factories).join(", "),
+                });
+            }
+
+            if let Some(wire) = &instance.wire
+                && let Err(message) = wire.validate()
+            {
+                return Err(RegistryError::InvalidWireQuirks {
+                    name: instance.name.clone(),
+                    message,
                 });
             }
 
@@ -623,6 +634,29 @@ struct OpenAiCompatFactory;
 /// The `openai-compat` factory singleton, built into every registry.
 static OPENAI_COMPAT_FACTORY: OpenAiCompatFactory = OpenAiCompatFactory;
 
+impl OpenAiCompatFactory {
+    /// The client one instance of `openai-compat` builds into: URL, key,
+    /// static headers, `body_overrides`, and wire quirks, all baked in at
+    /// construction. Split out of [`ProtocolFactory::create`] so tests can
+    /// inspect the built client's state.
+    fn build_client(
+        instance: &ProviderInstance,
+        model: &str,
+    ) -> Result<OpenAiCompatClient, ModelError> {
+        let api_key = instance.resolved_api_key().unwrap_or_default();
+        let base_url = instance.base_url.clone().unwrap_or_default();
+        let headers = instance
+            .headers
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Ok(OpenAiCompatClient::new(api_key, base_url, model)?
+            .with_headers(headers)
+            .with_body_overrides(instance.body_overrides.clone())
+            .with_quirks(instance.wire.clone().unwrap_or_default()))
+    }
+}
+
 impl ProtocolFactory for OpenAiCompatFactory {
     fn id(&self) -> &'static str {
         crate::core::config::DEFAULT_PROTOCOL
@@ -647,17 +681,7 @@ impl ProtocolFactory for OpenAiCompatFactory {
         instance: &ProviderInstance,
         model: &str,
     ) -> Result<Arc<dyn ModelClient>, ModelError> {
-        let api_key = instance.resolved_api_key().unwrap_or_default();
-        let base_url = instance.base_url.clone().unwrap_or_default();
-        let headers = instance
-            .headers
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let client = OpenAiCompatClient::new(api_key, base_url, model)?
-            .with_headers(headers)
-            .with_body_overrides(instance.body_overrides.clone());
-        Ok(Arc::new(client))
+        Ok(Arc::new(Self::build_client(instance, model)?))
     }
 
     fn list_models<'a>(
@@ -788,6 +812,7 @@ mod tests {
             fetch_models: Some(false),
             headers: BTreeMap::new(),
             body_overrides: serde_json::Map::new(),
+            wire: None,
             requires_api_key: false,
         }
     }
@@ -826,6 +851,43 @@ mod tests {
         assert!(ProviderRegistry::build(&[], vec![instance("p/slash", None, &["m"])]).is_err());
         assert!(ProviderRegistry::build(&[], vec![instance("p", None, &[""])]).is_err());
         assert!(ProviderRegistry::build(&[], vec![instance("p", None, &["m", "m"])]).is_err());
+    }
+
+    #[test]
+    fn registry_validates_wire_quirks() {
+        use crate::core::config::WireQuirks;
+
+        let mut inst = instance("p", Some(DEFAULT_PROTOCOL), &["m"]);
+        inst.wire = Some(WireQuirks {
+            thinking_fields: vec!["  ".to_string()],
+            ..Default::default()
+        });
+        let error = ProviderRegistry::build(&[], vec![inst]).unwrap_err();
+        assert!(matches!(error, RegistryError::InvalidWireQuirks { .. }));
+        assert!(
+            error.to_string().contains("provider `p`"),
+            "the error names the instance: {error}"
+        );
+    }
+
+    #[test]
+    fn openai_factory_bakes_instance_wire_quirks() {
+        use crate::core::config::WireQuirks;
+
+        let quirks = WireQuirks {
+            thinking_fields: vec!["reasoning".to_string(), "thinking".to_string()],
+            effort_field: "reasoning".to_string(),
+        };
+        let mut inst = instance("p", Some(DEFAULT_PROTOCOL), &["m"]);
+        inst.wire = Some(quirks.clone());
+
+        let client = OpenAiCompatFactory::build_client(&inst, "m").expect("client builds");
+        assert_eq!(client.quirks(), &quirks);
+
+        // No wire table: the built-in spellings, unchanged.
+        let inst = instance("plain", Some(DEFAULT_PROTOCOL), &["m"]);
+        let client = OpenAiCompatFactory::build_client(&inst, "m").expect("client builds");
+        assert_eq!(client.quirks(), &WireQuirks::default());
     }
 
     #[test]
@@ -915,6 +977,7 @@ mod tests {
             fetch_models: Some(true),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry =
@@ -1025,6 +1088,7 @@ mod tests {
             fetch_models: Some(false),
             headers: Default::default(),
             body_overrides: Default::default(),
+            wire: None,
             requires_api_key: false,
         };
         let registry =
