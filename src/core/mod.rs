@@ -26,6 +26,7 @@ pub mod model;
 pub mod openai_compat;
 pub mod protocol;
 pub mod providers;
+pub mod reasoning;
 pub mod rollout;
 pub mod session;
 pub mod sessions;
@@ -40,12 +41,13 @@ pub use config::{
 };
 pub use conversation::{Conversation, DEFAULT_SYSTEM_PROMPT};
 pub use echo_model::EchoModelClient;
-pub use model::{ModelClient, ModelError, StreamItem};
+pub use model::{ModelClient, ModelError, StreamItem, TurnOptions};
 pub use protocol::{Event, EventMsg, Message, Op, Role, Submission};
 pub use providers::{
     NO_MODEL_GUIDANCE, NO_MODEL_SELECTED, ModelPool, ProtocolFactory, ProviderRegistry,
     RegistryError, Selection, missing_credential_guidance,
 };
+pub use reasoning::{DEFAULT_EFFORT_LEVELS, EFFORT_COMMAND, REASONING_COMMANDS, THINKING_COMMAND};
 pub use rollout::{LoadedSession, RolloutItem, RolloutWriter, SessionMeta};
 pub use session::{AgentSession, SessionBootstrap};
 pub use sessions::SESSION_COMMANDS;

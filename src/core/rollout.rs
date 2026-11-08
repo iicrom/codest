@@ -161,6 +161,13 @@ pub enum RolloutItem {
         provider: String,
         model: String,
     },
+    /// The reasoning effort changed (`Op::SetReasoningEffort`, `/effort`);
+    /// `None` clears the override. Metadata for attribution, like
+    /// [`RolloutItem::ModelSwitched`] — it does not change the replayed
+    /// conversation.
+    ReasoningEffortSwitched {
+        effort: Option<String>,
+    },
 }
 
 /// One JSONL line: a timestamp plus the payload's fields flattened in.
@@ -317,9 +324,11 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             RolloutItem::AssistantMessage { message } => messages.push(Message::assistant(message)),
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
             RolloutItem::Cleared => messages.clear(),
-            // The active model selection is metadata for attribution; it does
-            // not change the replayed conversation.
+            // The active model selection and the reasoning effort are
+            // metadata for attribution; they do not change the replayed
+            // conversation.
             RolloutItem::ModelSwitched { .. } => {}
+            RolloutItem::ReasoningEffortSwitched { .. } => {}
         }
     }
 
@@ -478,5 +487,29 @@ mod tests {
 
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.messages.len(), 1);
+    }
+
+    #[test]
+    fn reasoning_effort_switched_round_trips_and_replay_ignores_it() {
+        let dir = tempdir("effort");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None).expect("start");
+        rollout
+            .append(&RolloutItem::ReasoningEffortSwitched {
+                effort: Some("high".to_string()),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "hello".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ReasoningEffortSwitched { effort: None })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "hello");
     }
 }

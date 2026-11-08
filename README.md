@@ -197,6 +197,8 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 | `/rename <name>` | — | 重命名当前会话；默认名取该会话第一句用户输入 |
 | `/sessions` | `/resume` | 打开会话列表菜单，切换并继续以前的会话 |
 | `/model` | — | 打开模型菜单，在 `provider/model` 之间切换（见"多 Provider"） |
+| `/effort [level]` | — | 查看或设置模型推理等级：无参数打开 `↑`/`↓` 选择菜单，`/effort <level>` 直接设置，`off` 清除；随请求以 `reasoning_effort` 字段发送。等级表来自模型的 `reasoning` 声明或 models API 的 `default_level`（选中模型时自动采纳为初始值） |
+| `/thinking` | — | 切换模型思考过程（thinking 输出）的折叠/展开 |
 
 输入 `/` 就会在输入框上方弹出候选列表，继续输入会按指令名或别名前缀实时过滤（不区分大小写）：
 
@@ -295,6 +297,7 @@ codest/
     │   ├── protocol.rs      # Message / Op / Event
     │   ├── commands.rs      # 命令表 / 解析（指令由插件提供）
     │   ├── sessions.rs      # 内置 /new /rename /sessions 命令 spec（多会话）
+    │   ├── reasoning.rs     # 内置 /effort /thinking 命令 spec + 推理等级校验
     │   ├── conversation.rs  # 线性会话历史
     │   ├── model.rs         # ModelClient trait + StreamItem + 错误类型
     │   ├── openai_compat.rs # HTTP + SSE 流式客户端（openai-compat 协议）
@@ -329,7 +332,7 @@ codest/
 - 会话按 rollout 保存在 `~/.codest/sessions/<工作区哈希>/`（`CODEST_HOME` 可覆盖），跨次启动可用 `--continue` / `--resume` 恢复；没有并发写锁（同时开多个 codest 写同一工作区没有保护）、没有归档/删除/搜索，也没有跨工作区的会话迁移。
 - 没有网络重试、代理、认证刷新；HTTP 客户端只实现一次请求 + SSE 增量解析。API key 支持 `$VAR` 模板引用环境变量，但没有 OAuth/凭据存储，token 轮换需在协议工厂内部自行解决。
 - 没有外网也能玩：`protocol = "test"` 提供进程内 echo 后端；真实端点仍需 API key 或先启动 `scripts/openai_test_server.py`。
-- 思考内容（`reasoning_content`）与 usage 已进入数据通道（`AgentThinkingDelta` / `TurnUsage` 事件），但 TUI 暂不渲染。
+- 思考内容（`reasoning_content`）以暗色渲染在回答上方，`/thinking` 随时折叠/展开；`/effort` 以 `reasoning_effort` 字段随请求发送（等级表取模型声明的 `reasoning`，未声明时用内置默认集）。模型元数据可带 `default_level`（providers.toml 声明或 models API 返回均可）：选中该模型时自动作为初始推理等级，footer 常显当前值。usage（`TurnUsage`）已入事件总线但 TUI 暂不展示。思考内容仅用于显示：不进模型上下文、不写 rollout。
 - 没有配置任何 provider 时以空路由启动：发消息得到添加指引（内容保留在输入框），不会发出请求。
 - `fullscreen` 只有滚轮滚动，应用内鼠标选区/复制尚未实现；选区用终端原生能力（通常按住 `Shift` 拖拽）。
 - `inline` 下已经写进 scrollback 的行不会随窗口宽度重新换行。
@@ -339,7 +342,7 @@ codest/
 
 1. 在 `Op` 中加入工具调用与审批事件，向 codex 的 SQ/EQ 靠拢，并让插件可以注册工具。
 2. 为 `Conversation` 增加 token 预算与压缩（消费 `ModelInfo::context_window` 与 `TurnUsage`）。
-3. 思考内容的淡色渲染（`AgentThinkingDelta` 已入事件总线）与 `/status` 的 token 统计。
+3. `/status` 的 token 统计（`TurnUsage` 已入事件总线）与 `/effort` 写回 `config.toml` 作为全局默认。
 4. `/model` 菜单内添加/编辑端点（表单向导或 `$EDITOR`），写回 `providers.toml`。
 5. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
 6. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。

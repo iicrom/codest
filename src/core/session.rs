@@ -14,11 +14,13 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::config::ModelInfo;
 use crate::core::conversation::Conversation;
 use crate::core::conversation::DEFAULT_SYSTEM_PROMPT;
 use crate::core::model::ModelClient;
 use crate::core::model::ModelStream;
 use crate::core::model::StreamItem;
+use crate::core::model::TurnOptions;
 use crate::core::protocol::Event;
 use crate::core::protocol::EventMsg;
 use crate::core::protocol::Op;
@@ -94,6 +96,16 @@ impl ModelBackend {
         match self {
             ModelBackend::Fixed(_) | ModelBackend::Empty { .. } => None,
             ModelBackend::Pooled { current, .. } => Some(current),
+        }
+    }
+
+    /// The metadata of `selection` when the backend can look it up (the
+    /// pooled backend merges declared and discovered models); `None` on a
+    /// fixed or empty backend.
+    fn model_info(&self, selection: &Selection) -> Option<ModelInfo> {
+        match self {
+            ModelBackend::Pooled { pool, .. } => pool.model_info(selection),
+            ModelBackend::Fixed(_) | ModelBackend::Empty { .. } => None,
         }
     }
 
@@ -278,6 +290,14 @@ impl AgentSession {
         self.submit(Op::SwitchModel {
             selection: selection.into(),
         })
+    }
+
+    /// Set the reasoning effort sent with the following turns (`/effort`);
+    /// `None` clears the override. The result arrives as
+    /// [`EventMsg::ReasoningEffortSwitched`]; ops are FIFO, so it never lands
+    /// mid-turn.
+    pub fn set_reasoning_effort(&self, effort: Option<String>) -> String {
+        self.submit(Op::SetReasoningEffort { effort })
     }
 
     /// Await the next event. `None` means the worker has stopped and the
@@ -465,6 +485,15 @@ async fn run_worker(
     };
     let mut current = sessions.len() - 1;
     let mut active: Option<ActiveTurn> = None;
+    // Reasoning effort for the next turn (`Op::SetReasoningEffort`,
+    // `/effort`). Worker-level rather than backend-level, so it also applies
+    // to fixed/test backends (which simply ignore it). Seeded from the
+    // initial model's `default_level` when it declares one.
+    let mut effort = backend
+        .selection()
+        .cloned()
+        .and_then(|selection| backend.model_info(&selection))
+        .and_then(|model| model.default_level);
 
     loop {
         if let Some(mut turn) = active.take() {
@@ -507,10 +536,11 @@ async fn run_worker(
                 sessions[current].push_user(text.clone());
                 rollouts.append(current, RolloutItem::UserMessage { message: text });
                 let cancel = CancellationToken::new();
-                let stream =
-                    backend
-                        .client()
-                        .stream_chat(sessions[current].snapshot(), cancel.clone());
+                let stream = backend.client().stream_chat(
+                    sessions[current].snapshot(),
+                    TurnOptions { effort: effort.clone() },
+                    cancel.clone(),
+                );
                 let _ = tx.send(Event::new(submission.id.clone(), EventMsg::TurnStarted));
                 active = Some(ActiveTurn {
                     id: submission.id,
@@ -590,16 +620,44 @@ async fn run_worker(
                         },
                     );
                     let _ = tx.send(Event::new(
-                        submission.id,
+                        submission.id.clone(),
                         EventMsg::ModelSwitched {
                             model: parsed.as_str(),
                         },
                     ));
+                    // Selecting a model that declares a `default_level`
+                    // resets the effort to it; one without keeps the current
+                    // effort. The event keeps the front-end footer in step.
+                    let default_effort = backend
+                        .model_info(&parsed)
+                        .and_then(|model| model.default_level);
+                    if default_effort.is_some() && default_effort != effort {
+                        effort = default_effort.clone();
+                        rollouts.append(
+                            current,
+                            RolloutItem::ReasoningEffortSwitched { effort: effort.clone() },
+                        );
+                        let _ = tx.send(Event::new(
+                            submission.id,
+                            EventMsg::ReasoningEffortSwitched { effort: default_effort },
+                        ));
+                    }
                 }
                 Err(message) => {
                     let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
                 }
             },
+            Op::SetReasoningEffort { effort: new_effort } => {
+                effort = new_effort.clone();
+                rollouts.append(
+                    current,
+                    RolloutItem::ReasoningEffortSwitched { effort: new_effort.clone() },
+                );
+                let _ = tx.send(Event::new(
+                    submission.id,
+                    EventMsg::ReasoningEffortSwitched { effort: new_effort },
+                ));
+            }
             Op::Shutdown => {
                 let _ = tx.send(Event::new(submission.id, EventMsg::ShutdownComplete));
                 break;
@@ -634,8 +692,8 @@ async fn run_turn(
                         ));
                     }
                     Some(Ok(StreamItem::Thinking(delta))) => {
-                        // The minimal front-end ignores reasoning output; the
-                        // event keeps the bus honest about what was produced.
+                        // Reasoning output stays out of the conversation and
+                        // the rollout; the front-end renders it display-only.
                         let _ = tx.send(Event::new(
                             turn.id.clone(),
                             EventMsg::AgentThinkingDelta { delta },
@@ -758,6 +816,7 @@ mod tests {
     use crate::core::echo_model::EchoModelClient;
     use crate::core::protocol::Message;
     use crate::core::protocol::Role;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     async fn collect_turn(session: &mut AgentSession) -> Vec<Event> {
@@ -801,10 +860,11 @@ mod tests {
         ));
     }
 
-    /// Records the full snapshot passed to each model call.
+    /// Records the full snapshot and options passed to each model call.
     #[derive(Clone, Default)]
     struct RecordingClient {
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
+        options: Arc<Mutex<Vec<TurnOptions>>>,
     }
 
     impl RecordingClient {
@@ -815,6 +875,10 @@ mod tests {
         fn snapshots(&self) -> Arc<Mutex<Vec<Vec<Message>>>> {
             self.seen.clone()
         }
+
+        fn turn_options(&self) -> Arc<Mutex<Vec<TurnOptions>>> {
+            self.options.clone()
+        }
     }
 
     impl ModelClient for RecordingClient {
@@ -822,8 +886,14 @@ mod tests {
             "recording".to_string()
         }
 
-        fn stream_chat(&self, messages: Vec<Message>, _cancel: CancellationToken) -> ModelStream {
+        fn stream_chat(
+            &self,
+            messages: Vec<Message>,
+            options: TurnOptions,
+            _cancel: CancellationToken,
+        ) -> ModelStream {
             self.seen.lock().expect("lock").push(messages);
+            self.options.lock().expect("lock").push(options);
             Box::pin(futures_util::stream::once(async {
                 Ok::<_, crate::core::model::ModelError>(StreamItem::Delta("ok".to_string()))
             }))
@@ -1106,6 +1176,87 @@ mod tests {
         Arc::new(ModelPool::new(registry))
     }
 
+    /// Test protocol: hands out recording clients keyed by the instance
+    /// name. `spawn_with_pool` builds clients through the pool — bypassing
+    /// any client a test passes to a `spawn_with_*` helper — so pooled
+    /// tests that need to observe the actual requests register their
+    /// handles with [`recording_handles`] and use this factory.
+    struct RecordingFactory;
+
+    type RecordingHandles = (
+        Arc<Mutex<Vec<Vec<Message>>>>,
+        Arc<Mutex<Vec<TurnOptions>>>,
+    );
+
+    static RECORDINGS: std::sync::OnceLock<Mutex<HashMap<String, RecordingHandles>>> =
+        std::sync::OnceLock::new();
+
+    fn recordings() -> &'static Mutex<HashMap<String, RecordingHandles>> {
+        RECORDINGS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Pre-install the handles for instance `name` and return them.
+    fn recording_handles(name: &str) -> RecordingHandles {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let options = Arc::new(Mutex::new(Vec::new()));
+        recordings()
+            .lock()
+            .expect("lock")
+            .insert(name.to_string(), (seen.clone(), options.clone()));
+        (seen, options)
+    }
+
+    impl crate::core::providers::ProtocolFactory for RecordingFactory {
+        fn id(&self) -> &'static str {
+            "recording"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Recording (testing)"
+        }
+
+        fn create(
+            &self,
+            instance: &ProviderInstance,
+            _model: &str,
+        ) -> Result<Arc<dyn ModelClient>, crate::core::model::ModelError> {
+            let mut map = recordings().lock().expect("lock");
+            let (seen, options) = map
+                .entry(instance.name.clone())
+                .or_insert_with(|| {
+                    (
+                        Arc::new(Mutex::new(Vec::new())),
+                        Arc::new(Mutex::new(Vec::new())),
+                    )
+                });
+            Ok(Arc::new(RecordingClient {
+                seen: seen.clone(),
+                options: options.clone(),
+            }))
+        }
+    }
+
+    /// A one-instance pool over [`RecordingFactory`].
+    fn recording_pool(name: &str, models: Vec<ModelInfo>) -> Arc<ModelPool> {
+        let instance = ProviderInstance {
+            name: name.to_string(),
+            protocol: Some("recording".to_string()),
+            base_url: None,
+            api_key: None,
+            models,
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry = crate::core::providers::ProviderRegistry::build(
+            &[&RecordingFactory],
+            vec![instance],
+        )
+        .expect("valid registry");
+        Arc::new(ModelPool::new(registry))
+    }
+
     #[tokio::test]
     async fn switch_model_swaps_the_backend_between_turns() {
         let mut session = AgentSession::spawn_with_pool(
@@ -1294,5 +1445,150 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].meta.provider.as_deref(), Some("test"));
         assert_eq!(loaded[0].meta.model.as_deref(), Some("one"));
+    }
+
+    #[tokio::test]
+    async fn set_reasoning_effort_reaches_the_client_and_the_rollout() {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-effort-rollout-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let client = RecordingClient::new();
+        let options = client.turn_options();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                loaded: Vec::new(),
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                fresh: true,
+            },
+        );
+
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+
+        session.set_reasoning_effort(Some("high".to_string()));
+        let event = session.next_event().await.expect("effort event");
+        assert!(matches!(
+            &event.msg,
+            EventMsg::ReasoningEffortSwitched { effort } if effort.as_deref() == Some("high")
+        ));
+
+        session.submit_user_turn("second");
+        collect_turn(&mut session).await;
+
+        // Clearing the override reaches the client as no effort at all.
+        session.set_reasoning_effort(None);
+        let event = session.next_event().await.expect("clear event");
+        assert!(matches!(
+            &event.msg,
+            EventMsg::ReasoningEffortSwitched { effort } if effort.is_none()
+        ));
+
+        session.submit_user_turn("third");
+        collect_turn(&mut session).await;
+
+        {
+            let seen = options.lock().expect("lock");
+            assert_eq!(seen.len(), 3);
+            assert_eq!(seen[0].effort, None);
+            assert_eq!(seen[1].effort, Some("high".to_string()));
+            assert_eq!(seen[2].effort, None);
+        }
+
+        session.shutdown();
+        while session.next_event().await.is_some() {}
+
+        // Both switches are recorded for attribution; the replayed
+        // conversation is unaffected (three user/assistant pairs).
+        let loaded = crate::core::rollout::load_workspace_sessions(&dir).expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].messages.len(), 6);
+        let content = std::fs::read_to_string(&loaded[0].path).expect("read rollout");
+        assert_eq!(content.matches("reasoning_effort_switched").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_initial_model_default_level_seeds_the_effort() {
+        let mut one = ModelInfo::from_id("one");
+        one.default_level = Some("high".to_string());
+        let (seen, options) = recording_handles("rec-seed");
+        let mut session = AgentSession::spawn_with_pool(
+            recording_pool("rec-seed", vec![one, ModelInfo::from_id("two")]),
+            Some(&Selection::new("rec-seed", "one")),
+            "be brief",
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+
+        session.submit_user_turn("hello");
+        collect_turn(&mut session).await;
+
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        let options = options.lock().expect("lock");
+        assert_eq!(options[0].effort, Some("high".to_string()));
+    }
+
+    #[tokio::test]
+    async fn switching_models_adopts_the_new_default_level() {
+        let mut one = ModelInfo::from_id("one");
+        one.default_level = Some("high".to_string());
+        let (seen, options) = recording_handles("rec-switch");
+        let mut session = AgentSession::spawn_with_pool(
+            recording_pool("rec-switch", vec![one, ModelInfo::from_id("two")]),
+            Some(&Selection::new("rec-switch", "two")), // declares no default
+            "be brief",
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+
+        // A user override on a model without a default.
+        session.set_reasoning_effort(Some("low".to_string()));
+        let _ = session.next_event().await;
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+
+        // Switching to the model WITH a default adopts it: `ModelSwitched`
+        // followed by `ReasoningEffortSwitched`.
+        session.switch_model("rec-switch/one");
+        let switch = session.next_event().await.expect("switch event");
+        assert!(matches!(switch.msg, EventMsg::ModelSwitched { .. }));
+        let effort = session.next_event().await.expect("effort event");
+        assert!(matches!(
+            &effort.msg,
+            EventMsg::ReasoningEffortSwitched { effort } if effort.as_deref() == Some("high")
+        ));
+
+        session.submit_user_turn("second");
+        collect_turn(&mut session).await;
+
+        // Switching back to the default-less model keeps the current effort.
+        session.switch_model("rec-switch/two");
+        let switch = session.next_event().await.expect("switch event");
+        assert!(matches!(switch.msg, EventMsg::ModelSwitched { .. }));
+        session.submit_user_turn("third");
+        collect_turn(&mut session).await;
+
+        let options = options.lock().expect("lock");
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].effort, Some("low".to_string()));
+        assert_eq!(options[1].effort, Some("high".to_string()));
+        assert_eq!(
+            options[2].effort,
+            Some("high".to_string()),
+            "kept when the model declares no default"
+        );
+        drop(options);
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 3);
     }
 }

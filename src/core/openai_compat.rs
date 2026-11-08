@@ -25,6 +25,7 @@ use crate::core::model::ModelClient;
 use crate::core::model::ModelError;
 use crate::core::model::ModelStream;
 use crate::core::model::StreamItem;
+use crate::core::model::TurnOptions;
 use crate::core::protocol::Message;
 use crate::core::sse::SseDecoder;
 
@@ -87,8 +88,9 @@ impl OpenAiCompatClient {
     }
 
     /// The request body: the standard fields with `body_overrides` merged on
-    /// top (overrides win).
-    fn request_body(&self, messages: &[Message]) -> Value {
+    /// top (overrides win), and a per-turn `reasoning_effort` merged last so
+    /// an interactive `/effort` beats a static override for that one field.
+    fn request_body(&self, messages: &[Message], effort: Option<&str>) -> Value {
         let mut body = json!({
             "model": self.model,
             "stream": true,
@@ -105,6 +107,9 @@ impl OpenAiCompatClient {
         for (key, value) in &self.body_overrides {
             object.insert(key.clone(), value.clone());
         }
+        if let Some(effort) = effort {
+            object.insert("reasoning_effort".to_string(), json!(effort));
+        }
         body
     }
 }
@@ -114,7 +119,12 @@ impl ModelClient for OpenAiCompatClient {
         self.model.clone()
     }
 
-    fn stream_chat(&self, messages: Vec<Message>, cancel: CancellationToken) -> ModelStream {
+    fn stream_chat(
+        &self,
+        messages: Vec<Message>,
+        options: TurnOptions,
+        cancel: CancellationToken,
+    ) -> ModelStream {
         if self.api_key.trim().is_empty() {
             return Box::pin(futures_util::stream::once(async {
                 Err(ModelError::NotConfigured(
@@ -128,7 +138,7 @@ impl ModelClient for OpenAiCompatClient {
 
         let url = self.endpoint();
         let api_key = self.api_key.clone();
-        let body = self.request_body(&messages);
+        let body = self.request_body(&messages, options.effort.as_deref());
         let http = self.http.clone();
         let headers = self.headers.clone();
 
@@ -301,12 +311,32 @@ mod tests {
         let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m")
             .unwrap()
             .with_body_overrides(overrides);
-        let body = client.request_body(&[Message::user("hi")]);
+        let body = client.request_body(&[Message::user("hi")], None);
 
         assert_eq!(body["model"], "override");
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn effort_is_sent_last_and_only_when_set() {
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+
+        // No effort: the field is absent entirely, not null.
+        let body = client.request_body(&[Message::user("hi")], None);
+        assert!(body.get("reasoning_effort").is_none());
+
+        // Some effort: sent as the OpenAI-standard top-level field…
+        let body = client.request_body(&[Message::user("hi")], Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // …and a per-turn effort beats a static `body_overrides` value.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert("reasoning_effort".to_string(), json!("low"));
+        let client = client.with_body_overrides(overrides);
+        let body = client.request_body(&[Message::user("hi")], Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]
@@ -368,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn empty_key_yields_not_configured() {
         let client = OpenAiCompatClient::new("  ", "https://example.test/v1", "m").unwrap();
-        let mut stream = client.stream_chat(vec![], CancellationToken::new());
+        let mut stream = client.stream_chat(vec![], TurnOptions::default(), CancellationToken::new());
         let error = stream.next().await.expect("one item").unwrap_err();
         assert!(matches!(error, ModelError::NotConfigured(_)));
     }

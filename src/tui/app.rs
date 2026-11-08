@@ -73,6 +73,7 @@ use crate::core::NO_MODEL_GUIDANCE;
 use crate::core::NO_MODEL_SELECTED;
 use crate::core::Selection;
 use crate::core::SessionBootstrap;
+use crate::core::reasoning;
 use crate::core::rollout;
 use crate::core::rollout::LoadedSession;
 use crate::plugins::PluginEffect;
@@ -345,6 +346,15 @@ struct App {
     session_menu: Option<usize>,
     /// Open `/model` picker over the registry's selections.
     model_menu: Option<ModelMenu>,
+    /// Open `/effort` picker over the reasoning effort levels.
+    effort_menu: Option<EffortMenu>,
+    /// The reasoning effort sent with every turn (`/effort`); `None` sends no
+    /// effort field at all. Updated optimistically, confirmed by
+    /// `ReasoningEffortSwitched`.
+    effort: Option<String>,
+    /// Whether thinking output renders expanded. Global across sessions;
+    /// `/thinking` toggles it, and committed Thinking cells re-fold with it.
+    show_thinking: bool,
     composer: Composer,
     /// Selected row in the slash-command menu.
     command_selection: usize,
@@ -375,6 +385,19 @@ struct ModelMenuItem {
     current: bool,
 }
 
+/// State of the open `/effort` picker.
+struct EffortMenu {
+    items: Vec<EffortMenuItem>,
+    selected: usize,
+}
+
+/// One row of the `/effort` picker; `level: None` is the `off` entry that
+/// clears the override.
+struct EffortMenuItem {
+    level: Option<String>,
+    current: bool,
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -392,6 +415,15 @@ impl App {
         let inline_height = inline_pane_height(inline_rows, 1, false, 0);
         let inline_top = inline_rows.saturating_sub(inline_height);
 
+        let route = Selection::parse(&model_label).ok();
+        // A model that declares a `default_level` starts with that effort —
+        // the same value the worker seeds, so footer and requests agree
+        // until `/effort` overrides either side.
+        let effort = route
+            .as_ref()
+            .and_then(|route| pool.model_info(route))
+            .and_then(|model| model.default_level);
+
         Self {
             session,
             plugins,
@@ -399,13 +431,16 @@ impl App {
             notice_tx,
             notices,
             notices_closed: false,
-            route: Selection::parse(&model_label).ok(),
+            route,
             model_label,
             mode,
             views,
             active_view,
             session_menu: None,
             model_menu: None,
+            effort_menu: None,
+            effort,
+            show_thinking: true,
             composer: Composer::new(),
             command_selection: 0,
             command_menu_dismissed: false,
@@ -559,11 +594,35 @@ impl App {
         self.inline_rows = rows;
         self.inline_columns = size.width;
 
-        let live_tail = self.view().live.as_ref().map(|text| {
-            chat::assistant_lines(text, width, self.busy)
-                .pop()
-                .unwrap_or_else(|| Line::from(""))
-        });
+        // The bottom live line: the assistant tail, or — while the model is
+        // still reasoning and no content has started — a thinking line
+        // instead of an empty assistant line. The full thinking block lands
+        // in history when content starts or the turn ends.
+        let thinking_only = self.view().live.as_ref().is_some_and(String::is_empty)
+            && self
+                .view()
+                .live_thinking
+                .as_ref()
+                .is_some_and(|text| !text.is_empty());
+        let live_tail = if thinking_only {
+            if self.show_thinking {
+                self.view()
+                    .live_thinking
+                    .as_ref()
+                    .and_then(|text| chat::thinking_lines(text, width, self.busy).pop())
+            } else {
+                Some(Line::from(Span::styled(
+                    "✻ thinking…",
+                    Style::default().fg(theme::DIM),
+                )))
+            }
+        } else {
+            self.view().live.as_ref().map(|text| {
+                chat::assistant_lines(text, width, self.busy)
+                    .pop()
+                    .unwrap_or_else(|| Line::from(""))
+            })
+        };
 
         tui.draw(|frame| {
             self.render_inline_pane(frame, live_tail, &menu, menu_height, &composer_rows);
@@ -576,6 +635,7 @@ impl App {
     /// active session's view is flushed; a background view catches up when it
     /// becomes active again.
     fn take_inline_pending(&mut self, width: usize) -> Vec<Line<'static>> {
+        let thinking_expanded = self.show_thinking;
         let view = self.view_mut();
         let mut pending: Vec<Line<'static>> = Vec::new();
 
@@ -590,7 +650,7 @@ impl App {
 
         // Transcript cells that have not been written to scrollback yet.
         while view.printed_cells < view.history.len() {
-            pending.extend(view.history[view.printed_cells].lines(width));
+            pending.extend(view.history[view.printed_cells].lines(width, thinking_expanded));
             pending.push(Line::from(""));
             view.printed_cells += 1;
         }
@@ -644,9 +704,10 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        // The `/sessions` and `/model` pickers are modal for navigation keys:
-        // ↑↓ move, plain Enter confirms, Esc closes. Everything else (typing,
-        // Ctrl+C, ...) still reaches its normal handler while a menu is open.
+        // The `/sessions`, `/model`, and `/effort` pickers are modal for
+        // navigation keys: ↑↓ move, plain Enter confirms, Esc closes.
+        // Everything else (typing, Ctrl+C, ...) still reaches its normal
+        // handler while a menu is open.
         if self.session_menu.is_some() {
             match key.code {
                 KeyCode::Up => return self.move_session_selection(-1),
@@ -667,6 +728,18 @@ impl App {
                 KeyCode::Char('r') if !ctrl && !alt && !shift => return self.refresh_model(),
                 KeyCode::Esc => {
                     self.model_menu = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.effort_menu.is_some() {
+            match key.code {
+                KeyCode::Up => return self.move_effort_selection(-1),
+                KeyCode::Down => return self.move_effort_selection(1),
+                KeyCode::Enter if !ctrl && !alt && !shift => return self.confirm_effort_selection(),
+                KeyCode::Esc => {
+                    self.effort_menu = None;
                     return;
                 }
                 _ => {}
@@ -780,6 +853,7 @@ impl App {
             || self.command_menu_dismissed
             || self.session_menu.is_some()
             || self.model_menu.is_some()
+            || self.effort_menu.is_some()
         {
             return Vec::new();
         }
@@ -900,6 +974,15 @@ impl App {
             "rename" => return self.rename_session(&invocation.args),
             "sessions" => return self.open_session_menu(),
             "model" => return self.open_model_menu(),
+            // `/effort` with a level sets it directly; with no argument it
+            // opens the picker (the argument policy is Optional).
+            "effort" => {
+                if invocation.args.is_empty() {
+                    return self.open_effort_menu();
+                }
+                return self.set_effort(&invocation.args);
+            }
+            "thinking" => return self.toggle_thinking(),
             _ => {}
         }
         let effects = self
@@ -1107,6 +1190,137 @@ impl App {
         self.spawn_discovery(&item.selection.provider);
     }
 
+    /// The effort levels the active model accepts: its declared `reasoning`
+    /// list when present, else the shared defaults — with the model's own
+    /// `default_level` always selectable even when the list omits it. Both
+    /// `/effort` forms (argument validation and the picker) use this list.
+    fn effort_levels(&self) -> Vec<String> {
+        let info = self
+            .route
+            .as_ref()
+            .and_then(|route| self.pool.model_info(route));
+        let mut levels = match info.as_ref().and_then(|model| model.reasoning.as_deref()) {
+            Some(levels) if !levels.is_empty() => levels.to_vec(),
+            _ => reasoning::DEFAULT_EFFORT_LEVELS
+                .iter()
+                .map(|level| (*level).to_string())
+                .collect(),
+        };
+        if let Some(default) = info.as_ref().and_then(|model| model.default_level.as_deref())
+            && !levels.iter().any(|level| level.eq_ignore_ascii_case(default))
+        {
+            levels.push(default.to_string());
+        }
+        levels
+    }
+
+    /// `/effort <level|off>`: validate the argument against the active
+    /// model's levels and apply it. A failed validation leaves the current
+    /// effort untouched.
+    fn set_effort(&mut self, args: &str) {
+        let value = args.trim();
+        if let Err(error) = reasoning::validate_effort(value, Some(&self.effort_levels())) {
+            self.view_mut().history.push(HistoryCell::Error(error));
+            return;
+        }
+        let effort = if value.eq_ignore_ascii_case(reasoning::EFFORT_OFF) {
+            None
+        } else {
+            Some(value.to_ascii_lowercase())
+        };
+        self.apply_effort(effort);
+    }
+
+    /// Apply an effort change: update the label optimistically, tell the
+    /// core, and record a notice. The core's `ReasoningEffortSwitched` event
+    /// is the authoritative confirmation (mirroring `/model`).
+    fn apply_effort(&mut self, effort: Option<String>) {
+        let view = self.view_mut();
+        view.history.push(HistoryCell::Notice(match &effort {
+            Some(level) => format!("reasoning effort set to {level}"),
+            None => "reasoning effort unset".to_string(),
+        }));
+        self.effort = effort.clone();
+        self.session.set_reasoning_effort(effort);
+    }
+
+    /// `/effort` with no argument: open the picker over the levels the active
+    /// model accepts (the defaults when it declares none), plus an `off`
+    /// entry that clears the override. Selection starts on the active level.
+    fn open_effort_menu(&mut self) {
+        let mut items: Vec<EffortMenuItem> = self
+            .effort_levels()
+            .into_iter()
+            .map(|level| EffortMenuItem {
+                current: self.effort.as_deref() == Some(level.as_str()),
+                level: Some(level),
+            })
+            .collect();
+        items.push(EffortMenuItem {
+            level: None,
+            current: self.effort.is_none(),
+        });
+        let selected = items
+            .iter()
+            .position(|item| item.current)
+            .unwrap_or(items.len() - 1);
+        self.command_menu_dismissed = true;
+        self.effort_menu = Some(EffortMenu { items, selected });
+    }
+
+    fn move_effort_selection(&mut self, delta: isize) {
+        let Some(menu) = self.effort_menu.as_mut() else {
+            return;
+        };
+        let len = menu.items.len();
+        menu.selected = if delta < 0 {
+            (menu.selected + len - 1) % len
+        } else {
+            (menu.selected + 1) % len
+        };
+    }
+
+    /// Confirm the picker: picking the already-active level just closes the
+    /// menu.
+    fn confirm_effort_selection(&mut self) {
+        let Some(menu) = self.effort_menu.take() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
+        if item.current {
+            return;
+        }
+        self.apply_effort(item.level.clone());
+    }
+
+    /// `/thinking`: fold or unfold the model's thinking output. A global
+    /// display flag — committed Thinking cells in every session re-render
+    /// with it on the next frame.
+    fn toggle_thinking(&mut self) {
+        self.show_thinking = !self.show_thinking;
+        let state = if self.show_thinking {
+            "expanded"
+        } else {
+            "collapsed"
+        };
+        let view = self.view_mut();
+        view.history
+            .push(HistoryCell::Notice(format!("thinking output {state}")));
+    }
+
+    /// Commit streamed thinking as a history cell, keeping it above the
+    /// assistant message it precedes. Called when visible content starts and
+    /// when the turn finalizes; blank thinking produces no cell.
+    fn commit_thinking(&mut self) {
+        if let Some(text) = self.view_mut().live_thinking.take()
+            && !text.trim().is_empty()
+        {
+            self.view_mut().history.push(HistoryCell::Thinking(text));
+        }
+    }
+
     /// Start a user turn. Hooks run before the turn is queued so they cannot
     /// race the model request; `busy` is already true, so nested submissions
     /// are ignored.
@@ -1179,6 +1393,7 @@ impl App {
         view.history
             .push(HistoryCell::Notice("conversation cleared".to_string()));
         view.live = None;
+        view.live_thinking = None;
         view.inline_final_text = None;
         view.live_committed = 0;
         view.printed_cells = 0;
@@ -1196,14 +1411,20 @@ impl App {
                 }
             }
             EventMsg::AgentMessageDelta { delta } => {
+                // Thinking that streamed before the first visible delta
+                // commits as a history cell now, so it renders above the
+                // streaming answer.
+                self.commit_thinking();
                 self.view_mut()
                     .live
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
             }
-            EventMsg::AgentThinkingDelta { .. } => {
-                // Reasoning output is not rendered by the minimal front-end;
-                // the worker already kept the transcript clean of it.
+            EventMsg::AgentThinkingDelta { delta } => {
+                self.view_mut()
+                    .live_thinking
+                    .get_or_insert_with(String::new)
+                    .push_str(&delta);
             }
             EventMsg::TurnUsage { .. } => {
                 // Surfaced for future status/context work; nothing to render.
@@ -1214,6 +1435,11 @@ impl App {
                 // non-TUI front-ends).
                 self.route = Selection::parse(&model).ok();
                 self.model_label = model;
+            }
+            EventMsg::ReasoningEffortSwitched { effort } => {
+                // `/effort` already updated optimistically; the core confirms
+                // (also covering non-TUI front-ends).
+                self.effort = effort;
             }
             EventMsg::AgentMessage { message } => {
                 self.view_mut().live = Some(message);
@@ -1255,6 +1481,9 @@ impl App {
     }
 
     fn finalize_live(&mut self) {
+        // Any thinking that never saw visible content (interrupted or failed
+        // turn) still lands as its own cell, above the assistant text.
+        self.commit_thinking();
         let Some(text) = self.view_mut().live.take() else {
             return;
         };
@@ -1422,10 +1651,12 @@ impl App {
     }
 
     /// Rows the menu above the composer needs: a picker (`/sessions`,
-    /// `/model`) when it is open, otherwise the slash-command candidates.
-    /// Empty when neither is visible.
+    /// `/model`, `/effort`) when it is open, otherwise the slash-command
+    /// candidates. Empty when neither is visible.
     fn menu_row_count(&self) -> usize {
         if let Some(menu) = self.model_menu.as_ref() {
+            menu.items.len().min(MAX_COMMAND_MENU_ROWS)
+        } else if let Some(menu) = self.effort_menu.as_ref() {
             menu.items.len().min(MAX_COMMAND_MENU_ROWS)
         } else if self.session_menu.is_some() {
             self.views.len().min(MAX_COMMAND_MENU_ROWS)
@@ -1442,6 +1673,18 @@ impl App {
             return window
                 .map(|index| {
                     model_menu_line(
+                        index + 1,
+                        &menu.items[index],
+                        index == menu.selected,
+                    )
+                })
+                .collect();
+        }
+        if let Some(menu) = self.effort_menu.as_ref() {
+            let window = command_menu_window(menu.items.len(), menu.selected, height);
+            return window
+                .map(|index| {
+                    effort_menu_line(
                         index + 1,
                         &menu.items[index],
                         index == menu.selected,
@@ -1493,17 +1736,34 @@ impl App {
         }
 
         let busy = self.busy;
+        let thinking_expanded = self.show_thinking;
         let view = self.view_mut();
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(""));
 
         for (index, cell) in view.history.iter().enumerate() {
-            lines.extend(cell.lines(width));
+            lines.extend(cell.lines(width, thinking_expanded));
             let has_more = index + 1 < view.history.len() || view.live.is_some();
             if has_more {
                 lines.push(Line::from(""));
             }
+        }
+
+        // The thinking block still streaming for this turn, above the
+        // assistant text it precedes.
+        if let Some(thinking) = &view.live_thinking
+            && !thinking.is_empty()
+        {
+            if thinking_expanded {
+                lines.extend(chat::thinking_lines(thinking, width, busy));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "✻ thinking…",
+                    Style::default().fg(theme::DIM),
+                )));
+            }
+            lines.push(Line::from(""));
         }
 
         if let Some(live) = &view.live {
@@ -1626,6 +1886,8 @@ impl App {
             "↑↓ select · Enter switch · Esc close"
         } else if self.model_menu.is_some() {
             "↑↓ select · Enter switch · r refresh · Esc close"
+        } else if self.effort_menu.is_some() {
+            "↑↓ select · Enter switch · Esc close"
         } else if self.command_menu_open() {
             "↑↓ select · Tab complete · Enter run · Esc close"
         } else if self.show_ctrl_c_hint() {
@@ -1638,7 +1900,13 @@ impl App {
             "Enter · / commands · Ctrl+J newline · PgUp/PgDn scroll"
         };
 
-        let hint_width = (display_width(hints) as u16 + 1).min(area.width);
+        let effort_label = self.effort.as_deref().unwrap_or(reasoning::EFFORT_OFF);
+        // The left side (label · state) wins: on a narrow terminal the right
+        // hint is what degrades, never the state word.
+        let left_plain = format!(" codest · {} · effort {effort_label}  │  {state}", self.model_label);
+        let left_width = (display_width(&left_plain) as u16 + 1).min(area.width);
+        let hint_width = (display_width(hints) as u16 + 1)
+            .min(area.width.saturating_sub(left_width));
         let parts =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(hint_width)]).split(area);
 
@@ -1651,6 +1919,10 @@ impl App {
             ),
             Span::styled(
                 format!(" · {}", self.model_label),
+                Style::default().fg(theme::DIM),
+            ),
+            Span::styled(
+                format!(" · effort {effort_label}"),
                 Style::default().fg(theme::DIM),
             ),
             Span::styled("  │  ", Style::default().fg(theme::DIM)),
@@ -1811,6 +2083,49 @@ fn model_menu_line(number: usize, item: &ModelMenuItem, selected: bool) -> Line<
         Span::styled(format!("{number} · "), number_style),
         Span::styled(
             truncated(&item.selection.as_str(), 48),
+            text_style,
+        ),
+    ];
+    if item.current {
+        spans.push(Span::styled(
+            " · current",
+            Style::default()
+                .fg(theme::DIM)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// One row of the `/effort` picker: marker, 1-based number, the level (or the
+/// `off` entry), and a marker on the active level.
+fn effort_menu_line(number: usize, item: &EffortMenuItem, selected: bool) -> Line<'static> {
+    let marker = if selected { "▸ " } else { "  " };
+    let (marker_style, number_style, text_style) = if selected {
+        (
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    } else {
+        (
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+        )
+    };
+
+    let mut spans = vec![
+        Span::styled(marker, marker_style),
+        Span::styled(format!("{number} · "), number_style),
+        Span::styled(
+            item.level
+                .clone()
+                .unwrap_or_else(|| reasoning::EFFORT_OFF.to_string()),
             text_style,
         ),
     ];
@@ -2018,6 +2333,77 @@ mod tests {
             vec![SessionView::initial("openai/m1", TuiMode::Fullscreen)],
             0,
         )
+    }
+
+    /// A pool whose `test/one` model declares reasoning metadata: a levels
+    /// list that does NOT spell out its own `default_level`.
+    fn meta_pool() -> Arc<ModelPool> {
+        let mut one = ModelInfo::from_id("one");
+        one.reasoning = Some(vec!["low".to_string(), "high".to_string()]);
+        one.default_level = Some("thinking".to_string());
+        let instance = ProviderInstance {
+            name: "test".to_string(),
+            protocol: Some("test".to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![one, ModelInfo::from_id("two")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
+        Arc::new(ModelPool::new(registry))
+    }
+
+    fn test_app_meta() -> App {
+        let pool = meta_pool();
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            Some(&Selection::new("test", "one")),
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            "test/one".to_string(),
+            TuiMode::Fullscreen,
+            PluginHost::builtin().expect("builtin plugins"),
+            vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_model_default_level_seeds_the_footer_effort() {
+        let mut app = test_app_meta();
+        assert_eq!(app.effort.as_deref(), Some("thinking"));
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(lines.join("\n").contains("· effort thinking"), "{lines:?}");
+
+        // The model's default stays selectable even though the declared
+        // `reasoning` list does not spell it out…
+        app.composer.set_text("/effort thinking".to_string());
+        app.try_submit();
+        assert_eq!(app.effort.as_deref(), Some("thinking"));
+
+        // …the declared levels stay available…
+        app.composer.set_text("/effort high".to_string());
+        app.try_submit();
+        assert_eq!(app.effort.as_deref(), Some("high"));
+
+        // …and levels outside both are still rejected.
+        app.composer.set_text("/effort medium".to_string());
+        app.try_submit();
+        assert_eq!(app.effort.as_deref(), Some("high"));
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Error(text)) if text.contains("unknown effort level"))
+        );
     }
 
     /// An app whose provider is a complete endpoint with no models yet:
@@ -2403,6 +2789,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_effort_switched_event_updates_effort() {
+        let mut app = test_app();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ReasoningEffortSwitched {
+                effort: Some("medium".to_string()),
+            },
+        ));
+        assert_eq!(app.effort.as_deref(), Some("medium"));
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ReasoningEffortSwitched { effort: None },
+        ));
+        assert_eq!(app.effort, None);
+    }
+
+    #[tokio::test]
+    async fn effort_command_sets_validates_and_clears() {
+        let mut app = test_app();
+
+        // The footer always shows the effort: `off` until one is set.
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(lines.join("\n").contains("· effort off"), "{lines:?}");
+
+        app.composer.set_text("/effort high".to_string());
+        app.try_submit();
+        assert_eq!(app.effort.as_deref(), Some("high"));
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("high"))
+        );
+
+        // Levels are case-insensitive and normalize to lowercase.
+        app.composer.set_text("/effort HIGH".to_string());
+        app.try_submit();
+        assert_eq!(app.effort.as_deref(), Some("high"));
+
+        // An unknown level is an error cell; the current effort stays.
+        app.composer.set_text("/effort bogus".to_string());
+        app.try_submit();
+        assert_eq!(app.effort.as_deref(), Some("high"));
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Error(text)) if text.contains("unknown effort level"))
+        );
+
+        // `off` clears the override.
+        app.composer.set_text("/effort off".to_string());
+        app.try_submit();
+        assert_eq!(app.effort, None);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("unset"))
+        );
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(lines.join("\n").contains("· effort off"), "{lines:?}");
+
+        // The footer shows the level while one is set.
+        app.composer.set_text("/effort medium".to_string());
+        app.try_submit();
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(lines.join("\n").contains("· effort medium"), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn effort_menu_opens_navigates_and_switches() {
+        let mut app = test_app();
+
+        app.composer.set_text("/effort".to_string());
+        app.try_submit();
+        let menu = app.effort_menu.as_ref().expect("picker open");
+        // Four default levels plus `off`; nothing is set yet, so the
+        // selection starts on the `off` entry.
+        assert_eq!(menu.items.len(), 5);
+        assert_eq!(menu.selected, 4);
+        assert!(menu.items.last().is_some_and(|item| item.current && item.level.is_none()));
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.effort_menu.is_none());
+        assert_eq!(app.effort.as_deref(), Some("high"));
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("high"))
+        );
+
+        // Reopening starts on the now-active level; confirming it only
+        // closes the menu.
+        app.composer.set_text("/effort".to_string());
+        app.try_submit();
+        assert_eq!(app.effort_menu.as_ref().unwrap().selected, 3);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.effort_menu.is_none());
+        let notices = app
+            .view()
+            .history
+            .iter()
+            .filter(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("set to")))
+            .count();
+        assert_eq!(notices, 1);
+
+        // Esc closes the picker without changing anything.
+        app.composer.set_text("/effort".to_string());
+        app.try_submit();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.effort_menu.is_none());
+        assert_eq!(app.effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn effort_menu_renders_levels_with_the_current_marker() {
+        let mut app = test_app();
+        app.composer.set_text("/effort high".to_string());
+        app.try_submit();
+        app.composer.set_text("/effort".to_string());
+        app.try_submit();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        let lines = render_lines(&mut app, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("▸ 5 · off"), "{rendered}");
+        assert!(rendered.contains("4 · high · current"), "{rendered}");
+        assert!(rendered.contains("Enter switch"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn thinking_command_toggles_the_fold_flag() {
+        let mut app = test_app();
+        assert!(app.show_thinking);
+
+        app.composer.set_text("/thinking".to_string());
+        app.try_submit();
+        assert!(!app.show_thinking);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("collapsed"))
+        );
+
+        app.composer.set_text("/thinking".to_string());
+        app.try_submit();
+        assert!(app.show_thinking);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("expanded"))
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_deltas_commit_above_the_answer() {
+        let mut app = test_app();
+        let event = |msg| crate::core::Event::new("sub-1", msg);
+
+        app.handle_agent_event(event(EventMsg::TurnStarted));
+        app.handle_agent_event(event(EventMsg::AgentThinkingDelta {
+            delta: "pondering".to_string(),
+        }));
+        assert_eq!(app.view().live_thinking.as_deref(), Some("pondering"));
+        assert!(
+            app.view().history.iter().all(|cell| !matches!(cell, HistoryCell::Thinking(_))),
+            "nothing commits while only thinking has streamed"
+        );
+
+        // The first visible delta commits the thinking cell above it.
+        app.handle_agent_event(event(EventMsg::AgentMessageDelta {
+            delta: "answer".to_string(),
+        }));
+        assert_eq!(app.view().live_thinking, None);
+        assert!(
+            matches!(&app.view().history[3], HistoryCell::Thinking(text) if text == "pondering"),
+            "{:?}",
+            app.view().history
+        );
+        assert_eq!(app.view().live.as_deref(), Some("answer"));
+
+        app.handle_agent_event(event(EventMsg::AgentMessage {
+            message: "answer".to_string(),
+        }));
+        app.handle_agent_event(event(EventMsg::TurnComplete));
+        assert!(
+            matches!(&app.view().history[4], HistoryCell::Assistant(text) if text == "answer"),
+            "{:?}",
+            app.view().history
+        );
+    }
+
+    #[tokio::test]
+    async fn a_thinking_only_turn_still_commits_the_cell() {
+        let mut app = test_app();
+        let event = |msg| crate::core::Event::new("sub-1", msg);
+
+        app.handle_agent_event(event(EventMsg::TurnStarted));
+        app.handle_agent_event(event(EventMsg::AgentThinkingDelta {
+            delta: "silent reasoning".to_string(),
+        }));
+        app.handle_agent_event(event(EventMsg::TurnAborted {
+            reason: "interrupted by user".to_string(),
+        }));
+
+        assert!(
+            matches!(&app.view().history[3], HistoryCell::Thinking(text) if text == "silent reasoning"),
+            "{:?}",
+            app.view().history
+        );
+        assert!(matches!(app.view().history.last(), Some(HistoryCell::Interrupted)));
+        assert_eq!(app.view().live_thinking, None);
+    }
+
+    #[tokio::test]
+    async fn thinking_cells_render_folded_and_expanded() {
+        let mut app = test_app();
+        app.view_mut()
+            .history
+            .push(HistoryCell::Thinking("long thoughts".to_string()));
+
+        // Expanded (the default): header over the dim body.
+        let lines = render_lines(&mut app, 60, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("✻ thinking"), "{rendered}");
+        assert!(rendered.contains("long thoughts"), "{rendered}");
+
+        // Folded: a single marker line, no body.
+        app.show_thinking = false;
+        let lines = render_lines(&mut app, 60, 20);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("✻ thinking (hidden · /thinking to expand)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("long thoughts"), "{rendered}");
+    }
+
+    #[tokio::test]
     async fn empty_route_prompts_instead_of_submitting_and_keeps_the_input() {
         let mut app = test_app_without_model();
         app.composer.set_text("hello there".to_string());
@@ -2529,8 +3142,8 @@ mod tests {
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            12,
-            "eight commands plus four aliases"
+            14,
+            "ten commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -2577,9 +3190,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 11);
+        assert_eq!(app.command_selection, 13);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 10);
+        assert_eq!(app.command_selection, 12);
     }
 
     #[tokio::test]

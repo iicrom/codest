@@ -76,6 +76,10 @@ pub enum Op {
     /// Make `selection` (`"provider/model"`, see `/model`) the backend for the
     /// following turns. Applied between turns; the current one is untouched.
     SwitchModel { selection: String },
+    /// Set the reasoning effort sent with the following turns (`/effort`);
+    /// `None` clears the override so no effort field is sent at all. Applied
+    /// between turns, like `SwitchModel`.
+    SetReasoningEffort { effort: Option<String> },
 }
 
 /// Events emitted by the agent.
@@ -85,8 +89,8 @@ pub enum EventMsg {
     TurnStarted,
     /// Incremental assistant text.
     AgentMessageDelta { delta: String },
-    /// Incremental reasoning content. The minimal front-end ignores it; the
-    /// event keeps the bus honest about what the model produced.
+    /// Incremental reasoning content, rendered dim (and foldable via
+    /// `/thinking`) by the front-end.
     AgentThinkingDelta { delta: String },
     /// The complete assistant text for the turn. Sent once, after streaming.
     AgentMessage { message: String },
@@ -109,6 +113,9 @@ pub enum EventMsg {
     /// The active model is now `model` (`"provider/model"`, see
     /// `Op::SwitchModel`).
     ModelSwitched { model: String },
+    /// The reasoning effort for the following turns is now `effort`
+    /// (`None` = no effort field is sent; see `Op::SetReasoningEffort`).
+    ReasoningEffortSwitched { effort: Option<String> },
     /// The worker has stopped.
     ShutdownComplete,
 }

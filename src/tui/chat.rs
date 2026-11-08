@@ -1,8 +1,8 @@
 //! Transcript cells.
 //!
 //! Codex renders a large family of history cells (exec output, diffs, MCP
-//! calls, approvals, …). A basic chat agent needs exactly five: user,
-//! assistant, error, notice, and an interruption marker.
+//! calls, approvals, …). A basic chat agent needs exactly six: user,
+//! assistant, thinking, error, notice, and an interruption marker.
 
 use ratatui::style::Modifier;
 use ratatui::style::Style;
@@ -17,6 +17,9 @@ use crate::tui::wrap::wrap_str;
 pub enum HistoryCell {
     User(String),
     Assistant(String),
+    /// The model's reasoning output for one turn. Display-only: folded to a
+    /// one-line marker unless `thinking_expanded` is passed to [`lines`].
+    Thinking(String),
     Error(String),
     Notice(String),
     Interrupted,
@@ -24,12 +27,21 @@ pub enum HistoryCell {
 
 impl HistoryCell {
     /// Render this cell into owned lines for a transcript of `width` columns.
-    pub fn lines(&self, width: usize) -> Vec<Line<'static>> {
+    /// `thinking_expanded` controls whether [`HistoryCell::Thinking`] cells
+    /// show their body or a one-line folded marker (`/thinking`).
+    pub fn lines(&self, width: usize, thinking_expanded: bool) -> Vec<Line<'static>> {
         match self {
             HistoryCell::User(text) => {
                 prefixed("› ", theme::USER, true, text, Style::default(), width)
             }
             HistoryCell::Assistant(text) => assistant_lines(text, width, false),
+            HistoryCell::Thinking(text) => {
+                if thinking_expanded {
+                    thinking_lines(text, width, false)
+                } else {
+                    vec![thinking_hidden_line()]
+                }
+            }
             HistoryCell::Error(text) => prefixed(
                 "! ",
                 theme::ERROR,
@@ -65,6 +77,37 @@ pub fn assistant_lines(text: &str, width: usize, streaming: bool) -> Vec<Line<'s
             .push(Span::styled("▌", Style::default().fg(theme::ACCENT)));
     }
     lines
+}
+
+/// Render the thinking block: a dim `✻ thinking` header over the dim body.
+/// While `streaming`, a block cursor is appended to the last body line.
+pub fn thinking_lines(text: &str, width: usize, streaming: bool) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "✻ thinking",
+        Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD),
+    ))];
+    let mut body = prefixed(
+        "  ",
+        theme::DIM,
+        false,
+        text,
+        Style::default().fg(theme::DIM),
+        width,
+    );
+    if streaming && let Some(last) = body.last_mut() {
+        last.spans
+            .push(Span::styled("▌", Style::default().fg(theme::ACCENT)));
+    }
+    lines.append(&mut body);
+    lines
+}
+
+/// The one-line stand-in shown for a folded thinking cell.
+fn thinking_hidden_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "✻ thinking (hidden · /thinking to expand)",
+        Style::default().fg(theme::DIM),
+    ))
 }
 
 fn normalize(text: &str) -> String {
@@ -132,7 +175,7 @@ mod tests {
 
     #[test]
     fn user_cell_has_prompt_and_indent() {
-        let lines = HistoryCell::User("hello world".to_string()).lines(10);
+        let lines = HistoryCell::User("hello world".to_string()).lines(10, true);
         assert_eq!(plain(&lines), vec!["› hello", "  world"]);
     }
 
@@ -144,7 +187,25 @@ mod tests {
 
     #[test]
     fn notice_is_dim_and_indented() {
-        let lines = HistoryCell::Notice("note".to_string()).lines(20);
+        let lines = HistoryCell::Notice("note".to_string()).lines(20, true);
         assert_eq!(plain(&lines), vec!["  note"]);
+    }
+
+    #[test]
+    fn thinking_cell_expands_to_header_and_dim_body() {
+        let lines = HistoryCell::Thinking("reasoning hard".to_string()).lines(20, true);
+        assert_eq!(plain(&lines), vec!["✻ thinking", "  reasoning hard"]);
+    }
+
+    #[test]
+    fn thinking_cell_folds_to_a_marker() {
+        let lines = HistoryCell::Thinking("reasoning hard".to_string()).lines(60, false);
+        assert_eq!(plain(&lines), vec!["✻ thinking (hidden · /thinking to expand)"]);
+    }
+
+    #[test]
+    fn thinking_streaming_appends_a_cursor() {
+        let lines = thinking_lines("deep thought", 20, true);
+        assert_eq!(plain(&lines), vec!["✻ thinking", "  deep thought▌"]);
     }
 }

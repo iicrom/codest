@@ -79,6 +79,20 @@ def reply_for(messages: Any) -> str:
     )
 
 
+def reasoning_for(body: dict[str, Any]) -> str:
+    """The thinking text streamed before the reply as `reasoning_content`.
+
+    It echoes back the `reasoning_effort` the request actually carried, so an
+    `/effort` change is visible end-to-end in the codest transcript.
+    """
+    effort = body.get("reasoning_effort")
+    effort_text = effort if isinstance(effort, str) and effort.strip() else "(not set)"
+    return (
+        "The test server is thinking: this text arrives as reasoning_content "
+        f"deltas, which codest renders dim. reasoning_effort={effort_text}."
+    )
+
+
 class ChatHandler(BaseHTTPRequestHandler):
     server_version = "codest-test-server/0.1"
     protocol_version = "HTTP/1.0"
@@ -88,13 +102,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send_json(200, {"status": "ok"})
         elif path.endswith("/models"):
-            # OpenAI-shaped directory for codest's `fetch_models` discovery.
+            # OpenAI-shaped directory for codest's `fetch_models` discovery;
+            # `default_level` feeds the /effort picker.
             self._send_json(
                 200,
                 {
                     "object": "list",
                     "data": [
-                        {"id": "test-model", "name": "Test Model"},
+                        {
+                            "id": "test-model",
+                            "name": "Test Model",
+                            "default_level": "high",
+                        },
                         {"id": "second-model"},
                     ],
                 },
@@ -178,6 +197,27 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         try:
+            # Reasoning deltas first, mirroring reasoning-tuned backends whose
+            # `reasoning_content` precedes the visible reply.
+            for token in tokenize(reasoning_for(body)):
+                self._send_chunk(
+                    {
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"reasoning_content": token},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                if delay > 0:
+                    time.sleep(delay)
+
             for token in tokenize(reply_for(body.get("messages"))):
                 self._send_chunk(
                     {

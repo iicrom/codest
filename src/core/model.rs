@@ -31,6 +31,15 @@ pub enum StreamItem {
 /// Boxed delta stream. `Err` terminates the turn with an error event.
 pub type ModelStream = Pin<Box<dyn Stream<Item = Result<StreamItem, ModelError>> + Send>>;
 
+/// Per-turn request options, threaded from the worker's state (set via ops)
+/// down to the client. Options a backend does not understand are ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnOptions {
+    /// Reasoning effort for this turn (e.g. `"low"`/`"medium"`/`"high"`,
+    /// `/effort`); `None` sends no effort field at all.
+    pub effort: Option<String>,
+}
+
 /// A streaming chat backend.
 ///
 /// Implementations must not panic and should return a stream even for invalid
@@ -41,7 +50,12 @@ pub trait ModelClient: Send + Sync {
 
     /// Stream assistant text for `messages`. `cancel` should be honoured both
     /// while waiting on the network and between deltas.
-    fn stream_chat(&self, messages: Vec<Message>, cancel: CancellationToken) -> ModelStream;
+    fn stream_chat(
+        &self,
+        messages: Vec<Message>,
+        options: TurnOptions,
+        cancel: CancellationToken,
+    ) -> ModelStream;
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -18,6 +18,10 @@ pub struct SessionView {
     pub history: Vec<HistoryCell>,
     /// Assistant text currently streaming (not yet committed to history).
     pub live: Option<String>,
+    /// Thinking text currently streaming for this turn. Display-only: it is
+    /// committed as a [`HistoryCell::Thinking`] when visible content arrives
+    /// or the turn ends, and never enters the conversation or the rollout.
+    pub live_thinking: Option<String>,
     /// Explicit session name set by `/rename`; when unset the session is
     /// named after its first user message.
     pub name: Option<String>,
@@ -91,6 +95,7 @@ impl SessionView {
         Self {
             history: Vec::new(),
             live: None,
+            live_thinking: None,
             name: None,
             follow: true,
             scroll: 0,

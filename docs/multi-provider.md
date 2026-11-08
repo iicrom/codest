@@ -24,7 +24,8 @@ worker 启动时吃掉一个 `Arc<dyn ModelClient>` 直到退出。多 Provider 
 
 非目标（v1 明确不做）：
 
-- 思考内容（`reasoning_content`）与 usage 的 UI 渲染（数据通道已打通，见 §7）；
+- usage 的 UI 渲染（数据通道已打通，见 §7；thinking 渲染与 `/effort`、
+  `/thinking` 已落地——见 §7 与 `core::reasoning`）；
 - OAuth / 凭据存储 / token 刷新（工厂的 `create()` 边界内自行解决）；
 - 模型添加向导 / `$EDITOR` 编辑（手改 providers.toml）；
 - 后台定时刷新、自适应探针、外部元数据源（models.dev 之类）——DSH 需要它们是因为
@@ -79,9 +80,10 @@ fetch_models = true                  # 缺省规则：未声明 models 视为 tr
 
   [[providers.models]]               # 显式声明（静态路径，优先）
   id = "gpt-4o-mini"
-  name = "GPT-4o mini"               # 以下元数据均为可选占位，本轮不消费
-  context_window = 128000
+  name = "GPT-4o mini"               # context_window 仍为占位；reasoning /
+  context_window = 128000            # default_level 供 /effort 使用
   reasoning = ["low", "medium", "high"]
+  default_level = "medium"           # 选中该模型时自动作为初始推理等级
 
 [[providers]]
 name = "glm-local"
@@ -172,9 +174,14 @@ footer 的 `provider/model` 标签，事件到达时权威回填。
 - **`ModelStream` 条目从 `String` 改为 `#[non_exhaustive] enum StreamItem`**：
   `Delta`（正文）、`Thinking`（`delta.reasoning_content`，reasoning 模型的思考
   增量）、`Usage`（token 计数）。worker 把 Thinking 转成
-  `EventMsg::AgentThinkingDelta`（前端本轮显式忽略）、Usage 在完整结束时以
+  `EventMsg::AgentThinkingDelta`（TUI 以暗色渲染、`/thinking` 可折叠；仅显示，
+  不进模型上下文与 rollout）、Usage 在完整结束时以
   `EventMsg::TurnUsage` 发出。渲染策略可以后补，通道先通——enum 后加 variant
   是破坏性变更，实现方会全体返工；
+- **per-turn 请求选项**：`ModelClient::stream_chat` 增加 `TurnOptions`
+  （当前含 `effort`，`/effort` → `Op::SetReasoningEffort` 设定、FIFO 生效），
+  `openai-compat` 把它作为请求体的 `reasoning_effort` 字段发送——合并顺序为
+  标准字段 < `body_overrides` < effort（交互式设置赢过静态覆盖）。
 - **SSE 帧解析提取为 `core::sse`**：按规范实现（帧以空行结束、同帧多行 `data:`
   以 `\n` 连接、`event:` 字段、单空格剥离、CRLF/UTF-8 跨块容错）。`openai-compat`
   消费它；插件协议不应自带 SSE 解析，直接复用。
@@ -244,7 +251,7 @@ python3 scripts/pty_smoke.py
 - client 不做重试、代理、认证刷新（与单端点时代一致）；`ModelError::NotConfigured`
   仍是"回合报错"而非启动失败，部分配置的 providers.toml 不影响其他实例；
 - `/model` 添加端点的表单向导、`$EDITOR` 流程留待后续（先手改 providers.toml）；
-- `Thinking`/`Usage` 的消费方（淡色渲染、`/status` token 统计、按 `context_window`
-  压缩）是现成的下一步；
+- `Usage` 的消费方（`/status` token 统计、按 `context_window` 压缩）是现成的
+  下一步；thinking 的暗色渲染与折叠（`/thinking`）、推理等级（`/effort`）已落地；
 - 想要 anthropic-messages 之类第二协议时，写一个内置工厂或示范插件即可，注册表
   无需改动。

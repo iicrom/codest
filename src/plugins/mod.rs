@@ -266,14 +266,15 @@ impl PluginHost {
     }
 
     /// The plugins compiled into the binary, plus the built-in front-end
-    /// commands (`/new`, `/rename`, `/sessions`, `/model`) that the front-end
-    /// handles itself.
+    /// commands (`/new`, `/rename`, `/sessions`, `/model`, `/effort`,
+    /// `/thinking`) that the front-end handles itself.
     pub fn builtin() -> Result<Self, PluginHostError> {
         Self::with_extra_commands(
             BUILTIN_PLUGINS,
             &[
                 crate::core::sessions::SESSION_COMMANDS,
                 crate::core::providers::MODEL_COMMANDS,
+                crate::core::reasoning::REASONING_COMMANDS,
             ],
         )
     }
@@ -627,7 +628,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "clear", "quit", "status", "new", "rename", "sessions", "model"
+                "help", "clear", "quit", "status", "new", "rename", "sessions", "model",
+                "effort", "thinking"
             ]
         );
     }

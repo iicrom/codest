@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::core::model::{ModelClient, ModelError, ModelStream, StreamItem};
+use crate::core::model::{ModelClient, ModelError, ModelStream, StreamItem, TurnOptions};
 use crate::core::protocol::{Message, Role};
 
 /// A deterministic echo model. It streams word-sized chunks so session tests
@@ -30,7 +30,12 @@ impl ModelClient for EchoModelClient {
         "echo".to_string()
     }
 
-    fn stream_chat(&self, messages: Vec<Message>, cancel: CancellationToken) -> ModelStream {
+    fn stream_chat(
+        &self,
+        messages: Vec<Message>,
+        _options: TurnOptions,
+        cancel: CancellationToken,
+    ) -> ModelStream {
         let reply = reply_for(&messages);
         let delay = self.delay;
 
@@ -92,7 +97,11 @@ mod tests {
     #[tokio::test]
     async fn streams_the_full_reply() {
         let client = EchoModelClient::new(Duration::ZERO);
-        let mut stream = client.stream_chat(vec![Message::user("ping")], CancellationToken::new());
+        let mut stream = client.stream_chat(
+            vec![Message::user("ping")],
+            TurnOptions::default(),
+            CancellationToken::new(),
+        );
 
         let mut out = String::new();
         while let Some(item) = stream.next().await {
@@ -112,6 +121,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut stream = client.stream_chat(
             vec![Message::user("a much longer message to stream")],
+            TurnOptions::default(),
             cancel.clone(),
         );
 

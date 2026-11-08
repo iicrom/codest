@@ -471,6 +471,14 @@ impl ModelPool {
         models
     }
 
+    /// The metadata for one selection: the declared model entry when the
+    /// config declares it, else the discovered one.
+    pub fn model_info(&self, selection: &Selection) -> Option<ModelInfo> {
+        self.models_of(&selection.provider)
+            .into_iter()
+            .find(|model| model.id == selection.model)
+    }
+
     /// Selection rows for the `/model` menu: every configured model of every
     /// instance, in declaration order.
     pub fn selections(&self) -> Vec<Selection> {
@@ -698,11 +706,18 @@ pub fn models_from_openai_list(payload: &serde_json::Value) -> Vec<ModelInfo> {
             .and_then(serde_json::Value::as_str)
             .filter(|name| !name.is_empty())
             .map(str::to_string);
+        let default_level = entry
+            .get("default_level")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|level| !level.is_empty())
+            .map(str::to_string);
         models.push(ModelInfo {
             id: id.to_string(),
             name,
             context_window: None,
             reasoning: None,
+            default_level,
         });
     }
     models
@@ -905,18 +920,63 @@ mod tests {
     fn openai_models_list_parses_and_dedupes() {
         let payload = serde_json::json!({
             "data": [
-                {"id": "m1", "name": "Model One"},
+                {"id": "m1", "name": "Model One", "default_level": "high"},
                 {"id": "m1"},
                 {"id": ""},
                 {"no-id": true},
-                {"id": "m2"}
+                {"id": "m2", "default_level": "  "},
+                {"id": "m3", "default_level": "thinking"}
             ]
         });
         let models = models_from_openai_list(&payload);
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].display_name(), "Model One");
+        assert_eq!(models[0].default_level.as_deref(), Some("high"));
         assert_eq!(models[1].id, "m2");
+        // A blank default is not a level.
+        assert_eq!(models[1].default_level, None);
+        assert_eq!(models[2].id, "m3");
+        assert_eq!(models[2].default_level.as_deref(), Some("thinking"));
 
         assert!(models_from_openai_list(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn model_info_finds_declared_and_fetched_entries() {
+        let mut declared = ModelInfo::from_id("m1");
+        declared.default_level = Some("high".to_string());
+        let mut fetched = ModelInfo::from_id("fetched");
+        fetched.default_level = Some("low".to_string());
+        let instance = ProviderInstance {
+            name: "p".to_string(),
+            protocol: Some(DEFAULT_PROTOCOL.to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![declared],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry =
+            ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
+        let pool = ModelPool::new(registry);
+        pool.fetched
+            .lock()
+            .expect("lock")
+            .insert("p".to_string(), vec![fetched]);
+
+        assert_eq!(
+            pool.model_info(&Selection::new("p", "m1"))
+                .and_then(|model| model.default_level),
+            Some("high".to_string()),
+            "the declared entry wins"
+        );
+        assert_eq!(
+            pool.model_info(&Selection::new("p", "fetched"))
+                .and_then(|model| model.default_level),
+            Some("low".to_string())
+        );
+        assert!(pool.model_info(&Selection::new("p", "nope")).is_none());
     }
 }

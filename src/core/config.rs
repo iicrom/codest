@@ -37,8 +37,9 @@ pub struct GlobalConfig {
     pub default: Option<String>,
 }
 
-/// One model of a provider: an id plus optional display metadata. All fields
-/// beyond `id` are advisory; nothing consumes them yet.
+/// One model of a provider: an id plus optional display metadata. The fields
+/// beyond `id` are advisory — `reasoning` and `default_level` feed `/effort`,
+/// the rest await consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelInfo {
@@ -47,6 +48,12 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     /// Reasoning effort levels the model accepts, lowest first.
     pub reasoning: Option<Vec<String>>,
+    /// The reasoning effort this model prefers when none is set explicitly.
+    /// Adopted when the model is selected (startup or `/model`) until
+    /// `/effort` overrides it. Accepted from providers.toml and the models
+    /// API alike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_level: Option<String>,
 }
 
 impl ModelInfo {
@@ -57,6 +64,7 @@ impl ModelInfo {
             name: None,
             context_window: None,
             reasoning: None,
+            default_level: None,
         }
     }
 
@@ -285,6 +293,7 @@ id = "glm-5.3"
 name = "GLM-5.3"
 context_window = 200000
 reasoning = ["low", "high"]
+default_level = "high"
 
 [[providers]]
 name = "local"
@@ -305,6 +314,7 @@ nested = { deep = [1, "two", true] }
         assert_eq!(instances[0].models.len(), 1);
         assert_eq!(instances[0].models[0].display_name(), "GLM-5.3");
         assert_eq!(instances[0].models[0].context_window, Some(200000));
+        assert_eq!(instances[0].models[0].default_level.as_deref(), Some("high"));
         assert!(instances[0].should_fetch_models());
 
         assert_eq!(instances[1].protocol_id(), "test");
