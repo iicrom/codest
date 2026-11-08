@@ -27,6 +27,7 @@ use std::fmt;
 
 use crate::core::commands::CommandTableError;
 use crate::core::commands::{CommandInput, CommandTable};
+use crate::core::providers::ProtocolFactory;
 
 pub use crate::core::commands::{ArgsPolicy, CommandCandidate, CommandSpec, Invocation};
 pub use builtin::BUILTIN_PLUGINS;
@@ -49,6 +50,14 @@ pub trait Plugin: Sync {
     /// Extra system-prompt text appended when the session starts.
     fn system_prompt(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Protocol kinds contributed to the provider registry. A custom
+    /// provider = a `ProtocolFactory` here (the wire protocol, compile-time)
+    /// plus instances in `providers.toml` (the endpoints, runtime config).
+    /// See `core::providers`.
+    fn protocols(&self) -> &'static [&'static dyn ProtocolFactory] {
+        &[]
     }
 
     /// Called once after the session is created and before the first frame.
@@ -225,11 +234,12 @@ impl PluginHost {
     }
 
     /// Build a host whose command table also carries front-end built-in
-    /// commands that no plugin owns (the core session commands). Name
-    /// collisions between plugins and extras are rejected like duplicates.
+    /// commands that no plugin owns (the core session commands and `/model`).
+    /// Name collisions between plugins and extras are rejected like
+    /// duplicates.
     fn with_extra_commands(
         plugins: &'static [&'static dyn Plugin],
-        extra: &'static [CommandSpec],
+        extra: &[&'static [CommandSpec]],
     ) -> Result<Self, PluginHostError> {
         let mut ids = Vec::with_capacity(plugins.len());
         for plugin in plugins {
@@ -246,7 +256,7 @@ impl PluginHost {
         let specs = plugins
             .iter()
             .flat_map(|plugin| plugin.commands())
-            .chain(extra.iter());
+            .chain(extra.iter().flat_map(|slice| slice.iter()));
         let table = CommandTable::new(specs)?;
         Ok(Self {
             plugins,
@@ -255,10 +265,17 @@ impl PluginHost {
         })
     }
 
-    /// The plugins compiled into the binary, plus the built-in session
-    /// commands (`/new`, `/sessions`) that the front-end handles itself.
+    /// The plugins compiled into the binary, plus the built-in front-end
+    /// commands (`/new`, `/rename`, `/sessions`, `/model`) that the front-end
+    /// handles itself.
     pub fn builtin() -> Result<Self, PluginHostError> {
-        Self::with_extra_commands(BUILTIN_PLUGINS, crate::core::sessions::SESSION_COMMANDS)
+        Self::with_extra_commands(
+            BUILTIN_PLUGINS,
+            &[
+                crate::core::sessions::SESSION_COMMANDS,
+                crate::core::providers::MODEL_COMMANDS,
+            ],
+        )
     }
 
     pub fn plugins(&self) -> &'static [&'static dyn Plugin] {
@@ -271,6 +288,16 @@ impl PluginHost {
 
     pub fn table(&self) -> &CommandTable {
         &self.table
+    }
+
+    /// Every protocol factory contributed by the compiled-in plugins, in
+    /// registration order. The provider registry merges these with its
+    /// built-ins; duplicate ids fail the registry build.
+    pub fn protocol_factories(&self) -> Vec<&'static dyn ProtocolFactory> {
+        self.plugins
+            .iter()
+            .flat_map(|plugin| plugin.protocols().iter().copied())
+            .collect()
     }
 
     /// Build the effective system prompt: the base prompt followed by every
@@ -372,6 +399,10 @@ impl fmt::Debug for PluginHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ModelClient;
+    use crate::core::config::ProviderInstance;
+    use crate::core::echo_model::EchoModelClient;
+    use crate::core::model::ModelError;
 
     static ECHO_COMMAND: CommandSpec = CommandSpec::new(
         "echo",
@@ -596,10 +627,88 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "clear", "quit", "status", "new", "rename", "sessions"
+                "help", "clear", "quit", "status", "new", "rename", "sessions", "model"
             ]
         );
     }
+
+    /// A plugin contributing a protocol kind to the provider registry —
+    /// the "custom provider" extension path.
+    struct Vendor;
+
+    impl Plugin for Vendor {
+        fn id(&self) -> &'static str {
+            "vendor"
+        }
+
+        fn protocols(&self) -> &'static [&'static dyn ProtocolFactory] {
+            static FACTORIES: &[&'static dyn ProtocolFactory] = &[&VENDOR_FACTORY];
+            FACTORIES
+        }
+    }
+
+    /// A minimal custom protocol: one that builds a client from an instance
+    /// without touching the network.
+    struct VendorFactory;
+
+    impl ProtocolFactory for VendorFactory {
+        fn id(&self) -> &'static str {
+            "vendor-protocol"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Vendor (example)"
+        }
+
+        fn create(
+            &self,
+            instance: &ProviderInstance,
+            _model: &str,
+        ) -> Result<std::sync::Arc<dyn ModelClient>, ModelError> {
+            // Resolving the key exercises the config seam even though the
+            // echo model ignores it (an unset template yields None here).
+            let _api_key = instance.resolved_api_key();
+            Ok(std::sync::Arc::new(EchoModelClient::new(
+                std::time::Duration::ZERO,
+            )))
+        }
+    }
+
+    static VENDOR_FACTORY: VendorFactory = VendorFactory;
+
+    #[test]
+    fn plugin_protocols_feed_the_provider_registry() {
+        static VENDOR_PLUGINS: &[&dyn Plugin] = &[&Vendor];
+
+        let host = PluginHost::new(VENDOR_PLUGINS).expect("valid plugins");
+        let factories = host.protocol_factories();
+        assert_eq!(factories.len(), 1);
+        assert_eq!(factories[0].id(), "vendor-protocol");
+
+        let instance = ProviderInstance {
+            name: "vendored".to_string(),
+            protocol: Some("vendor-protocol".to_string()),
+            base_url: None,
+            api_key: Some("$CODEST_NO_SUCH_VAR".to_string()),
+            models: vec![],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry = crate::core::providers::ProviderRegistry::build(&factories, vec![instance])
+            .expect("the plugin protocol is known");
+        assert_eq!(registry.protocol_display_name("vendor-protocol"), "Vendor (example)");
+
+        // Registering the same protocol id twice in one build is an error.
+        let error = crate::core::providers::ProviderRegistry::build(
+            &[factories[0], factories[0]],
+            vec![],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("more than once"), "{error}");
+    }
+
 
     #[test]
     fn help_lists_plugin_commands() {

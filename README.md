@@ -34,12 +34,12 @@ cargo test                    # 单元测试离线运行，使用进程内假模
 python3 scripts/pty_smoke.py  # 伪终端冒烟测试：自动拉起测试服务，fullscreen / inline 都会跑
 ```
 
-连接一个 OpenAI 兼容的流式接口：
+连接一个 OpenAI 兼容的流式接口（`CST_BASE_URL`/`CST_API_KEY` 需成对提供，只给其一时 codest 会在发送时提示补全）：
 
 ```bash
 export CST_API_KEY=sk-...
-export CST_BASE_URL=https://api.openai.com/v1   # 可选
-export CST_MODEL=gpt-4o-mini                   # 可选
+export CST_BASE_URL=https://api.openai.com/v1
+export CST_MODEL=gpt-4o-mini                   # 可选；不给则由 /model 从该端点发现模型列表
 cargo run
 ```
 
@@ -59,12 +59,15 @@ cargo run -- --resume      # 打开会话选择菜单（见"多会话"）
 > `CST_API_KEY` / `CST_BASE_URL` / `CST_MODEL` / `CST_TUI_MODE` 中的 `CST` 就是 codest 的简写，保持不变。
 >
 > 没有 API key 时 codest 会直接报错并提示如何启动本地测试服务，不再回退到任何内嵌 mock。
+>
+> 上面的 flag/env 方式是**单端点兼容路径**；配置了 `~/.codest/providers.toml` 之后，它们退化为"覆盖所选实例字段"。多 Provider 的完整用法见[下一节](#多-provider)。
 
 ### 本地测试服务
 
 `scripts/openai_test_server.py` 是只依赖 Python 标准库的简易 OpenAI Chat Completions 服务端，用于在没有 key、没有外网的情况下端到端验证 TUI 和 SSE 客户端：
 
 - `POST /chat/completions` 支持 `"stream": true` 的 SSE 增量输出，也支持普通 JSON 响应；
+- `GET /models` 返回 OpenAI 形状的模型目录（供 `fetch_models` 发现）；
 - `GET /health` 返回 `{"status":"ok"}`；
 - 不校验 API key，回复内容为最后一条用户消息，便于确认流式渲染；
 - `--delay` 控制 token 间隔，`--port 0` 使用随机端口并打印实际地址。
@@ -75,6 +78,72 @@ python3 scripts/openai_test_server.py --port 0
 ```
 
 > 按需求，本项目**没有做真实外网测试**。`cargo test` 是纯离线单元测试；`scripts/pty_smoke.py` 只访问本机启动的测试服务。
+
+## 多 Provider
+
+codest 支持多个 provider 实例，每个实例挂多个模型；协议与实例分离——"自定义端点"只是一个 `base_url` 不同的 `openai-compat` 实例，真正的自定义线协议由插件贡献。完整设计见 [`docs/multi-provider.md`](docs/multi-provider.md)。
+
+### 配置
+
+`~/.codest/config.toml` 存全局设置（本轮仅 `default` 一项），provider 实例放 `~/.codest/providers.toml`：
+
+```toml
+# ~/.codest/providers.toml
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "$OPENAI_API_KEY"        # $VAR 模板，密钥不必落盘
+fetch_models = true                # 从 GET /models 发现模型列表
+
+  [[providers.models]]             # 也可以显式声明（优先于发现结果）
+  id = "gpt-4o-mini"
+
+[[providers]]
+name = "local"
+base_url = "http://127.0.0.1:8080/v1"
+api_key = "test"
+headers = { "X-Custom" = "v" }     # 静态请求头/请求体覆盖：多数"特殊端点"免插件
+body_overrides = { temperature = 0.5 }
+```
+
+- **没有内置默认 provider,也没有默认 base_url/model**:flag/env 提供的 `base_url` 与 `api_key` 按**成对**要求合成单端点实例——只给了其中一个时,codest 照常启动并在发送消息或 `/model` 获取列表时提示补全另一个;两者都未提供则为空路由(见下)。显式给了 model 就直接可用;没给 model 则实例不带模型列表,由 `/model` 从该 `base_url` 的 models API 发现(启动时即后台拉取);
+- 文件存在但解析失败会启动报错（带路径与细节），未知字段同样报错；
+- 起始选择优先级：`--provider`/`--model` > config.toml `default` > 第一个实例的第一个模型；
+- 也可以用 `protocol = "test"` 选内置的进程内 echo 后端，完全离线试玩。
+
+### `/model` 切换
+
+| 指令 | 行为 |
+| --- | --- |
+| `/model` | 打开模型菜单：`↑`/`↓` 选择、`Enter` 切换、`r` 重新发现模型、`Esc` 关闭 |
+
+- 菜单按 provider 分组列出全部可选的 `provider/model`，当前项标 `current`；
+- 切换只在回合边界生效（不打断正在生成的回复），footer 的 backend 标签即时更新；
+- 开启了 `fetch_models` 的实例在启动时后台发现模型，结果合并进菜单并缓存到 `~/.codest/model-cache.json`（失败只产生一条通知，绝不阻塞会话）；
+- 会话 rollout 记录初始与切换后的模型（`SessionMeta` 与 `model_switched` 行），旧 rollout 文件照常加载。
+
+### 插件贡献自定义协议
+
+端点说 OpenAI 方言时**不需要写代码**（配置 `headers` / `body_overrides` 即可）；请求体结构、流格式、签名机制不同时，插件实现 `ProtocolFactory`（编译期）并在 `providers.toml` 里以 `protocol = "<id>"` 引用：
+
+```rust
+impl Plugin for Vendor {
+    fn id(&self) -> &'static str { "vendor" }
+    fn protocols(&self) -> &'static [&'static dyn ProtocolFactory] {
+        std::slice::from_ref(&VENDOR_FACTORY)
+    }
+}
+```
+
+```toml
+[[providers]]
+name = "vendored"
+protocol = "vendor-protocol"
+api_key = "$VENDOR_TOKEN"
+models = [{ id = "vendor-large" }]
+```
+
+协议插件与命令插件一样是编译期静态链接的：它给的是维护者的模块化，不是运行时可扩展性。工厂示例与扩展契约见 [`docs/multi-provider.md`](docs/multi-provider.md) 第 8 节。
 
 ## TUI 模式（fullscreen / inline）
 
@@ -127,6 +196,7 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 | `/new` | — | 归档当前对话，开启一个新的空会话 |
 | `/rename <name>` | — | 重命名当前会话；默认名取该会话第一句用户输入 |
 | `/sessions` | `/resume` | 打开会话列表菜单，切换并继续以前的会话 |
+| `/model` | — | 打开模型菜单，在 `provider/model` 之间切换（见"多 Provider"） |
 
 输入 `/` 就会在输入框上方弹出候选列表，继续输入会按指令名或别名前缀实时过滤（不区分大小写）：
 
@@ -173,7 +243,7 @@ codest --resume          # 同 --continue，并在启动时打开会话选择菜
 codest 的指令和生命周期扩展都来自**编译期链接**的插件，不做运行时加载：
 
 - 插件是普通的 Rust 模块，注册表是 `src/plugins/builtin/mod.rs` 里的一个 `static` 切片；注册顺序就是钩子执行顺序和菜单顺序。
-- 插件可以贡献 slash 命令、系统提示词片段，以及 `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` 钩子。
+- 插件可以贡献 slash 命令、系统提示词片段、`on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` 钩子，以及多 Provider 的协议工厂（`protocols()`，见"多 Provider"）。
 - 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、清屏、退出、设置输入框、提交新回合），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
 - 重复插件 id、重复命令名/别名、非法命令名会在启动时被拒绝。
 
@@ -211,27 +281,31 @@ codest/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   └── plugins.md           # 静态插件系统设计
+│   ├── plugins.md           # 静态插件系统设计
+│   └── multi-provider.md    # 多 Provider 框架设计
 ├── scripts/
 │   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务
 │   └── pty_smoke.py          # 离线端到端冒烟测试（pty）
 └── src/
     ├── main.rs              # codest 主入口
     ├── bin/cst.rs           # cst 别名入口
-    ├── cli.rs               # CLI 参数 + endpoint 配置
+    ├── cli.rs               # CLI 参数 + 启动装配（配置文件、注册表、初始选择）
     ├── lib.rs
     ├── core/
     │   ├── protocol.rs      # Message / Op / Event
     │   ├── commands.rs      # 命令表 / 解析（指令由插件提供）
     │   ├── sessions.rs      # 内置 /new /rename /sessions 命令 spec（多会话）
     │   ├── conversation.rs  # 线性会话历史
-    │   ├── model.rs         # ModelClient trait + 错误类型
-    │   ├── openai_compat.rs # HTTP + SSE 流式客户端
+    │   ├── model.rs         # ModelClient trait + StreamItem + 错误类型
+    │   ├── openai_compat.rs # HTTP + SSE 流式客户端（openai-compat 协议）
+    │   ├── sse.rs           # 共享 SSE 帧解析（所有 SSE 协议复用）
+    │   ├── config.rs        # config.toml / providers.toml 解析 + $ENV 模板
+    │   ├── providers.rs     # 协议工厂 / 注册表 / 模型池 / /model 命令 spec
     │   ├── rollout.rs       # 会话持久化（JSONL rollout 落盘 / 回放）
-    │   ├── test_model.rs    # 仅 cargo test 编译的进程内假模型
+    │   ├── echo_model.rs    # 进程内 echo 模型（测试 + test 协议后端）
     │   └── session.rs       # agent worker（持有全部会话）+ AgentSession
     ├── plugins/
-    │   ├── mod.rs           # Plugin trait / PluginHost / effects
+    │   ├── mod.rs           # Plugin trait / PluginHost / effects / 协议收集
     │   └── builtin/
     │       ├── mod.rs       # 静态注册表
     │       ├── help.rs      # /help
@@ -239,7 +313,7 @@ codest/
     │       ├── quit.rs      # /quit
     │       └── status.rs    # /status
     └── tui/
-        ├── app.rs           # 事件循环 / fullscreen & inline 渲染
+        ├── app.rs           # 事件循环 / fullscreen & inline 渲染 / /model 菜单
         ├── session.rs       # 每会话视图状态（SessionView）
         ├── chat.rs          # 历史单元格
         ├── composer.rs      # 输入编辑器
@@ -253,8 +327,10 @@ codest/
 - 插件是编译期静态链接的：新增/修改插件需要改代码并重新编译，不支持运行时加载 `.so` 或脚本插件；插件与主程序同权限，没有沙箱隔离。
 - 插件钩子在 TUI 线程同步执行，不能做阻塞 I/O。
 - 会话按 rollout 保存在 `~/.codest/sessions/<工作区哈希>/`（`CODEST_HOME` 可覆盖），跨次启动可用 `--continue` / `--resume` 恢复；没有并发写锁（同时开多个 codest 写同一工作区没有保护）、没有归档/删除/搜索，也没有跨工作区的会话迁移。
-- 没有网络重试、代理、认证刷新；HTTP 客户端只实现一次请求 + SSE 增量解析。
-- 没有内嵌离线模型：必须配置 API key，或先启动 `scripts/openai_test_server.py` 并把 `--base-url` 指过去。
+- 没有网络重试、代理、认证刷新；HTTP 客户端只实现一次请求 + SSE 增量解析。API key 支持 `$VAR` 模板引用环境变量，但没有 OAuth/凭据存储，token 轮换需在协议工厂内部自行解决。
+- 没有外网也能玩：`protocol = "test"` 提供进程内 echo 后端；真实端点仍需 API key 或先启动 `scripts/openai_test_server.py`。
+- 思考内容（`reasoning_content`）与 usage 已进入数据通道（`AgentThinkingDelta` / `TurnUsage` 事件），但 TUI 暂不渲染。
+- 没有配置任何 provider 时以空路由启动：发消息得到添加指引（内容保留在输入框），不会发出请求。
 - `fullscreen` 只有滚轮滚动，应用内鼠标选区/复制尚未实现；选区用终端原生能力（通常按住 `Shift` 拖拽）。
 - `inline` 下已经写进 scrollback 的行不会随窗口宽度重新换行。
 - 测试全部离线：`cargo test` 不会发起任何网络请求；`scripts/pty_smoke.py` 只访问本机启动的测试服务。
@@ -262,8 +338,9 @@ codest/
 ## 后续可扩展点
 
 1. 在 `Op` 中加入工具调用与审批事件，向 codex 的 SQ/EQ 靠拢，并让插件可以注册工具。
-2. 为 `Conversation` 增加 token 预算与压缩。
-3. 会话持久化（rollout JSONL）与 resume。
-4. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
-5. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。
-6. 用 `inventory`/`linkme` 做分布式静态注册，保持 `Plugin` 契约不变。
+2. 为 `Conversation` 增加 token 预算与压缩（消费 `ModelInfo::context_window` 与 `TurnUsage`）。
+3. 思考内容的淡色渲染（`AgentThinkingDelta` 已入事件总线）与 `/status` 的 token 统计。
+4. `/model` 菜单内添加/编辑端点（表单向导或 `$EDITOR`），写回 `providers.toml`。
+5. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
+6. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。
+7. 用 `inventory`/`linkme` 做分布式静态注册，保持 `Plugin` 契约不变。

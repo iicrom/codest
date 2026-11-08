@@ -1,33 +1,33 @@
-//! Deterministic in-process model used by unit tests.
+//! Deterministic in-process echo model.
 //!
-//! This module is compiled only for `cargo test`. The shipped binary has no
-//! offline backend: it always talks to an OpenAI-compatible endpoint. For
-//! manual end-to-end testing, run `scripts/openai_test_server.py` and point
-//! `codest` at it.
+//! Serves two roles: the fake backend for offline unit tests, and the
+//! implementation behind the built-in `test` protocol (pickable through
+//! `providers.toml` with `protocol = "test"`), so a no-network demo does not
+//! need the Python test server.
 
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::core::model::{ModelClient, ModelError, ModelStream};
+use crate::core::model::{ModelClient, ModelError, ModelStream, StreamItem};
 use crate::core::protocol::{Message, Role};
 
 /// A deterministic echo model. It streams word-sized chunks so session tests
 /// exercise the same incremental path as a real backend.
 #[derive(Debug, Clone)]
-pub(crate) struct FakeModelClient {
+pub struct EchoModelClient {
     delay: Duration,
 }
 
-impl FakeModelClient {
-    pub(crate) fn new(delay: Duration) -> Self {
+impl EchoModelClient {
+    pub fn new(delay: Duration) -> Self {
         Self { delay }
     }
 }
 
-impl ModelClient for FakeModelClient {
+impl ModelClient for EchoModelClient {
     fn label(&self) -> String {
-        "test-model".to_string()
+        "echo".to_string()
     }
 
     fn stream_chat(&self, messages: Vec<Message>, cancel: CancellationToken) -> ModelStream {
@@ -45,7 +45,7 @@ impl ModelClient for FakeModelClient {
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
-                yield Ok::<String, ModelError>(token);
+                yield Ok::<_, ModelError>(StreamItem::Delta(token));
             }
         })
     }
@@ -91,12 +91,15 @@ mod tests {
 
     #[tokio::test]
     async fn streams_the_full_reply() {
-        let client = FakeModelClient::new(Duration::ZERO);
+        let client = EchoModelClient::new(Duration::ZERO);
         let mut stream = client.stream_chat(vec![Message::user("ping")], CancellationToken::new());
 
         let mut out = String::new();
         while let Some(item) = stream.next().await {
-            out.push_str(&item.expect("test stream never fails"));
+            match item.expect("test stream never fails") {
+                StreamItem::Delta(delta) => out.push_str(&delta),
+                other => panic!("echo model only streams deltas, got {other:?}"),
+            }
         }
 
         assert!(out.contains("You said: \"ping\""));
@@ -105,7 +108,7 @@ mod tests {
 
     #[tokio::test]
     async fn honours_cancellation() {
-        let client = FakeModelClient::new(Duration::from_millis(5));
+        let client = EchoModelClient::new(Duration::from_millis(5));
         let cancel = CancellationToken::new();
         let mut stream = client.stream_chat(
             vec![Message::user("a much longer message to stream")],

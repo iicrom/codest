@@ -200,25 +200,50 @@ def start_test_server() -> tuple[subprocess.Popen, str]:
     return process, f"http://127.0.0.1:{port}/v1"
 
 
-def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
+def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> dict[str, bool]:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
     env = dict(os.environ)
     env["TERM"] = "xterm-256color"
     # Keep smoke-test sessions out of the user's real ~/.codest.
-    env["CODEST_HOME"] = tempfile.mkdtemp(prefix="codest-pty-")
+    home = tempfile.mkdtemp(prefix="codest-pty-")
+    env["CODEST_HOME"] = home
+    if variant == "config":
+        # The multi-provider path: a providers.toml instance pointing at the
+        # test server plus a config.toml default selection. The flag/env
+        # fallback stays covered by the flag-driven case below.
+        with open(os.path.join(home, "providers.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                "[[providers]]\n"
+                'name = "pytest"\n'
+                f'base_url = "{base_url}"\n'
+                'api_key = "test-key"\n'
+                "fetch_models = true\n"
+            )
+        with open(os.path.join(home, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write('default = "pytest/test-model"\n')
+    elif variant in ("empty", "partial"):
+        # `empty`: nothing configured at all — an empty route (`no model`
+        # footer) that prompts instead of sending. `partial`: only one half
+        # of the base_url/api_key pair — prompts name the missing piece.
+        for key in list(env):
+            if key.startswith("CST_") or key in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
+                del env[key]
+    if variant == "flags":
+        endpoint_args = ["--base-url", base_url, "--api-key", "test-key", "--model", "test-model"]
+    elif variant == "partial":
+        # One half of the pair only: codest must run, arm the route, and ask
+        # for the missing `api_key` at use time.
+        endpoint_args = ["--base-url", base_url, "--model", "test-model"]
+    else:
+        endpoint_args = []
     process = subprocess.Popen(
         [
             binary,
             "--tui-mode",
             mode,
-            "--base-url",
-            base_url,
-            "--api-key",
-            "test-key",
-            "--model",
-            "test-model",
+            *endpoint_args,
         ],
         stdin=slave,
         stdout=slave,
@@ -237,6 +262,54 @@ def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
             print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
             return {"startup": False}
 
+        if variant in ("empty", "partial"):
+            # Empty route: commands keep working, messages get guidance and
+            # the composer keeps its content, and no turn is ever queued.
+            # Partial: the guidance names the missing half of the pair.
+            os.write(master, b"/help")
+            pump(master, output, 0.4)
+            os.write(master, b"\r")
+            pump(master, output, 0.5)
+            os.write(master, b"hello from pty")
+            pump(master, output, 0.4)
+            os.write(master, b"\r")
+            if not pump(master, output, 1.0):
+                print(f"[{mode}] process exited on the empty-route send", file=sys.stderr)
+                print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
+                return {"empty_send": False}
+            raw_after = output.decode("utf-8", "replace")
+            screen = render(raw_after)
+            print(f"--- {mode} screen (empty route) ---")
+            print(screen)
+            print(f"--- {mode} checks ---")
+            if variant == "empty":
+                checks = {
+                    "no model footer": "codest · no model" in screen,
+                    "no model banner": "backend: no model" in raw_after,
+                    "commands work": "/clear" in screen and "/quit" in screen,
+                    "guidance on send": "no model is configured" in screen,
+                    "composer preserved": "› hello from pty" in screen,
+                    "idle state": "ready" in screen,
+                    "clean exit": True,  # set below after quitting
+                }
+            else:
+                checks = {
+                    "partial footer": "codest · openai/test-model" in screen,
+                    "commands work": "/clear" in screen and "/quit" in screen,
+                    "guidance names missing key": "missing `api_key`" in screen,
+                    "composer preserved": "› hello from pty" in screen,
+                    "idle state": "ready" in screen,
+                    "clean exit": True,  # set below after quitting
+                }
+            # Quit: first Ctrl+C clears the untouched composer, the next two quit.
+            for _ in range(3):
+                os.write(master, b"\x03")
+                pump(master, output, 0.4)
+            checks["clean exit"] = process.poll() is not None or process.wait(timeout=2) == 0
+            for name, passed in checks.items():
+                print(f"{'PASS' if passed else 'FAIL'}  {name}")
+            return checks
+
         # First turn: a single-line message.
         os.write(master, b"hello from pty")
         pump(master, output, 0.4)
@@ -247,6 +320,23 @@ def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
             return {"streaming": False}
         turn1_end = len(output)
 
+        if variant == "config":
+            # `/model` picker: the discovery notice may have landed already;
+            # open the menu, move to the fetched second model, switch.
+            os.write(master, b"/model")
+            pump(master, output, 0.4)
+            os.write(master, b"\r")
+            pump(master, output, 0.5)
+            menu_end = len(output)
+            os.write(master, b"\x1b[B")
+            pump(master, output, 0.2)
+            os.write(master, b"\r")
+            if not pump(master, output, 1.0):
+                print(f"[{mode}] process exited in the model menu", file=sys.stderr)
+                print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
+                return {"model_menu": False}
+            raw_menu = output[menu_end:].decode("utf-8", "replace")
+
         # Second turn: grow the composer with Ctrl+J before sending, which
         # exercises the inline pane's height changes.
         os.write(master, b"line one")
@@ -256,10 +346,11 @@ def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         os.write(master, b"line two")
         pump(master, output, 0.3)
         os.write(master, b"\r")
-        if not pump(master, output, 3.0):
+        if not pump(master, output, 5.0):
             print(f"[{mode}] process exited on the second turn", file=sys.stderr)
             print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
             return {"streaming": False}
+        turn2_end = len(output)
 
         # Fullscreen owns the mouse wheel and should scroll the transcript
         # back to the first turn after the second one overflowed the screen.
@@ -287,8 +378,13 @@ def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
 
     raw = output.decode("utf-8", "replace")
     raw_turn1 = output[:turn1_end].decode("utf-8", "replace")
+    # The second turn is checked before the wheel section: the scroll test
+    # legitimately moves the viewport to the top, which pushes the tail of
+    # the transcript below the fold in longer (config) transcripts.
+    raw_turn2 = output[:turn2_end].decode("utf-8", "replace")
     raw_before_quit = output[:before_quit].decode("utf-8", "replace")
     screen_turn1 = render(raw_turn1)
+    screen_turn2 = render(raw_turn2)
     screen = render(raw_before_quit)
     if os.environ.get("PTY_RAW_OUT"):
         with open(os.environ["PTY_RAW_OUT"], "w", encoding="utf-8") as handle:
@@ -299,17 +395,28 @@ def run_case(binary: str, mode: str, base_url: str) -> dict[str, bool]:
     print(screen)
     print(f"--- {mode} checks ---")
 
+    if variant == "config":
+        expected_label = "pytest/second-model"
+    else:
+        expected_label = "openai/test-model"
     checks = {
         "first user message": "› hello from pty" in screen_turn1,
         "first reply": 'You said: "hello from pty"' in screen_turn1,
-        "second user message": "› line one" in screen,
-        "second reply": 'You said: "line one' in screen,
+        "second user message": "› line one" in screen_turn2,
+        "second reply": 'You said: "line one' in screen_turn2,
         "no stray cursor": "▌" not in screen,
-        "test server footer": "codest · test-model" in screen,
+        "test server footer": f"codest · {expected_label}" in screen,
         "idle state": "ready" in screen,
         "mode notice": f"mode: {mode}" in raw_turn1,
         "clean exit": process.returncode == 0,
     }
+    if variant == "config":
+        # Discovery + picker + switch: the test server lists test-model and
+        # second-model; the menu switched to the second one.
+        checks["discovery notice"] = "model discovery for pytest found 2 models" in raw
+        checks["menu lists fetched model"] = "pytest/test-model" in raw_menu
+        checks["menu lists second model"] = "pytest/second-model" in raw_menu
+        checks["switch notice"] = "switched to pytest/second-model" in screen
     if mode == "fullscreen":
         checks["alternate screen"] = "\x1b[?1049h" in raw
         checks["mouse capture"] = "\x1b[?1000h" in raw
@@ -343,9 +450,12 @@ def main() -> int:
     passed = True
     try:
         for mode in modes:
-            checks = run_case(args.binary, mode, base_url)
-            passed = passed and all(checks.values())
-            print()
+            for variant in ("flags", "config", "empty", "partial"):
+                label = f"{mode}/{variant}"
+                print(f"=== {label} ===")
+                checks = run_case(args.binary, mode, base_url, variant=variant)
+                passed = passed and all(checks.values())
+                print()
     finally:
         server.terminate()
         try:

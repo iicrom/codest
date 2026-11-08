@@ -18,10 +18,13 @@ use crate::core::conversation::Conversation;
 use crate::core::conversation::DEFAULT_SYSTEM_PROMPT;
 use crate::core::model::ModelClient;
 use crate::core::model::ModelStream;
+use crate::core::model::StreamItem;
 use crate::core::protocol::Event;
 use crate::core::protocol::EventMsg;
 use crate::core::protocol::Op;
 use crate::core::protocol::Submission;
+use crate::core::providers::ModelPool;
+use crate::core::providers::Selection;
 use crate::core::rollout::LoadedSession;
 use crate::core::rollout::RolloutFile;
 use crate::core::rollout::RolloutItem;
@@ -56,6 +59,83 @@ impl InterruptHandle {
     }
 }
 
+/// Where a worker's model requests go.
+///
+/// [`ModelBackend::Fixed`] is the single-client shape tests and simple hosts
+/// use; [`ModelBackend::Pooled`] is the multi-provider shape: a
+/// [`ModelPool`] plus the currently selected `provider/model`, replaceable
+/// between turns via `Op::SwitchModel`. [`ModelBackend::Empty`] is the
+/// no-providers-configured shape: turns fail with guidance until a switch
+/// migrates it to [`ModelBackend::Pooled`].
+pub enum ModelBackend {
+    Fixed(Arc<dyn ModelClient>),
+    Pooled {
+        pool: Arc<ModelPool>,
+        current: Selection,
+        client: Arc<dyn ModelClient>,
+    },
+    Empty { pool: Arc<ModelPool> },
+}
+
+impl ModelBackend {
+    /// The client for the upcoming turn. Only meaningful for the backends
+    /// that have one — callers guard `Empty` before reaching here.
+    fn client(&self) -> &Arc<dyn ModelClient> {
+        match self {
+            ModelBackend::Fixed(client) => client,
+            ModelBackend::Pooled { client, .. } => client,
+            ModelBackend::Empty { .. } => unreachable!("Empty backend has no client; guard turns with has_client()"),
+        }
+    }
+
+    /// The active selection, for rollout metadata; `None` on a fixed or
+    /// empty backend.
+    fn selection(&self) -> Option<&Selection> {
+        match self {
+            ModelBackend::Fixed(_) | ModelBackend::Empty { .. } => None,
+            ModelBackend::Pooled { current, .. } => Some(current),
+        }
+    }
+
+    /// Switch the pooled backend to another `provider/model`. The new client
+    /// is built (or cache-hit) here, so a broken selection surfaces as this
+    /// error instead of failing the next turn. A fixed backend cannot
+    /// switch; an empty backend becomes pooled on the first successful one.
+    fn switch(&mut self, selection: &str) -> Result<Selection, String> {
+        match self {
+            ModelBackend::Fixed(_) => Err("model switching is unavailable: \
+                this session runs a fixed backend"
+                .to_string()),
+            ModelBackend::Pooled { pool, current, client } => {
+                let parsed = Self::resolve(pool, selection)?;
+                *current = parsed.clone();
+                *client = Self::client_for(pool, &parsed)?;
+                Ok(parsed)
+            }
+            ModelBackend::Empty { pool } => {
+                let parsed = Self::resolve(pool, selection)?;
+                let client = Self::client_for(pool, &parsed)?;
+                *self = ModelBackend::Pooled {
+                    pool: pool.clone(),
+                    current: parsed.clone(),
+                    client,
+                };
+                Ok(parsed)
+            }
+        }
+    }
+
+    fn resolve(pool: &ModelPool, selection: &str) -> Result<Selection, String> {
+        pool.registry()
+            .parse_selection(selection)
+            .map_err(|error| error.to_string())
+    }
+
+    fn client_for(pool: &ModelPool, parsed: &Selection) -> Result<Arc<dyn ModelClient>, String> {
+        pool.client(parsed).map_err(|error| error.to_string())
+    }
+}
+
 /// Front-end handle to the agent worker.
 pub struct AgentSession {
     tx: mpsc::UnboundedSender<Submission>,
@@ -84,12 +164,46 @@ impl AgentSession {
         system_prompt: impl Into<String>,
         bootstrap: SessionBootstrap,
     ) -> Self {
+        Self::spawn_with_backend(
+            ModelBackend::Fixed(client),
+            system_prompt,
+            bootstrap,
+        )
+    }
+
+    /// Spawn the worker on a multi-provider pool, starting at `selection`
+    /// (`"provider/model"`). `None` starts with no route at all (nothing
+    /// configured): turns fail with guidance until a `/model` switch lands.
+    /// Fails when a given selection cannot resolve to a client — callers
+    /// should validate before offering it.
+    pub fn spawn_with_pool(
+        pool: Arc<ModelPool>,
+        selection: Option<&Selection>,
+        system_prompt: impl Into<String>,
+        bootstrap: SessionBootstrap,
+    ) -> Result<Self, String> {
+        let backend = match selection {
+            Some(selection) => ModelBackend::Pooled {
+                client: pool.client(selection).map_err(|error| error.to_string())?,
+                current: selection.clone(),
+                pool,
+            },
+            None => ModelBackend::Empty { pool },
+        };
+        Ok(Self::spawn_with_backend(backend, system_prompt, bootstrap))
+    }
+
+    fn spawn_with_backend(
+        backend: ModelBackend,
+        system_prompt: impl Into<String>,
+        bootstrap: SessionBootstrap,
+    ) -> Self {
         let (tx, submission_rx) = mpsc::unbounded_channel();
         let (event_tx, rx) = mpsc::unbounded_channel();
         let interrupt = InterruptHandle::default();
 
         tokio::spawn(run_worker(
-            client,
+            backend,
             system_prompt.into(),
             submission_rx,
             event_tx,
@@ -157,6 +271,15 @@ impl AgentSession {
         })
     }
 
+    /// Make `selection` (`"provider/model"`, see `/model`) the backend for
+    /// the following turns. The result arrives as [`EventMsg::ModelSwitched`]
+    /// or an error event; ops are FIFO, so a switch never lands mid-turn.
+    pub fn switch_model(&self, selection: impl Into<String>) -> String {
+        self.submit(Op::SwitchModel {
+            selection: selection.into(),
+        })
+    }
+
     /// Await the next event. `None` means the worker has stopped and the
     /// channel is closed.
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -169,6 +292,9 @@ struct ActiveTurn {
     stream: ModelStream,
     cancel: CancellationToken,
     assistant: String,
+    /// Usage reported by the backend for this turn, surfaced with
+    /// `TurnUsage` on completion.
+    usage: Option<(u64, u64)>,
 }
 
 /// What the worker starts from: sessions restored from disk plus the rollout
@@ -219,10 +345,13 @@ impl RolloutSlot {
     }
 }
 
-/// All rollout slots plus the writer they lazily create files with.
+/// All rollout slots plus the writer they lazily create files with. The
+/// active model selection is recorded in a session's meta line, so a rollout
+/// says which backend produced it.
 struct Rollouts {
     writer: Option<RolloutWriter>,
     system_prompt: String,
+    selection: Option<Selection>,
     slots: Vec<RolloutSlot>,
 }
 
@@ -248,7 +377,14 @@ impl Rollouts {
             }
             // First user input: the session earns its rollout file now, with
             // any buffered items flushed ahead of the message.
-            match writer.start_session(&self.system_prompt) {
+            let (provider, model) = match self.selection.as_ref() {
+                Some(selection) => (
+                    Some(selection.provider.as_str()),
+                    Some(selection.model.as_str()),
+                ),
+                None => (None, None),
+            };
+            match writer.start_session(&self.system_prompt, provider, model) {
                 Ok(mut file) => {
                     for buffered in std::mem::take(&mut slot.pending) {
                         if let Err(error) = file.append(&buffered) {
@@ -274,7 +410,7 @@ impl Rollouts {
 }
 
 async fn run_worker(
-    client: Arc<dyn ModelClient>,
+    backend: ModelBackend,
     system_prompt: String,
     mut rx: mpsc::UnboundedReceiver<Submission>,
     tx: mpsc::UnboundedSender<Event>,
@@ -287,6 +423,7 @@ async fn run_worker(
     let writer = bootstrap
         .rollout_dir
         .map(|dir| RolloutWriter::new(dir, bootstrap.cwd));
+    let mut backend = backend;
     let mut sessions = Vec::new();
     let mut slots = Vec::new();
 
@@ -323,6 +460,7 @@ async fn run_worker(
     let mut rollouts = Rollouts {
         writer,
         system_prompt: system_prompt.clone(),
+        selection: backend.selection().cloned(),
         slots,
     };
     let mut current = sessions.len() - 1;
@@ -349,16 +487,37 @@ async fn run_worker(
 
         match submission.op {
             Op::UserTurn { text } => {
+                // Two stops before any wire traffic: nothing selected at all,
+                // or a half-specified endpoint (lone base_url/api_key). Both
+                // answer with guidance instead of a doomed request — non-TUI
+                // front-ends rely on this guard.
+                let blocked = match &backend {
+                    ModelBackend::Empty { .. } => {
+                        Some(crate::core::providers::NO_MODEL_GUIDANCE.to_string())
+                    }
+                    ModelBackend::Pooled { pool, current, .. } => {
+                        pool.missing_credential(&current.provider)
+                    }
+                    ModelBackend::Fixed(_) => None,
+                };
+                if let Some(message) = blocked {
+                    let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
+                    continue;
+                }
                 sessions[current].push_user(text.clone());
                 rollouts.append(current, RolloutItem::UserMessage { message: text });
                 let cancel = CancellationToken::new();
-                let stream = client.stream_chat(sessions[current].snapshot(), cancel.clone());
+                let stream =
+                    backend
+                        .client()
+                        .stream_chat(sessions[current].snapshot(), cancel.clone());
                 let _ = tx.send(Event::new(submission.id.clone(), EventMsg::TurnStarted));
                 active = Some(ActiveTurn {
                     id: submission.id,
                     stream,
                     cancel,
                     assistant: String::new(),
+                    usage: None,
                 });
             }
             Op::Interrupt => {
@@ -420,6 +579,27 @@ async fn run_worker(
                     ));
                 }
             }
+            Op::SwitchModel { selection } => match backend.switch(&selection) {
+                Ok(parsed) => {
+                    rollouts.selection = Some(parsed.clone());
+                    rollouts.append(
+                        current,
+                        RolloutItem::ModelSwitched {
+                            provider: parsed.provider.clone(),
+                            model: parsed.model.clone(),
+                        },
+                    );
+                    let _ = tx.send(Event::new(
+                        submission.id,
+                        EventMsg::ModelSwitched {
+                            model: parsed.as_str(),
+                        },
+                    ));
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
+                }
+            },
             Op::Shutdown => {
                 let _ = tx.send(Event::new(submission.id, EventMsg::ShutdownComplete));
                 break;
@@ -446,12 +626,23 @@ async fn run_turn(
             }
             item = turn.stream.next() => {
                 match item {
-                    Some(Ok(delta)) => {
+                    Some(Ok(StreamItem::Delta(delta))) => {
                         turn.assistant.push_str(&delta);
                         let _ = tx.send(Event::new(
                             turn.id.clone(),
                             EventMsg::AgentMessageDelta { delta },
                         ));
+                    }
+                    Some(Ok(StreamItem::Thinking(delta))) => {
+                        // The minimal front-end ignores reasoning output; the
+                        // event keeps the bus honest about what was produced.
+                        let _ = tx.send(Event::new(
+                            turn.id.clone(),
+                            EventMsg::AgentThinkingDelta { delta },
+                        ));
+                    }
+                    Some(Ok(StreamItem::Usage { input, output })) => {
+                        turn.usage = Some((input, output));
                     }
                     Some(Err(error)) => {
                         finalize_error(turn, conversation, rollouts, current, tx, &error.to_string());
@@ -489,6 +680,9 @@ fn finalize_complete(
             message: turn.assistant.clone(),
         },
     ));
+    if let Some((input, output)) = turn.usage {
+        let _ = tx.send(Event::new(turn.id.clone(), EventMsg::TurnUsage { input, output }));
+    }
     let _ = tx.send(Event::new(turn.id.clone(), EventMsg::TurnComplete));
 }
 
@@ -559,9 +753,11 @@ fn finalize_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::ModelInfo;
+    use crate::core::config::ProviderInstance;
+    use crate::core::echo_model::EchoModelClient;
     use crate::core::protocol::Message;
     use crate::core::protocol::Role;
-    use crate::core::test_model::FakeModelClient;
     use std::time::Duration;
 
     async fn collect_turn(session: &mut AgentSession) -> Vec<Event> {
@@ -578,7 +774,7 @@ mod tests {
 
     #[tokio::test]
     async fn streams_a_turn_end_to_end() {
-        let client = Arc::new(FakeModelClient::new(Duration::ZERO));
+        let client = Arc::new(EchoModelClient::new(Duration::ZERO));
         let mut session = AgentSession::spawn(client);
 
         session.submit_user_turn("hello");
@@ -629,7 +825,7 @@ mod tests {
         fn stream_chat(&self, messages: Vec<Message>, _cancel: CancellationToken) -> ModelStream {
             self.seen.lock().expect("lock").push(messages);
             Box::pin(futures_util::stream::once(async {
-                Ok::<String, crate::core::model::ModelError>("ok".to_string())
+                Ok::<_, crate::core::model::ModelError>(StreamItem::Delta("ok".to_string()))
             }))
         }
     }
@@ -680,7 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn interrupt_keeps_partial_output() {
-        let client = Arc::new(FakeModelClient::new(Duration::from_millis(5)));
+        let client = Arc::new(EchoModelClient::new(Duration::from_millis(5)));
         let mut session = AgentSession::spawn(client);
 
         session.submit_user_turn("interrupt me");
@@ -746,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn switching_to_an_unknown_session_reports_an_error() {
-        let client = Arc::new(FakeModelClient::new(Duration::ZERO));
+        let client = Arc::new(EchoModelClient::new(Duration::ZERO));
         let mut session = AgentSession::spawn(client);
 
         session.switch_session(3);
@@ -833,7 +1029,7 @@ mod tests {
         // A session with no user input produces no rollout file at all, even
         // when it was renamed.
         let mut session = AgentSession::spawn_with_bootstrap(
-            Arc::new(FakeModelClient::new(Duration::ZERO)),
+            Arc::new(EchoModelClient::new(Duration::ZERO)),
             "be brief",
             SessionBootstrap {
                 loaded: Vec::new(),
@@ -853,7 +1049,7 @@ mod tests {
 
         // Once input arrives the file appears, with the rename replayed.
         let mut session = AgentSession::spawn_with_bootstrap(
-            Arc::new(FakeModelClient::new(Duration::ZERO)),
+            Arc::new(EchoModelClient::new(Duration::ZERO)),
             "be brief",
             SessionBootstrap {
                 loaded: Vec::new(),
@@ -878,12 +1074,225 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_stops_the_worker() {
-        let client = Arc::new(FakeModelClient::new(Duration::ZERO));
+        let client = Arc::new(EchoModelClient::new(Duration::ZERO));
         let mut session = AgentSession::spawn(client);
         session.shutdown();
 
         let event = session.next_event().await.expect("shutdown event");
         assert!(matches!(event.msg, EventMsg::ShutdownComplete));
         assert!(session.next_event().await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-provider switching
+    // -----------------------------------------------------------------------
+
+    /// A pool over the built-in `test` protocol with two selectable models.
+    fn test_pool() -> Arc<ModelPool> {
+        let instance = ProviderInstance {
+            name: "test".to_string(),
+            protocol: Some("test".to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![ModelInfo::from_id("one"), ModelInfo::from_id("two")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry =
+            crate::core::providers::ProviderRegistry::build(&[], vec![instance])
+                .expect("valid registry");
+        Arc::new(ModelPool::new(registry))
+    }
+
+    #[tokio::test]
+    async fn switch_model_swaps_the_backend_between_turns() {
+        let mut session = AgentSession::spawn_with_pool(
+            test_pool(),
+            Some(&Selection::new("test", "one")),
+            "be brief",
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+
+        session.switch_model("test/two");
+        let event = session.next_event().await.expect("switch event");
+        assert!(matches!(
+            event.msg,
+            EventMsg::ModelSwitched { model } if model == "test/two"
+        ));
+
+        // Ops are FIFO: the switch applies before the next turn streams.
+        session.submit_user_turn("second");
+        let events = collect_turn(&mut session).await;
+        assert!(matches!(
+            events.last().map(|event| &event.msg),
+            Some(EventMsg::TurnComplete)
+        ));
+    }
+
+    #[tokio::test]
+    async fn switching_to_an_unknown_provider_reports_an_error_and_keeps_serving() {
+        let mut session = AgentSession::spawn_with_pool(
+            test_pool(),
+            Some(&Selection::new("test", "one")),
+            "be brief",
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+
+        session.switch_model("other/m");
+        let event = session.next_event().await.expect("error event");
+        assert!(matches!(event.msg, EventMsg::Error { .. }));
+
+        // The failed switch left the active backend in place.
+        session.submit_user_turn("still there");
+        let events = collect_turn(&mut session).await;
+        assert!(matches!(
+            events.last().map(|event| &event.msg),
+            Some(EventMsg::TurnComplete)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_fixed_backend_rejects_switching() {
+        let mut session =
+            AgentSession::spawn(Arc::new(EchoModelClient::new(Duration::ZERO)));
+        session.switch_model("test/one");
+        let event = session.next_event().await.expect("error event");
+        match &event.msg {
+            EventMsg::Error { message } => assert!(message.contains("fixed backend"), "{message}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_route_answers_turns_with_guidance() {
+        let mut session = AgentSession::spawn_with_pool(
+            test_pool(),
+            None,
+            "be brief",
+            SessionBootstrap::default(),
+        )
+        .expect("empty route spawns");
+
+        session.submit_user_turn("hello");
+        let event = session.next_event().await.expect("guidance event");
+        match &event.msg {
+            EventMsg::Error { message } => {
+                assert!(message.contains("no model is configured"), "{message}");
+            }
+            other => panic!("expected guidance, got {other:?}"),
+        }
+
+        // The worker keeps serving; another turn gets the same guidance.
+        session.submit_user_turn("still nothing");
+        let event = session.next_event().await.expect("second guidance");
+        assert!(matches!(event.msg, EventMsg::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_half_specified_provider_answers_turns_with_guidance() {
+        // URL but no key: the route arms (the model id is declared), and the
+        // first turn names the missing half instead of firing a doomed
+        // request.
+        let instance = ProviderInstance {
+            name: "openai".to_string(),
+            protocol: None,
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            api_key: None,
+            models: vec![ModelInfo::from_id("m1")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: true,
+        };
+        let registry = crate::core::providers::ProviderRegistry::build(&[], vec![instance])
+            .expect("valid registry");
+        let mut session = AgentSession::spawn_with_pool(
+            Arc::new(ModelPool::new(registry)),
+            Some(&Selection::new("openai", "m1")),
+            "be brief",
+            SessionBootstrap::default(),
+        )
+        .expect("selection resolves");
+
+        session.submit_user_turn("hello");
+        let event = session.next_event().await.expect("guidance event");
+        match &event.msg {
+            EventMsg::Error { message } => {
+                assert!(message.contains("missing `api_key`"), "{message}");
+            }
+            other => panic!("expected guidance, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_from_an_empty_route_arms_the_backend() {
+        let mut session = AgentSession::spawn_with_pool(
+            test_pool(),
+            None,
+            "be brief",
+            SessionBootstrap::default(),
+        )
+        .expect("empty route spawns");
+
+        session.switch_model("test/two");
+        let event = session.next_event().await.expect("switch event");
+        assert!(matches!(
+            event.msg,
+            EventMsg::ModelSwitched { model } if model == "test/two"
+        ));
+
+        // The empty backend migrated to pooled: the next turn streams.
+        session.submit_user_turn("now it works");
+        let events = collect_turn(&mut session).await;
+        assert!(matches!(
+            events.last().map(|event| &event.msg),
+            Some(EventMsg::TurnComplete)
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_selection_is_recorded_in_the_rollout() {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-model-rollout-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut session = AgentSession::spawn_with_pool(
+            test_pool(),
+            Some(&Selection::new("test", "one")),
+            "be brief",
+            SessionBootstrap {
+                loaded: Vec::new(),
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                fresh: true,
+            },
+        )
+        .expect("initial selection resolves");
+        session.submit_user_turn("hello");
+        collect_turn(&mut session).await;
+        session.switch_model("test/two");
+        let _ = session.next_event().await;
+        session.submit_user_turn("again");
+        collect_turn(&mut session).await;
+        session.shutdown();
+        while session.next_event().await.is_some() {}
+
+        let loaded = crate::core::rollout::load_workspace_sessions(&dir).expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].meta.provider.as_deref(), Some("test"));
+        assert_eq!(loaded[0].meta.model.as_deref(), Some("one"));
     }
 }

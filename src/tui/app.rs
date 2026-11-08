@@ -68,7 +68,10 @@ use crate::core::CommandInput;
 use crate::core::DEFAULT_SYSTEM_PROMPT;
 use crate::core::EventMsg;
 use crate::core::Invocation;
-use crate::core::ModelClient;
+use crate::core::ModelPool;
+use crate::core::NO_MODEL_GUIDANCE;
+use crate::core::NO_MODEL_SELECTED;
+use crate::core::Selection;
 use crate::core::SessionBootstrap;
 use crate::core::rollout;
 use crate::core::rollout::LoadedSession;
@@ -94,8 +97,17 @@ const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
 
 /// Run the TUI until the user quits or the agent worker stops.
+///
+/// `plugins` carries the command table (and the provider factories already
+/// merged into `pool`'s registry); `selection` is the model this run starts
+/// with, or `None` when nothing is configured — the app then opens with an
+/// empty route and guides the user on the first send. Providers with models
+/// discovery enabled are refreshed in the background, best-effort: results
+/// arrive as transcript notices.
 pub async fn run(
-    client: Arc<dyn ModelClient>,
+    plugins: PluginHost,
+    pool: Arc<ModelPool>,
+    selection: Option<Selection>,
     system_prompt: Option<String>,
     mode: TuiMode,
     restore: RestoreMode,
@@ -104,7 +116,6 @@ pub async fn run(
     let _guard = TerminalGuard { mode };
     let mut terminal = Some(setup_terminal(mode)?);
 
-    let plugins = PluginHost::builtin()?;
     let base_prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
     let system_prompt = plugins.system_prompt(&base_prompt);
 
@@ -121,8 +132,9 @@ pub async fn run(
     });
     let fresh = restore == RestoreMode::None;
 
-    let session = AgentSession::spawn_with_bootstrap(
-        client.clone(),
+    let session = AgentSession::spawn_with_pool(
+        pool.clone(),
+        selection.as_ref(),
         system_prompt.clone(),
         SessionBootstrap {
             cwd: workspace.to_string_lossy().into_owned(),
@@ -130,15 +142,41 @@ pub async fn run(
             loaded: loaded.clone(),
             fresh,
         },
-    );
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let (views, active_view) = build_views(&client.label(), mode, &loaded, fresh);
-    let mut app = App::new(session, client.label(), mode, plugins, views, active_view);
+    let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let model_label = selection
+        .as_ref()
+        .map(Selection::as_str)
+        .unwrap_or_else(|| "no model".to_string());
+    let (views, active_view) = build_views(&model_label, mode, &loaded, fresh);
+    let mut app = App::new(
+        session,
+        pool,
+        notice_tx.clone(),
+        notice_rx,
+        model_label,
+        mode,
+        plugins,
+        views,
+        active_view,
+    );
     if restore == RestoreMode::Picker {
         app.open_session_menu();
     }
     let effects = app.plugins.startup(app.plugin_info());
     app.apply_effects(effects);
+
+    // Models discovery for every instance that asked for it. Failures are
+    // notices, never errors: the declared models keep the menu usable. An
+    // incomplete endpoint (lone base_url or api_key) is reported the same
+    // way, naming the missing piece.
+    for instance in app.pool.registry().instances() {
+        if instance.should_fetch_models() && app.pool.can_discover(&instance.name) {
+            app.spawn_discovery(&instance.name);
+        }
+    }
 
     let result = app.event_loop(&mut terminal).await;
     finish_terminal(&mut terminal, &app, mode);
@@ -281,7 +319,22 @@ fn inline_pane_height(rows: u16, composer_rows: usize, has_live: bool, menu_rows
 struct App {
     session: AgentSession,
     plugins: PluginHost,
+    /// The multi-provider registry behind `/model` and background discovery.
+    pool: Arc<ModelPool>,
+    /// Notices from background tasks (models discovery). The sender half is
+    /// kept alive by the tasks and `notice_tx`; once all senders are gone the
+    /// arm is disabled via `notices_closed`.
+    notice_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    notices: tokio::sync::mpsc::UnboundedReceiver<String>,
+    notices_closed: bool,
+    /// Backend label shown in the footer and banner: the active
+    /// `"provider/model"` selection, or `no model` before anything is
+    /// configured.
     model_label: String,
+    /// The active selection; `None` until a model is configured and chosen.
+    /// Derived from `model_label` (which is always either a valid selection
+    /// string or the literal `no model`).
+    route: Option<Selection>,
     mode: TuiMode,
     /// One view per recorded session; `views[i]` mirrors core conversation i.
     /// Append-only: `/new` adds one and switches to it, nothing is removed.
@@ -290,6 +343,8 @@ struct App {
     active_view: usize,
     /// Open `/sessions` picker: the selected view index; `None` when closed.
     session_menu: Option<usize>,
+    /// Open `/model` picker over the registry's selections.
+    model_menu: Option<ModelMenu>,
     composer: Composer,
     /// Selected row in the slash-command menu.
     command_selection: usize,
@@ -309,9 +364,24 @@ struct App {
     inline_columns: u16,
 }
 
+/// State of the open `/model` picker.
+struct ModelMenu {
+    items: Vec<ModelMenuItem>,
+    selected: usize,
+}
+
+struct ModelMenuItem {
+    selection: Selection,
+    current: bool,
+}
+
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session: AgentSession,
+        pool: Arc<ModelPool>,
+        notice_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        notices: tokio::sync::mpsc::UnboundedReceiver<String>,
         model_label: String,
         mode: TuiMode,
         plugins: PluginHost,
@@ -325,11 +395,17 @@ impl App {
         Self {
             session,
             plugins,
+            pool,
+            notice_tx,
+            notices,
+            notices_closed: false,
+            route: Selection::parse(&model_label).ok(),
             model_label,
             mode,
             views,
             active_view,
             session_menu: None,
+            model_menu: None,
             composer: Composer::new(),
             command_selection: 0,
             command_menu_dismissed: false,
@@ -380,6 +456,14 @@ impl App {
                     match maybe_event {
                         Some(event) => self.handle_agent_event(event),
                         None => break,
+                    }
+                }
+                maybe_notice = self.notices.recv(), if !self.notices_closed => {
+                    match maybe_notice {
+                        Some(text) => {
+                            self.view_mut().history.push(HistoryCell::Notice(text));
+                        }
+                        None => self.notices_closed = true,
                     }
                 }
                 _ = ticker.tick() => self.on_tick(),
@@ -560,9 +644,9 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-        // The `/sessions` picker is modal for navigation keys: ↑↓ move, plain
-        // Enter switches, Esc closes. Everything else (typing, Ctrl+C, ...)
-        // still reaches its normal handler while the menu is open.
+        // The `/sessions` and `/model` pickers are modal for navigation keys:
+        // ↑↓ move, plain Enter confirms, Esc closes. Everything else (typing,
+        // Ctrl+C, ...) still reaches its normal handler while a menu is open.
         if self.session_menu.is_some() {
             match key.code {
                 KeyCode::Up => return self.move_session_selection(-1),
@@ -570,6 +654,19 @@ impl App {
                 KeyCode::Enter if !ctrl && !alt && !shift => return self.confirm_session_switch(),
                 KeyCode::Esc => {
                     self.session_menu = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if self.model_menu.is_some() {
+            match key.code {
+                KeyCode::Up => return self.move_model_selection(-1),
+                KeyCode::Down => return self.move_model_selection(1),
+                KeyCode::Enter if !ctrl && !alt && !shift => return self.confirm_model_switch(),
+                KeyCode::Char('r') if !ctrl && !alt && !shift => return self.refresh_model(),
+                KeyCode::Esc => {
+                    self.model_menu = None;
                     return;
                 }
                 _ => {}
@@ -679,7 +776,11 @@ impl App {
     }
 
     fn command_matches(&self) -> Vec<CommandCandidate> {
-        if self.busy || self.command_menu_dismissed || self.session_menu.is_some() {
+        if self.busy
+            || self.command_menu_dismissed
+            || self.session_menu.is_some()
+            || self.model_menu.is_some()
+        {
             return Vec::new();
         }
         let Some(query) = self.command_query() else {
@@ -730,22 +831,16 @@ impl App {
             return;
         }
 
-        // Commands share the composer's prompt history, so Up recalls a typo
-        // or a command the user wants to repeat.
-        self.composer.clear();
-        self.command_selection = 0;
-        self.command_menu_dismissed = false;
-        if self.prompts.last() != Some(&text) {
-            self.prompts.push(text.clone());
-        }
-        self.reset_input_navigation();
-
         match self.plugins.parse(&text) {
             CommandInput::Command(invocation) => {
+                // Commands are local — none of them need a model — so they
+                // keep working on an empty route.
+                self.clear_for_submit(&text);
                 self.run_command(invocation);
                 return;
             }
             CommandInput::Invalid(error) => {
+                self.clear_for_submit(&text);
                 self.view_mut()
                     .history
                     .push(HistoryCell::Error(error.to_string()));
@@ -754,7 +849,46 @@ impl App {
             CommandInput::Message => {}
         }
 
+        // A message needs a usable route: either a selected model on a
+        // complete endpoint, or actionable guidance. The composer is
+        // deliberately untouched in every guidance branch so the message
+        // survives until the setup is fixed.
+        if self.route.is_none() {
+            let guidance = if self.pool.registry().instances().is_empty() {
+                crate::core::providers::NO_MODEL_GUIDANCE.to_string()
+            } else {
+                crate::core::providers::NO_MODEL_SELECTED.to_string()
+            };
+            self.view_mut().history.push(HistoryCell::Error(guidance));
+            return;
+        }
+        if let Some(prompt) = self.route_guidance() {
+            self.view_mut().history.push(HistoryCell::Error(prompt));
+            return;
+        }
+
+        self.clear_for_submit(&text);
         self.submit_user_turn(text);
+    }
+
+    /// Why the active route cannot serve a message right now, if it can't:
+    /// the provider is only half specified (a lone `--base-url` or
+    /// `--api-key`).
+    fn route_guidance(&self) -> Option<String> {
+        let route = self.route.as_ref()?;
+        self.pool.missing_credential(&route.provider)
+    }
+
+    /// Reset the composer for an accepted submission: clear it, record the
+    /// input in the prompt history, and reset the input navigation state.
+    fn clear_for_submit(&mut self, text: &str) {
+        self.composer.clear();
+        self.command_selection = 0;
+        self.command_menu_dismissed = false;
+        if self.prompts.last().map(String::as_str) != Some(text) {
+            self.prompts.push(text.to_string());
+        }
+        self.reset_input_navigation();
     }
 
     /// Dispatch a command. The built-in session commands are front-end
@@ -765,6 +899,7 @@ impl App {
             "new" => return self.start_new_session(),
             "rename" => return self.rename_session(&invocation.args),
             "sessions" => return self.open_session_menu(),
+            "model" => return self.open_model_menu(),
             _ => {}
         }
         let effects = self
@@ -840,6 +975,138 @@ impl App {
         self.session.switch_session(index);
     }
 
+    /// `/model`: open the picker over the registry's selections, starting at
+    /// the active one. The items are re-read from the pool every time, so a
+    /// background models-discovery refresh is picked up without a restart.
+    fn open_model_menu(&mut self) {
+        let selections = self.pool.selections();
+        if selections.is_empty() {
+            self.command_menu_dismissed = true;
+            // Nothing to list yet. If a complete endpoint can still discover
+            // its models, kick the discovery off from here; otherwise tell
+            // the user what is actually missing.
+            let fetchable: Vec<String> = self
+                .pool
+                .registry()
+                .instances()
+                .iter()
+                .filter(|instance| {
+                    instance.should_fetch_models()
+                        && self.pool.missing_credential(&instance.name).is_none()
+                        && self.pool.can_discover(&instance.name)
+                })
+                .map(|instance| instance.name.clone())
+                .collect();
+            if !fetchable.is_empty() {
+                for name in &fetchable {
+                    self.spawn_discovery(name);
+                }
+                self.view_mut().history.push(HistoryCell::Notice(format!(
+                    "discovering models from {} — run /model again in a moment",
+                    fetchable.join(", ")
+                )));
+            } else if let Some(guidance) = self
+                .pool
+                .registry()
+                .instances()
+                .iter()
+                .find_map(|instance| self.pool.missing_credential(&instance.name))
+            {
+                self.view_mut().history.push(HistoryCell::Error(guidance));
+            } else if self.pool.registry().instances().is_empty() {
+                self.view_mut()
+                    .history
+                    .push(HistoryCell::Error(NO_MODEL_GUIDANCE.to_string()));
+            } else {
+                self.view_mut()
+                    .history
+                    .push(HistoryCell::Error(NO_MODEL_SELECTED.to_string()));
+            }
+            return;
+        }
+        let items: Vec<ModelMenuItem> = selections
+            .into_iter()
+            .map(|selection| ModelMenuItem {
+                current: selection.as_str() == self.model_label,
+                selection,
+            })
+            .collect();
+        let selected = items
+            .iter()
+            .position(|item| item.current)
+            .unwrap_or(0);
+        self.command_menu_dismissed = true;
+        self.model_menu = Some(ModelMenu { items, selected });
+    }
+
+    fn move_model_selection(&mut self, delta: isize) {
+        let Some(menu) = self.model_menu.as_mut() else {
+            return;
+        };
+        let len = menu.items.len();
+        menu.selected = if delta < 0 {
+            (menu.selected + len - 1) % len
+        } else {
+            (menu.selected + 1) % len
+        };
+    }
+
+    /// Confirm the picker: switching to the already-active model just closes
+    /// the menu. The label updates optimistically; the core's `ModelSwitched`
+    /// event confirms (a failure arrives as an error cell).
+    fn confirm_model_switch(&mut self) {
+        let Some(menu) = self.model_menu.take() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
+        let selection = item.selection.as_str();
+        if selection == self.model_label {
+            return;
+        }
+        self.model_label = selection.to_string();
+        self.route = Some(item.selection.clone());
+        let view = self.view_mut();
+        view.history
+            .push(HistoryCell::Notice(format!("switched to {selection}")));
+        self.session.switch_model(selection);
+    }
+
+    /// `r` in the picker: re-run models discovery for the selected item's
+    /// provider in the background; the completion notice lands as a
+    /// transcript notice and the menu shows the merged list on its next open.
+    /// Run models discovery for one provider in the background; the outcome
+    /// lands as a transcript notice via the notification channel.
+    fn spawn_discovery(&self, provider: &str) {
+        let pool = self.pool.clone();
+        let tx = self.notice_tx.clone();
+        let provider = provider.to_string();
+        tokio::spawn(async move {
+            match pool.refresh(&provider).await {
+                Ok(count) => {
+                    let _ = tx.send(format!(
+                        "model discovery for {provider} found {count} model{}",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                Err(error) => {
+                    let _ = tx.send(format!("model discovery for {provider} failed: {error}"));
+                }
+            }
+        });
+    }
+
+    fn refresh_model(&mut self) {
+        let Some(menu) = self.model_menu.as_ref() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
+        self.spawn_discovery(&item.selection.provider);
+    }
+
     /// Start a user turn. Hooks run before the turn is queued so they cannot
     /// race the model request; `busy` is already true, so nested submissions
     /// are ignored.
@@ -889,7 +1156,7 @@ impl App {
                     self.command_menu_dismissed = false;
                 }
                 PluginEffect::SubmitUserTurn(text) => {
-                    if !self.busy && !text.trim().is_empty() {
+                    if !self.busy && !text.trim().is_empty() && self.route.is_some() {
                         self.submit_user_turn(text);
                     }
                 }
@@ -933,6 +1200,20 @@ impl App {
                     .live
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
+            }
+            EventMsg::AgentThinkingDelta { .. } => {
+                // Reasoning output is not rendered by the minimal front-end;
+                // the worker already kept the transcript clean of it.
+            }
+            EventMsg::TurnUsage { .. } => {
+                // Surfaced for future status/context work; nothing to render.
+            }
+            EventMsg::ModelSwitched { model } => {
+                // `/model` already updated the label optimistically; this is
+                // the core's authoritative confirmation (also covering
+                // non-TUI front-ends).
+                self.route = Selection::parse(&model).ok();
+                self.model_label = model;
             }
             EventMsg::AgentMessage { message } => {
                 self.view_mut().live = Some(message);
@@ -1140,11 +1421,13 @@ impl App {
         self.render_footer(frame, chunks[3]);
     }
 
-    /// Rows the menu above the composer needs: the `/sessions` picker when it
-    /// is open, otherwise the slash-command candidates. Empty when neither is
-    /// visible.
+    /// Rows the menu above the composer needs: a picker (`/sessions`,
+    /// `/model`) when it is open, otherwise the slash-command candidates.
+    /// Empty when neither is visible.
     fn menu_row_count(&self) -> usize {
-        if self.session_menu.is_some() {
+        if let Some(menu) = self.model_menu.as_ref() {
+            menu.items.len().min(MAX_COMMAND_MENU_ROWS)
+        } else if self.session_menu.is_some() {
             self.views.len().min(MAX_COMMAND_MENU_ROWS)
         } else {
             self.command_matches().len().min(MAX_COMMAND_MENU_ROWS)
@@ -1154,6 +1437,18 @@ impl App {
     /// The menu lines, windowed around the selection so it stays visible
     /// within `height` rows.
     fn menu_lines(&self, height: usize) -> Vec<Line<'static>> {
+        if let Some(menu) = self.model_menu.as_ref() {
+            let window = command_menu_window(menu.items.len(), menu.selected, height);
+            return window
+                .map(|index| {
+                    model_menu_line(
+                        index + 1,
+                        &menu.items[index],
+                        index == menu.selected,
+                    )
+                })
+                .collect();
+        }
         if let Some(selected) = self.session_menu {
             let window = command_menu_window(self.views.len(), selected, height);
             return window
@@ -1329,6 +1624,8 @@ impl App {
         };
         let hints = if self.session_menu.is_some() {
             "↑↓ select · Enter switch · Esc close"
+        } else if self.model_menu.is_some() {
+            "↑↓ select · Enter switch · r refresh · Esc close"
         } else if self.command_menu_open() {
             "↑↓ select · Tab complete · Enter run · Esc close"
         } else if self.show_ctrl_c_hint() {
@@ -1487,6 +1784,47 @@ fn session_menu_line(
     Line::from(spans)
 }
 
+/// One row of the `/model` picker: marker, 1-based number, the
+/// `provider/model` selection, and a marker on the active model.
+fn model_menu_line(number: usize, item: &ModelMenuItem, selected: bool) -> Line<'static> {
+    let marker = if selected { "▸ " } else { "  " };
+    let (marker_style, number_style, text_style) = if selected {
+        (
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    } else {
+        (
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+        )
+    };
+
+    let mut spans = vec![
+        Span::styled(marker, marker_style),
+        Span::styled(format!("{number} · "), number_style),
+        Span::styled(
+            truncated(&item.selection.as_str(), 48),
+            text_style,
+        ),
+    ];
+    if item.current {
+        spans.push(Span::styled(
+            " · current",
+            Style::default()
+                .fg(theme::DIM)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// The inline pane always spans the terminal width and is pinned to the bottom.
 fn inline_rect(columns: u16, rows: u16, height: u16) -> Rect {
     let height = height.min(rows.max(1));
@@ -1596,17 +1934,151 @@ fn ansi_foreground(color: Color) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::test_model::FakeModelClient;
+    use crate::core::config::ModelInfo;
+    use crate::core::config::ProviderInstance;
+    use crate::core::providers::ProviderRegistry;
     use ratatui::backend::TestBackend;
 
+    /// A pool over the built-in `test` protocol with two selectable models.
+    fn test_pool() -> Arc<ModelPool> {
+        let instance = ProviderInstance {
+            name: "test".to_string(),
+            protocol: Some("test".to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![ModelInfo::from_id("one"), ModelInfo::from_id("two")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: false,
+        };
+        let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
+        Arc::new(ModelPool::new(registry))
+    }
+
     fn test_app() -> App {
-        let session = AgentSession::spawn(Arc::new(FakeModelClient::new(Duration::ZERO)));
+        let pool = test_pool();
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            Some(&Selection::new("test", "one")),
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
-            "test-model".to_string(),
+            pool,
+            notice_tx,
+            notice_rx,
+            "test/one".to_string(),
             TuiMode::Fullscreen,
             PluginHost::builtin().expect("builtin plugins"),
-            vec![SessionView::initial("test-model", TuiMode::Fullscreen)],
+            vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
+            0,
+        )
+    }
+
+    /// A pool whose openai-compat instance is half specified (url but no
+    /// key) — the partial CLI synthesis shape.
+    fn test_pool_partial() -> Arc<ModelPool> {
+        let instance = ProviderInstance {
+            name: "openai".to_string(),
+            protocol: None,
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            api_key: None,
+            models: vec![ModelInfo::from_id("m1")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: true,
+        };
+        let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
+        Arc::new(ModelPool::new(registry))
+    }
+
+    fn test_app_partial() -> App {
+        let pool = test_pool_partial();
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            Some(&Selection::new("openai", "m1")),
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("partial selection resolves (gated at send, not spawn)");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            "openai/m1".to_string(),
+            TuiMode::Fullscreen,
+            PluginHost::builtin().expect("builtin plugins"),
+            vec![SessionView::initial("openai/m1", TuiMode::Fullscreen)],
+            0,
+        )
+    }
+
+    /// An app whose provider is a complete endpoint with no models yet:
+    /// route empty until discovery fills the list.
+    fn test_app_unselected() -> App {
+        let instance = ProviderInstance {
+            name: "openai".to_string(),
+            protocol: None,
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            api_key: Some("k".to_string()),
+            models: vec![],
+            fetch_models: None,
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            requires_api_key: true,
+        };
+        let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
+        let pool = Arc::new(ModelPool::new(registry));
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            None,
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("empty route spawns");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            "no model".to_string(),
+            TuiMode::Fullscreen,
+            PluginHost::builtin().expect("builtin plugins"),
+            vec![SessionView::initial("no model", TuiMode::Fullscreen)],
+            0,
+        )
+    }
+
+    /// An app started with nothing configured: an empty registry (so even
+    /// `/model` has nothing to list), an empty route, and a `no model` label.
+    fn test_app_without_model() -> App {
+        let registry = ProviderRegistry::build(&[], Vec::new()).expect("empty registry");
+        let pool = Arc::new(ModelPool::new(registry));
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            None,
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("empty route spawns");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            "no model".to_string(),
+            TuiMode::Fullscreen,
+            PluginHost::builtin().expect("builtin plugins"),
+            vec![SessionView::initial("no model", TuiMode::Fullscreen)],
             0,
         )
     }
@@ -1641,6 +2113,8 @@ mod tests {
                     cwd: "/tmp/demo".to_string(),
                     system_prompt: "be brief".to_string(),
                     name: None,
+                    provider: None,
+                    model: None,
                 },
                 path: PathBuf::from(format!("/tmp/{id}.jsonl")),
                 messages,
@@ -1700,7 +2174,7 @@ mod tests {
         // Wide enough that the alias hints are not clipped.
         let lines = render_lines(&mut app, 110, 20);
         let rendered = lines.join("\n");
-        // Eleven names (seven commands plus four aliases) share a six-row
+        // Twelve names (eight commands plus four aliases) share a six-row
         // window; the first page shows /help with its aliases and the first
         // commands, aliases labeled with the command they point at.
         assert!(rendered.contains("▸ /help"), "{rendered}");
@@ -1838,7 +2312,7 @@ mod tests {
         assert!(!app.busy);
         match app.view().history.last() {
             Some(HistoryCell::Notice(text)) => {
-                assert!(text.contains("backend: test-model"), "{text}");
+                assert!(text.contains("backend: test/one"), "{text}");
                 assert!(
                     text.contains("plugins: help, clear, quit, status"),
                     "{text}"
@@ -1849,14 +2323,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_menu_lists_selections_and_switches() {
+        let mut app = test_app();
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+
+        // The picker lists every selection with the active one marked.
+        assert!(app.model_menu.is_some());
+        assert_eq!(app.model_menu.as_ref().unwrap().items.len(), 2);
+        assert_eq!(app.model_menu.as_ref().unwrap().selected, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.model_menu.is_none());
+        assert_eq!(app.model_label, "test/two");
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Notice(text)) if text == "switched to test/two"
+        ));
+
+        // Confirming on the already-active model only closes the menu.
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        assert_eq!(app.model_menu.as_ref().unwrap().selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.model_menu.is_none());
+        let notices = app
+            .view()
+            .history
+            .iter()
+            .filter(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("switched to")))
+            .count();
+        assert_eq!(notices, 1);
+    }
+
+    #[tokio::test]
+    async fn model_command_rejects_arguments_and_busy_state() {
+        let mut app = test_app();
+        app.composer.set_text("/model now".to_string());
+        app.try_submit();
+        assert!(app.model_menu.is_none());
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(text)) if text.contains("arguments")
+        ));
+
+        app.busy = true;
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        assert!(app.model_menu.is_none(), "no picker while streaming");
+    }
+
+    #[tokio::test]
+    async fn model_menu_renders_selections_with_the_current_marker() {
+        let mut app = test_app();
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        let lines = render_lines(&mut app, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("▸ 2 · test/two"), "{rendered}");
+        assert!(rendered.contains("test/one"), "{rendered}");
+        assert!(rendered.contains("current"), "{rendered}");
+        assert!(rendered.contains("r refresh"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn model_switched_event_updates_the_label() {
+        let mut app = test_app();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ModelSwitched {
+                model: "test/two".to_string(),
+            },
+        ));
+        assert_eq!(app.model_label, "test/two");
+        assert_eq!(app.route, Some(Selection::new("test", "two")));
+    }
+
+    #[tokio::test]
+    async fn empty_route_prompts_instead_of_submitting_and_keeps_the_input() {
+        let mut app = test_app_without_model();
+        app.composer.set_text("hello there".to_string());
+        app.try_submit();
+
+        // The message never reached the worker (no busy) and the composer
+        // keeps its content; the transcript carries the guidance instead.
+        assert!(!app.busy);
+        assert_eq!(app.composer.text(), "hello there");
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(text)) if text.contains("no model is configured"),
+        ));
+
+        // The submit effect is gated the same way.
+        app.apply_effects(vec![PluginEffect::SubmitUserTurn("hi".to_string())]);
+        assert!(!app.busy);
+
+        // Once a model is actually active (event arrives), sending works.
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ModelSwitched {
+                model: "test/one".to_string(),
+            },
+        ));
+        app.try_submit();
+        assert!(app.busy);
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[tokio::test]
+    async fn commands_still_work_on_an_empty_route() {
+        let mut app = test_app_without_model();
+
+        // Local commands are unaffected by the missing model…
+        app.composer.set_text("/help".to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.busy);
+        assert!(app.composer.is_empty());
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Notice(text)) if text.contains("/clear"),
+        ));
+
+        // …including `/status`, which reports the empty backend label…
+        app.composer.set_text("/status".to_string());
+        app.try_submit();
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Notice(text)) if text.contains("backend: no model"),
+        ));
+
+        // …and `/model`, whose empty menu carries the same guidance.
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        assert!(app.model_menu.is_none());
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(text)) if text.contains("no model is configured"),
+        ));
+
+        // Unknown commands still report themselves as unknown, not as the
+        // missing-model guidance.
+        app.composer.set_text("/nope".to_string());
+        app.try_submit();
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(text)) if text.contains("unknown command"),
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_credentials_prompt_for_the_missing_half() {
+        let mut app = test_app_partial();
+
+        // The route is armed, but sending names the missing half instead of
+        // firing a doomed request; the composer keeps its content.
+        app.composer.set_text("hello".to_string());
+        app.try_submit();
+        assert!(!app.busy);
+        assert_eq!(app.composer.text(), "hello");
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(text))
+                if text.contains("missing `api_key`") && text.contains("openai"),
+        ));
+
+        // The model menu lists the declared model (listing needs no key);
+        // discovery would be gated with the same prompt.
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        assert!(app.model_menu.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[tokio::test]
+    async fn providers_without_a_selected_model_prompt_for_the_picker() {
+        let mut app = test_app_unselected();
+        app.composer.set_text("hello".to_string());
+        app.try_submit();
+
+        assert!(!app.busy);
+        assert_eq!(app.composer.text(), "hello");
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(text)) if text.contains("open /model"),
+        ));
+
+        // `/model` on a discovery-pending provider kicks discovery off and
+        // says so, instead of failing.
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        assert!(app.model_menu.is_none());
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Notice(text)) if text.contains("discovering models from openai"),
+        ));
+    }
+
+    #[tokio::test]
     async fn slash_opens_a_filtered_command_menu() {
         let mut app = test_app();
 
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            11,
-            "seven commands plus four aliases"
+            12,
+            "eight commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -1903,9 +2577,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 10);
+        assert_eq!(app.command_selection, 11);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 9);
+        assert_eq!(app.command_selection, 10);
     }
 
     #[tokio::test]
@@ -2115,3 +2789,4 @@ mod tests {
         assert_eq!(ansi_foreground(Color::Rgb(1, 2, 3)), "38;2;1;2;3");
     }
 }
+

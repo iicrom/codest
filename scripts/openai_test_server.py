@@ -84,8 +84,21 @@ class ChatHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
     def do_GET(self) -> None:  # noqa: N802 - http.server naming
-        if self.path.rstrip("/") == "/health":
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif path.endswith("/models"):
+            # OpenAI-shaped directory for codest's `fetch_models` discovery.
+            self._send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": "test-model", "name": "Test Model"},
+                        {"id": "second-model"},
+                    ],
+                },
+            )
         else:
             self._send_json(404, {"error": {"message": f"unknown path: {self.path}"}})
 

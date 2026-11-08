@@ -5,6 +5,12 @@
 //! useful extraction is the transport shape: build a JSON request, stream the
 //! response, decode `data:` frames, and yield text deltas.
 //!
+//! The client is protocol-`openai-compat`'s implementation behind the
+//! provider registry: an instance's base URL, key, static headers, and
+//! `body_overrides` are baked in at construction. Besides `delta.content` it
+//! forwards `delta.reasoning_content` as [`StreamItem::Thinking`] and honors
+//! usage chunks.
+//!
 //! This module deliberately knows nothing about terminals or conversations.
 
 use std::time::Duration;
@@ -18,7 +24,9 @@ use tokio_util::sync::CancellationToken;
 use crate::core::model::ModelClient;
 use crate::core::model::ModelError;
 use crate::core::model::ModelStream;
+use crate::core::model::StreamItem;
 use crate::core::protocol::Message;
+use crate::core::sse::SseDecoder;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
@@ -26,6 +34,8 @@ pub struct OpenAiCompatClient {
     base_url: String,
     api_key: String,
     model: String,
+    headers: Vec<(String, String)>,
+    body_overrides: serde_json::Map<String, Value>,
 }
 
 impl OpenAiCompatClient {
@@ -34,17 +44,36 @@ impl OpenAiCompatClient {
         base_url: impl Into<String>,
         model: impl Into<String>,
     ) -> Result<Self, ModelError> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .build()
-            .map_err(ModelError::network)?;
-
         Ok(Self {
-            http,
+            http: Self::build_http()?,
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
+            headers: Vec::new(),
+            body_overrides: serde_json::Map::new(),
         })
+    }
+
+    /// Static headers sent with every request. Callers' values override the
+    /// transport defaults (`Authorization` excepted, which stays the key).
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// JSON fields merged over the request body; overrides win over the
+    /// standard fields, which lets an instance fix up provider quirks
+    /// (`temperature`, `extra_body`-style nesting, …) without code.
+    pub fn with_body_overrides(mut self, overrides: serde_json::Map<String, Value>) -> Self {
+        self.body_overrides = overrides;
+        self
+    }
+
+    fn build_http() -> Result<Client, ModelError> {
+        Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(ModelError::network)
     }
 
     /// Accepts either a base URL (`https://host/v1`) or the full endpoint.
@@ -55,6 +84,28 @@ impl OpenAiCompatClient {
         } else {
             format!("{base}/chat/completions")
         }
+    }
+
+    /// The request body: the standard fields with `body_overrides` merged on
+    /// top (overrides win).
+    fn request_body(&self, messages: &[Message]) -> Value {
+        let mut body = json!({
+            "model": self.model,
+            "stream": true,
+            "messages": messages.iter().map(|message| {
+                json!({
+                    "role": message.role.as_str(),
+                    "content": message.content,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let object = body
+            .as_object_mut()
+            .expect("the standard request body is an object");
+        for (key, value) in &self.body_overrides {
+            object.insert(key.clone(), value.clone());
+        }
+        body
     }
 }
 
@@ -67,7 +118,9 @@ impl ModelClient for OpenAiCompatClient {
         if self.api_key.trim().is_empty() {
             return Box::pin(futures_util::stream::once(async {
                 Err(ModelError::NotConfigured(
-                    "API key is empty; set CST_API_KEY / OPENAI_API_KEY or pass --api-key"
+                    "API key is empty; set `api_key` for the provider in \
+                     ~/.codest/providers.toml, pass --api-key, or export \
+                     CST_API_KEY / OPENAI_API_KEY"
                         .to_string(),
                 ))
             }));
@@ -75,24 +128,19 @@ impl ModelClient for OpenAiCompatClient {
 
         let url = self.endpoint();
         let api_key = self.api_key.clone();
-        let model = self.model.clone();
-        let body = json!({
-            "model": model,
-            "stream": true,
-            "messages": messages.iter().map(|message| {
-                json!({
-                    "role": message.role.as_str(),
-                    "content": message.content,
-                })
-            }).collect::<Vec<_>>(),
-        });
+        let body = self.request_body(&messages);
         let http = self.http.clone();
+        let headers = self.headers.clone();
 
         Box::pin(async_stream::try_stream! {
             let response = {
+                let mut request = http.post(&url).bearer_auth(&api_key);
+                for (key, value) in &headers {
+                    request = request.header(key, value);
+                }
                 let send_result = tokio::select! {
                     _ = cancel.cancelled() => return,
-                    result = http.post(&url).bearer_auth(&api_key).json(&body).send() => result,
+                    result = request.json(&body).send() => result,
                 };
                 send_result.map_err(ModelError::network)?
             };
@@ -112,24 +160,24 @@ impl ModelClient for OpenAiCompatClient {
                         None => break,
                         Some(Err(error)) => Err(ModelError::network(error))?,
                         Some(Ok(chunk)) => {
-                            for data in decoder.feed(&chunk) {
-                                match parse_sse_data(&data)? {
-                                    SseEvent::Delta(delta) => yield delta,
-                                    SseEvent::Done => return,
-                                    SseEvent::Ignore => {}
+                            for frame in decoder.feed(&chunk) {
+                                match parse_sse_frame(&frame)? {
+                                    Parsed::Delta(item) => yield item,
+                                    Parsed::Done => return,
+                                    Parsed::Ignore => {}
                                 }
                             }
                         }
                     }
                 }
 
-                // A well-behaved server ends with a newline, but tolerate a
+                // A well-behaved server ends with a blank line, but tolerate a
                 // final frame that doesn't.
-                if let Some(data) = decoder.finish() {
-                    match parse_sse_data(&data)? {
-                        SseEvent::Delta(delta) => yield delta,
-                        SseEvent::Done => {}
-                        SseEvent::Ignore => {}
+                if let Some(frame) = decoder.finish() {
+                    match parse_sse_frame(&frame)? {
+                        Parsed::Delta(item) => yield item,
+                        Parsed::Done => {}
+                        Parsed::Ignore => {}
                     }
                 }
             } else {
@@ -151,59 +199,20 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
-#[derive(Debug, Default)]
-struct SseDecoder {
-    /// Raw bytes, not a `String`: a network chunk may end in the middle of a
-    /// multi-byte UTF-8 character.
-    buffer: Vec<u8>,
-}
-
-impl SseDecoder {
-    /// Append a chunk and return all complete `data:` payloads. Chunks may
-    /// split frames (and UTF-8 characters) at arbitrary byte boundaries.
-    fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.extend_from_slice(chunk);
-        let mut out = Vec::new();
-
-        while let Some(index) = self.buffer.iter().position(|&byte| byte == b'\n') {
-            let line_bytes: Vec<u8> = self.buffer.drain(..=index).collect();
-            let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len() - 1]);
-            let line = line.trim_end_matches('\r');
-            if let Some(data) = line.strip_prefix("data:") {
-                out.push(data.trim_start().to_string());
-            }
-        }
-
-        out
-    }
-
-    fn finish(&mut self) -> Option<String> {
-        if self.buffer.iter().all(u8::is_ascii_whitespace) {
-            self.buffer.clear();
-            return None;
-        }
-        let bytes = std::mem::take(&mut self.buffer);
-        let line = String::from_utf8_lossy(&bytes);
-        line.trim_end_matches('\r')
-            .strip_prefix("data:")
-            .map(|data| data.trim_start().to_string())
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
-enum SseEvent {
-    Delta(String),
+enum Parsed {
+    Delta(StreamItem),
     Done,
     Ignore,
 }
 
-fn parse_sse_data(data: &str) -> Result<SseEvent, ModelError> {
-    let data = data.trim();
+fn parse_sse_frame(frame: &crate::core::sse::SseFrame) -> Result<Parsed, ModelError> {
+    let data = frame.data.trim();
     if data.is_empty() {
-        return Ok(SseEvent::Ignore);
+        return Ok(Parsed::Ignore);
     }
     if data == "[DONE]" {
-        return Ok(SseEvent::Done);
+        return Ok(Parsed::Done);
     }
 
     let value: Value = serde_json::from_str(data).map_err(ModelError::decode)?;
@@ -217,15 +226,49 @@ fn parse_sse_data(data: &str) -> Result<SseEvent, ModelError> {
         return Err(ModelError::decode(message));
     }
 
-    let delta = value
-        .pointer("/choices/0/delta/content")
+    if let Some(usage) = parse_usage(&value) {
+        return Ok(Parsed::Delta(usage));
+    }
+
+    let delta = &value.pointer("/choices/0/delta");
+    let content = delta
+        .and_then(|delta| delta.get("content"))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if !content.is_empty() {
+        return Ok(Parsed::Delta(StreamItem::Delta(content.to_string())));
+    }
 
-    if delta.is_empty() {
-        Ok(SseEvent::Ignore)
-    } else {
-        Ok(SseEvent::Delta(delta.to_string()))
+    let reasoning = delta
+        .and_then(|delta| delta.get("reasoning_content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !reasoning.is_empty() {
+        return Ok(Parsed::Delta(StreamItem::Thinking(reasoning.to_string())));
+    }
+
+    Ok(Parsed::Ignore)
+}
+
+/// A final chunk's usage report. Both OpenAI's
+/// `prompt_tokens`/`completion_tokens` and the `input_tokens`/`output_tokens`
+/// spelling are accepted; a usage object without either pair is ignored.
+fn parse_usage(value: &Value) -> Option<StreamItem> {
+    let usage = value.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+    let input = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64);
+    let output = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64);
+    match (input, output) {
+        (Some(input), Some(output)) => Some(StreamItem::Usage { input, output }),
+        _ => None,
     }
 }
 
@@ -250,57 +293,83 @@ mod tests {
     }
 
     #[test]
-    fn decoder_handles_split_frames() {
-        let mut decoder = SseDecoder::default();
-        assert!(decoder.feed(b"data: {\"choices\":[{\"delta\"").is_empty());
-        assert!(!decoder.feed(b":{\"content\":\"he\"}}]}\n").is_empty());
+    fn body_overrides_win_over_standard_fields() {
+        let mut overrides = serde_json::Map::new();
+        overrides.insert("temperature".to_string(), json!(0.5));
+        overrides.insert("model".to_string(), json!("override"));
 
-        let frames = decoder.feed(b"data: [DONE]\n");
-        assert_eq!(frames, vec!["[DONE]".to_string()]);
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m")
+            .unwrap()
+            .with_body_overrides(overrides);
+        let body = client.request_body(&[Message::user("hi")]);
+
+        assert_eq!(body["model"], "override");
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["content"], "hi");
     }
 
     #[test]
-    fn decoder_survives_utf8_split_across_chunks() {
-        let mut decoder = SseDecoder::default();
-        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n".as_bytes();
-        let split = frame.iter().position(|&byte| byte >= 0x80).expect("CJK") + 1;
-
-        // The first chunk ends inside the three-byte character; no frame can
-        // be emitted yet and no replacement characters are introduced.
-        assert!(decoder.feed(&frame[..split]).is_empty());
-        let frames = decoder.feed(&frame[split..]);
-        assert_eq!(frames.len(), 1);
+    fn parse_extracts_content_errors_thinking_and_done() {
+        let frame = |data: &str| crate::core::sse::SseFrame {
+            event: None,
+            data: data.to_string(),
+        };
+        let parsed = parse_sse_frame(&frame(r#"{"choices":[{"delta":{"content":"hello"}}]}"#))
+            .unwrap();
         assert_eq!(
-            parse_sse_data(&frames[0]).unwrap(),
-            SseEvent::Delta("你".to_string())
-        );
-    }
-
-    #[test]
-    fn decoder_ignores_non_data_lines_and_crlf() {
-        let mut decoder = SseDecoder::default();
-        let frames = decoder.feed(
-            b"event: message\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\r\n\r\n",
-        );
-        assert_eq!(frames.len(), 1);
-        assert_eq!(
-            parse_sse_data(&frames[0]).unwrap(),
-            SseEvent::Delta("x".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_extracts_content_and_errors() {
-        let frame = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
-        assert_eq!(
-            parse_sse_data(frame).unwrap(),
-            SseEvent::Delta("hello".to_string())
+            parsed,
+            Parsed::Delta(StreamItem::Delta("hello".to_string()))
         );
 
-        assert_eq!(parse_sse_data("").unwrap(), SseEvent::Ignore);
-        assert_eq!(parse_sse_data("[DONE]").unwrap(), SseEvent::Done);
+        assert_eq!(parse_sse_frame(&frame("")).unwrap(), Parsed::Ignore);
+        assert_eq!(parse_sse_frame(&frame("[DONE]")).unwrap(), Parsed::Done);
 
-        let error = parse_sse_data(r#"{"error":{"message":"bad key"}}"#).unwrap_err();
+        let error = parse_sse_frame(&frame(r#"{"error":{"message":"bad key"}}"#)).unwrap_err();
         assert!(error.to_string().contains("bad key"));
+
+        let parsed = parse_sse_frame(&frame(
+            r#"{"choices":[{"delta":{"reasoning_content":"thinking…"}}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Parsed::Delta(StreamItem::Thinking("thinking…".to_string()))
+        );
+
+        // A delta with neither content nor reasoning is ignored.
+        let parsed = parse_sse_frame(&frame(r#"{"choices":[{"delta":{}}]}"#)).unwrap();
+        assert_eq!(parsed, Parsed::Ignore);
+    }
+
+    #[test]
+    fn parse_reads_usage_in_both_spellings() {
+        let frame = |data: &str| crate::core::sse::SseFrame {
+            event: None,
+            data: data.to_string(),
+        };
+        let parsed = parse_sse_frame(&frame(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#,
+        ))
+        .unwrap();
+        assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 10, output: 4 }));
+
+        let parsed = parse_sse_frame(&frame(
+            r#"{"usage":{"input_tokens":7,"output_tokens":2}}"#,
+        ))
+        .unwrap();
+        assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 7, output: 2 }));
+
+        // No usage pair at all: ignored, not an error.
+        let parsed = parse_sse_frame(&frame(r#"{"usage":{}}"#)).unwrap();
+        assert_eq!(parsed, Parsed::Ignore);
+    }
+
+    #[tokio::test]
+    async fn empty_key_yields_not_configured() {
+        let client = OpenAiCompatClient::new("  ", "https://example.test/v1", "m").unwrap();
+        let mut stream = client.stream_chat(vec![], CancellationToken::new());
+        let error = stream.next().await.expect("one item").unwrap_err();
+        assert!(matches!(error, ModelError::NotConfigured(_)));
     }
 }

@@ -128,6 +128,15 @@ pub struct SessionMeta {
     /// appended as [`RolloutItem::Renamed`] items and win on replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The provider half of the model selection this session started with
+    /// (`"provider/model"`; later switches are appended as
+    /// [`RolloutItem::ModelSwitched`] items). Absent in files written before
+    /// multi-provider support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The model half of the initial selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// One persisted record, distilled from codex's `RolloutItem` to what a chat
@@ -147,6 +156,11 @@ pub enum RolloutItem {
     },
     /// The conversation history was dropped (system prompt retained).
     Cleared,
+    /// The active model selection changed (`Op::SwitchModel`).
+    ModelSwitched {
+        provider: String,
+        model: String,
+    },
 }
 
 /// One JSONL line: a timestamp plus the payload's fields flattened in.
@@ -182,8 +196,13 @@ impl RolloutWriter {
 
     /// Create a new rollout file (meta line included) for a fresh session.
     /// The id comes from the current time; on the unlikely name collision the
-    /// id is regenerated.
-    pub fn start_session(&self, system_prompt: &str) -> io::Result<RolloutFile> {
+    /// id is regenerated. `provider`/`model` record the initial selection.
+    pub fn start_session(
+        &self,
+        system_prompt: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> io::Result<RolloutFile> {
         std::fs::create_dir_all(&self.dir)?;
         let mut last_error = None;
         for _ in 0..5 {
@@ -198,6 +217,8 @@ impl RolloutWriter {
                 cwd: self.cwd.clone(),
                 system_prompt: system_prompt.to_string(),
                 name: None,
+                provider: provider.map(str::to_string),
+                model: model.map(str::to_string),
             };
             match OpenOptions::new().create_new(true).append(true).open(&path) {
                 Ok(file) => {
@@ -296,6 +317,9 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             RolloutItem::AssistantMessage { message } => messages.push(Message::assistant(message)),
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
             RolloutItem::Cleared => messages.clear(),
+            // The active model selection is metadata for attribution; it does
+            // not change the replayed conversation.
+            RolloutItem::ModelSwitched { .. } => {}
         }
     }
 
@@ -365,7 +389,7 @@ mod tests {
     fn start_session_writes_meta_and_reloads() {
         let dir = tempdir("start");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief").expect("start");
+        let mut rollout = writer.start_session("be brief", None, None).expect("start");
 
         assert!(rollout.path.starts_with(&dir));
         rollout
@@ -393,7 +417,7 @@ mod tests {
     fn replay_applies_clears_and_renames_in_order() {
         let dir = tempdir("replay");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief").expect("start");
+        let mut rollout = writer.start_session("be brief", None, None).expect("start");
 
         rollout
             .append(&RolloutItem::UserMessage {
@@ -422,10 +446,10 @@ mod tests {
     fn listing_sorts_oldest_first() {
         let dir = tempdir("list");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let first = writer.start_session("one").expect("start");
+        let first = writer.start_session("one", None, None).expect("start");
         // Ensure distinct ids even with a coarse clock.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = writer.start_session("two").expect("start");
+        let second = writer.start_session("two", None, None).expect("start");
 
         let listed = list_workspace_sessions(&dir).expect("list");
         assert_eq!(listed, vec![first.path, second.path]);
@@ -435,7 +459,7 @@ mod tests {
     fn load_skips_unknown_item_types() {
         let dir = tempdir("unknown");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief").expect("start");
+        let mut rollout = writer.start_session("be brief", None, None).expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),

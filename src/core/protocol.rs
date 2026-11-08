@@ -73,6 +73,9 @@ pub enum Op {
     SwitchSession { session: usize },
     /// Name the session at `session` (see `/rename`); recorded in its rollout.
     RenameSession { session: usize, name: String },
+    /// Make `selection` (`"provider/model"`, see `/model`) the backend for the
+    /// following turns. Applied between turns; the current one is untouched.
+    SwitchModel { selection: String },
 }
 
 /// Events emitted by the agent.
@@ -82,8 +85,13 @@ pub enum EventMsg {
     TurnStarted,
     /// Incremental assistant text.
     AgentMessageDelta { delta: String },
+    /// Incremental reasoning content. The minimal front-end ignores it; the
+    /// event keeps the bus honest about what the model produced.
+    AgentThinkingDelta { delta: String },
     /// The complete assistant text for the turn. Sent once, after streaming.
     AgentMessage { message: String },
+    /// Token usage for a completed turn, right before its `TurnComplete`.
+    TurnUsage { input: u64, output: u64 },
     /// The turn was cancelled by the user.
     TurnAborted { reason: String },
     /// The turn hit an error.
@@ -98,6 +106,9 @@ pub enum EventMsg {
     SessionSwitched { session: usize },
     /// The session at `session` was named via `Op::RenameSession`.
     SessionRenamed { session: usize, name: String },
+    /// The active model is now `model` (`"provider/model"`, see
+    /// `Op::SwitchModel`).
+    ModelSwitched { model: String },
     /// The worker has stopped.
     ShutdownComplete,
 }
