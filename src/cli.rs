@@ -359,16 +359,19 @@ mod tests {
         assert_eq!(only_url.base_url.as_deref(), Some("http://x/v1"));
         assert_eq!(only_url.api_key, None);
         assert!(only_url.requires_api_key);
+        // The synthesized instance is registered under its literal name.
+        let name = only_url.name.clone();
         assert_eq!(
-            pool_of(only_url).missing_credential_raw("openai"),
+            pool_of(only_url).missing_credential_raw(&name),
             Some("api_key")
         );
 
         let only_key = synthesized_openai_instance(&args(&["--api-key", "k"]))
             .expect("key alone synthesizes");
         assert_eq!(only_key.base_url, None);
+        let name = only_key.name.clone();
         assert_eq!(
-            pool_of(only_key).missing_credential_raw("openai"),
+            pool_of(only_key).missing_credential_raw(&name),
             Some("base_url")
         );
 
@@ -380,7 +383,8 @@ mod tests {
             "k",
         ]))
         .expect("pair synthesizes");
-        assert_eq!(pool_of(both).missing_credential_raw("openai"), None);
+        let name = both.name.clone();
+        assert_eq!(pool_of(both).missing_credential_raw(&name), None);
         let both = synthesized_openai_instance(&args(&[
             "--base-url",
             "http://x/v1",

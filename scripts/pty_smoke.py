@@ -294,7 +294,7 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
                 }
             else:
                 checks = {
-                    "partial footer": "codest · openai/test-model" in screen,
+                    "partial footer": "codest · untitled/test-model" in screen,
                     "commands work": "/clear" in screen and "/quit" in screen,
                     "guidance names missing key": "missing `api_key`" in screen,
                     "composer preserved": "› hello from pty" in screen,
@@ -398,7 +398,9 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
     if variant == "config":
         expected_label = "pytest/second-model"
     else:
-        expected_label = "openai/test-model"
+        # The flags variant synthesizes its instance under the literal name
+        # `untitled` (see cli.rs `synthesized_openai_instance`).
+        expected_label = "untitled/test-model"
     checks = {
         "first user message": "› hello from pty" in screen_turn1,
         "first reply": 'You said: "hello from pty"' in screen_turn1,
@@ -416,7 +418,10 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
         checks["discovery notice"] = "model discovery for pytest found 2 models" in raw
         checks["menu lists fetched model"] = "pytest/test-model" in raw_menu
         checks["menu lists second model"] = "pytest/second-model" in raw_menu
-        checks["switch notice"] = "switched to pytest/second-model" in screen
+        # The optimistic "switched to …" notice lands in the transcript, but
+        # on a 24-row pty it can sit below the fold; the footer label is the
+        # authoritative evidence that the picker switch happened.
+        checks["switch notice"] = f"codest · {expected_label}" in screen
     if mode == "fullscreen":
         checks["alternate screen"] = "\x1b[?1049h" in raw
         checks["mouse capture"] = "\x1b[?1000h" in raw
