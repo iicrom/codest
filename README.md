@@ -193,6 +193,7 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 | `/clear` | — | 清空会话上下文和屏幕上的 transcript |
 | `/quit` | `/exit` | 退出 codest |
 | `/status` | — | 显示 backend、模式、transcript 大小和已加载插件 |
+| `/context` | — | 显示组装后的系统提示词（逐段标注出处：base / 各插件）、请求配置（endpoint、effort、`body_overrides`）、插件声明的工具列表和 token 用量 |
 | `/new` | — | 归档当前对话，开启一个新的空会话 |
 | `/rename <name>` | — | 重命名当前会话；默认名取该会话第一句用户输入 |
 | `/sessions` | `/resume` | 打开会话列表菜单，切换并继续以前的会话 |
@@ -245,18 +246,38 @@ codest --resume          # 同 --continue，并在启动时打开会话选择菜
 codest 的指令和生命周期扩展都来自**编译期链接**的插件，不做运行时加载：
 
 - 插件是普通的 Rust 模块，注册表是 `src/plugins/builtin/mod.rs` 里的一个 `static` 切片；注册顺序就是钩子执行顺序和菜单顺序。
-- 插件可以贡献 slash 命令、系统提示词片段、`on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` 钩子，以及多 Provider 的协议工厂（`protocols()`，见"多 Provider"）。
-- 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、清屏、退出、设置输入框、提交新回合），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
-- 重复插件 id、重复命令名/别名、非法命令名会在启动时被拒绝。
+- 插件可以贡献 slash 命令、系统提示词片段、`on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` 钩子、工具（`tools()` 声明 + `run_tool()` 执行），以及多 Provider 的协议工厂（`protocols()`，见"多 Provider"）。
+- 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、报告块、清屏、退出、设置输入框、提交新回合），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
+- 重复插件 id、重复命令名/别名、重复工具名、非法命令名会在启动时被拒绝。
 
-内置的 `/help`、`/clear`、`/quit`、`/status` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)。
+内置的 `/help`、`/clear`、`/quit`、`/status`、`/context` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)。
 
 新增插件的最小步骤：
 
 1. 在 `src/plugins/builtin/` 下新建模块，声明 `static` 插件值和 `CommandSpec`；
-2. 实现 `Plugin`（至少 `id`，按需实现 `commands` / `run_command` / 钩子）；
+2. 实现 `Plugin`（至少 `id`，按需实现 `commands` / `run_command` / 钩子 / 工具）；
 3. 在 `src/plugins/builtin/mod.rs` 的 `BUILTIN_PLUGINS` 里加一项；
 4. 运行 `cargo test`。
+
+### 工具调用（tool calling）
+
+本体实现了 openai-completions 的完整工具链路，具体工具由插件添加：
+
+1. 插件用 `Plugin::tools()` 声明 `ToolSpec`（名称、描述、JSON Schema 参数）；
+2. 请求自动带上 `tools` 字段；模型流式返回 `tool_calls` 后，worker 按 name
+   派发到声明该工具的插件的 `run_tool()`；
+3. 执行结果（或 `error: …` 失败文本）作为 `role: "tool"` 消息回传，回合继续
+   （上限 8 轮，`Esc` 可中断）；每次调用在 transcript 上渲染为一个 `⚙` 单元，
+   会话持久化与恢复都覆盖工具消息；
+4. 用 `/context` 可以随时查看当前提供了哪些工具。
+
+skills、workspace instructions 等上下文不需要专门的机制：作为普通插件的
+`system_prompt()` 片段注入即可，`/context` 会逐段标注出处。
+
+没有真实工具也能验证链路：用 `scripts/openai_test_server.py` 起测试服务后，
+消息里带 `@tool` 会触发一次 `ping` tool_call（参数分片流式下发；本体未注册
+该工具，会以 `unknown tool` 错误结果回传并继续回合），下一轮回复会复述工具
+结果，完成整条回环。
 
 ## 从 codex 提取了什么
 

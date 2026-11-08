@@ -83,14 +83,38 @@ impl SessionView {
     /// transcript into scrollback when the view becomes active.
     pub fn restored(loaded: &LoadedSession) -> Self {
         let mut view = Self::empty();
+        // Tool-call cells are keyed by the model's call ids so the follow-up
+        // `Role::Tool` messages attach their output to the right cell.
+        let mut call_cells = std::collections::HashMap::new();
         for message in &loaded.messages {
             match message.role {
                 Role::User => view
                     .history
                     .push(HistoryCell::User(message.content.clone())),
-                Role::Assistant => view
-                    .history
-                    .push(HistoryCell::Assistant(message.content.clone())),
+                Role::Assistant => {
+                    if !message.content.is_empty() {
+                        view.history
+                            .push(HistoryCell::Assistant(message.content.clone()));
+                    }
+                    for call in message.tool_calls.iter().flatten() {
+                        view.history.push(HistoryCell::ToolCall {
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            result: String::new(),
+                            error: None,
+                        });
+                        call_cells.insert(call.id.clone(), view.history.len() - 1);
+                    }
+                }
+                Role::Tool => {
+                    if let Some(id) = &message.tool_call_id
+                        && let Some(&index) = call_cells.get(id)
+                        && let Some(HistoryCell::ToolCall { result, .. }) =
+                            view.history.get_mut(index)
+                    {
+                        *result = message.content.clone();
+                    }
+                }
                 Role::System => {}
             }
         }

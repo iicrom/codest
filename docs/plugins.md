@@ -127,6 +127,7 @@ pub trait Plugin: Sync {
     fn id(&self) -> &'static str;
     fn commands(&self) -> &'static [CommandSpec] { &[] }
     fn system_prompt(&self) -> Option<&'static str> { None }
+    fn tools(&self) -> &'static [ToolSpec] { &[] }
 
     fn on_startup(&self, ctx: &mut PluginContext<'_>) {}
     fn on_user_message(&self, text: &str, ctx: &mut PluginContext<'_>) {}
@@ -140,6 +141,10 @@ pub trait Plugin: Sync {
     ) -> Result<(), PluginError> {
         Err(PluginError::new("not handled"))
     }
+
+    fn run_tool(&self, call: &ToolCall) -> Result<String, PluginError> {
+        Err(PluginError::new("not handled"))
+    }
 }
 ```
 
@@ -147,11 +152,27 @@ pub trait Plugin: Sync {
 
 - **`&self` 而不是 `&mut self`**：插件以 `&'static dyn Plugin` 共享，注册表本身
   不需要可变性。需要状态的插件用 `Mutex`/原子类型做内部可变性（见第 8 节）。
-- **默认实现**：只做钩子的插件不用写命令；只做命令的插件不用写钩子。
+- **默认实现**：只做钩子的插件不用写命令；只做命令的插件不用写钩子；不提供
+  工具的插件不用写 `run_tool`。
 - **`Sync`**：静态值必须可安全共享；这也阻止了插件在钩子里偷偷使用 `Rc` 等
   非线程安全状态。
-- **`'static` 元数据**：`CommandSpec` 和系统提示词片段都是静态字符串，菜单和
-  帮助文本可以直接借用，不需要克隆。
+- **`'static` 元数据**：`CommandSpec`、系统提示词片段和 `ToolSpec` 都是静态
+  字符串，菜单和帮助文本可以直接借用，不需要克隆。
+
+#### 工具：`tools()` + `run_tool()`
+
+插件通过 `tools()` 声明工具（名称、描述、JSON Schema 参数文本），通过
+`run_tool()` 执行模型发起的调用。core 侧的回合循环负责整条链路：请求带上
+`tools` 字段 → 模型流式返回 `tool_calls` → worker 按名字派发到声明该工具的
+插件 → 结果作为 `role: "tool"` 消息回传 → 继续本轮对话（上限
+`MAX_TOOL_ROUNDS = 8` 轮，可被用户中断）。执行失败也回传给模型（内容为
+`error: …`），模型可以选择重试或换路；transcript 上每次调用渲染为一个
+`⚙` 单元。
+
+`PluginHost` 在构建时校验工具名不重复（重复 → `PluginHostError::DuplicateTool`，
+启动失败），并实现 core 的 `ToolExecutor` trait 作为 worker 的执行入口。
+skills、workspace instructions 等上下文注入不需要专门的工具或钩子：作为
+普通插件的 `system_prompt()` 片段即可，`/context` 会自动展示它们的出处。
 
 ### 5.2 `CommandSpec` 与参数策略
 
@@ -189,6 +210,12 @@ pub enum ArgsPolicy {
 | `mode()` | `fullscreen` / `inline` |
 | `transcript_len()` | 当前 transcript 单元数（近似值，用于状态展示） |
 | `plugin_ids()` | 已加载插件 id |
+| `context_window()` / `last_usage()` / `total_input()` / `total_output()` | token 用量（见 `/status`） |
+| `system_sections()` | 组装后的系统提示词分段（`base` + `plugin:<id>`） |
+| `effort()` | 随请求发送的推理等级（`None` 表示不发送） |
+| `request()` | 请求去向与静态字段：protocol / base_url / endpoint / `body_overrides` |
+| `tools()` | 插件声明的全部工具 |
+| `message_count()` | 当前会话消息数的近似值 |
 
 插件能请求的副作用：
 
@@ -196,6 +223,7 @@ pub enum ArgsPolicy {
 | --- | --- |
 | `notice(text)` | `Notice(String)` |
 | `error(text)` | `Error(String)` |
+| `report(block)` | `Report(ReportBlock)`：结构化报告块（粗体标题 + 粗体分组标题 + 强调色标签/暗色正文条目，`/context`） |
 | `clear_conversation()` | `ClearConversation` |
 | `quit()` | `Quit` |
 | `set_composer(text)` | `SetComposer(String)` |
@@ -212,6 +240,7 @@ TUI 按插件顺序、再按效果顺序应用：
 | --- | --- |
 | `Notice` | 追加 `HistoryCell::Notice` |
 | `Error` | 追加 `HistoryCell::Error` |
+| `Report` | 追加 `HistoryCell::Report`（粗体标题 + 普通文本行） |
 | `ClearConversation` | 清空 transcript + 调用 `session.clear_conversation()` |
 | `Quit` | 设置 `quit`，下一帧退出 |
 | `SetComposer` | 替换输入框内容并重置候选菜单 |
@@ -230,6 +259,15 @@ pub struct PluginInfo<'a> {
     pub mode: &'a str,
     pub transcript_len: usize,
     pub plugin_ids: &'a [&'static str],
+    pub context_window: Option<u64>,
+    pub last_usage: Option<(u64, u64)>,
+    pub total_input: u64,
+    pub total_output: u64,
+    pub system_sections: &'a [(String, String)],
+    pub effort: Option<&'a str>,
+    pub request: RequestFacts<'a>,
+    pub tools: &'a [ToolSpec],
+    pub message_count: usize,
 }
 ```
 
@@ -241,8 +279,11 @@ pub struct PluginInfo<'a> {
 ### 5.6 错误处理
 
 - `Plugin::run_command` 返回 `Err(PluginError)` → host 转成
-  `PluginEffect::Error`，用户能看到，但不会中断应用。
-- 注册表错误（重复 id、重复命令、非法名）→ `PluginHostError`，启动失败。
+  `PluginEffect::Error`，用户能看到，但不会中断应用。`run_tool` 的 `Err`
+  同样不会中断：错误文本作为 tool 结果回传给模型，同时显示在 transcript 的
+  `⚙` 单元里。
+- 注册表错误（重复 id、重复命令、重复工具、非法名）→ `PluginHostError`，
+  启动失败。
 - 插件 panic **不会**被捕获：静态插件是可信代码，和主程序其他模块同级；
   需要隔离时应放在独立进程，而不是在这个系统里假装安全。
 
@@ -302,9 +343,11 @@ ConversationCleared
 | `clear` | `/clear` | 请求清空 transcript 和上下文 |
 | `quit` | `/quit` (`/exit`) | 请求退出 |
 | `status` | `/status` | 展示 backend、模式、transcript 大小、命令数、插件列表 |
+| `prompt_debug` | `/context` | 展示组装后的 prompt（逐段出处）、请求配置、工具列表和 token 用量 |
 
 这四个插件覆盖了三种典型形态：只读命令（`help`/`status`）、请求宿主动作
-（`clear`/`quit`）、以及不需要命令的纯钩子插件（文档示例）。
+（`clear`/`quit`）、以及不需要命令的纯钩子插件（文档示例）。`prompt_debug`
+是只读报告类插件的参照：只读 `PluginContext`，输出一个 `Report` 块。
 
 ## 8. 新增一个插件
 

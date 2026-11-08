@@ -23,6 +23,7 @@ use crate::core::model::StreamItem;
 use crate::core::model::TurnOptions;
 use crate::core::protocol::Event;
 use crate::core::protocol::EventMsg;
+use crate::core::protocol::Message;
 use crate::core::protocol::Op;
 use crate::core::protocol::Submission;
 use crate::core::providers::ModelPool;
@@ -31,6 +32,10 @@ use crate::core::rollout::LoadedSession;
 use crate::core::rollout::RolloutFile;
 use crate::core::rollout::RolloutItem;
 use crate::core::rollout::RolloutWriter;
+use crate::core::tools::MAX_TOOL_ROUNDS;
+use crate::core::tools::ToolCall;
+use crate::core::tools::ToolExecutor;
+use crate::core::tools::ToolSpec;
 
 /// Shared cancellation handle for the turn currently being streamed.
 #[derive(Debug, Clone, Default)]
@@ -323,7 +328,7 @@ struct ActiveTurn {
 /// What the worker starts from: sessions restored from disk plus the rollout
 /// directory to persist into. `rollout_dir: None` runs fully in memory (used
 /// by tests); restore failures degrade to an empty list.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SessionBootstrap {
     /// Sessions restored from rollouts, oldest first.
     pub loaded: Vec<LoadedSession>,
@@ -335,6 +340,24 @@ pub struct SessionBootstrap {
     /// saved sessions *and* opens a new one; the restore modes reuse the
     /// loaded sessions and only fall back to a fresh one when none exist.
     pub fresh: bool,
+    /// Tools the plugins declared; offered to the model on every turn.
+    pub tools: Vec<ToolSpec>,
+    /// Executes tool calls; the plugin host in a normal run. `None` turns
+    /// every call into an error result the model can react to.
+    pub executor: Option<Arc<dyn ToolExecutor>>,
+}
+
+impl std::fmt::Debug for SessionBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionBootstrap")
+            .field("loaded", &self.loaded)
+            .field("rollout_dir", &self.rollout_dir)
+            .field("cwd", &self.cwd)
+            .field("fresh", &self.fresh)
+            .field("tools", &self.tools)
+            .field("executor", &self.executor.is_some())
+            .finish()
+    }
 }
 
 /// Rollout state of one session. The append handle exists only once the
@@ -438,11 +461,13 @@ async fn run_worker(
     mut rx: mpsc::UnboundedReceiver<Submission>,
     tx: mpsc::UnboundedSender<Event>,
     interrupt: InterruptHandle,
-    bootstrap: SessionBootstrap,
+    mut bootstrap: SessionBootstrap,
 ) {
     // One worker owns every conversation and streams at most one turn at a
     // time. Sessions are append-only, so the creation-order index is stable
     // and front-ends can mirror it with their own per-session view state.
+    let tools = std::mem::take(&mut bootstrap.tools);
+    let executor = bootstrap.executor.take();
     let writer = bootstrap
         .rollout_dir
         .map(|dir| RolloutWriter::new(dir, bootstrap.cwd));
@@ -507,6 +532,14 @@ async fn run_worker(
     loop {
         if let Some(mut turn) = active.take() {
             interrupt.install(turn.cancel.clone());
+            let deps = TurnContext {
+                client: backend.client().clone(),
+                options: TurnOptions {
+                    effort: effort.clone(),
+                    tools: tools.clone(),
+                },
+                executor: executor.clone(),
+            };
             run_turn(
                 &mut turn,
                 &mut sessions[current],
@@ -514,6 +547,7 @@ async fn run_worker(
                 current,
                 &tx,
                 &interrupt,
+                &deps,
             )
             .await;
             continue;
@@ -547,7 +581,10 @@ async fn run_worker(
                 let cancel = CancellationToken::new();
                 let stream = backend.client().stream_chat(
                     sessions[current].snapshot(),
-                    TurnOptions { effort: effort.clone() },
+                    TurnOptions {
+                        effort: effort.clone(),
+                        tools: tools.clone(),
+                    },
                     cancel.clone(),
                 );
                 let _ = tx.send(Event::new(submission.id.clone(), EventMsg::TurnStarted));
@@ -679,6 +716,16 @@ async fn run_worker(
     }
 }
 
+/// Everything a turn's rounds need beyond the stream itself: the client for
+/// subsequent rounds, the per-turn options (effort + tools), and the plugin
+/// executor for tool calls. Built fresh per turn; the backend cannot switch
+/// mid-turn.
+struct TurnContext {
+    client: Arc<dyn ModelClient>,
+    options: TurnOptions,
+    executor: Option<Arc<dyn ToolExecutor>>,
+}
+
 async fn run_turn(
     turn: &mut ActiveTurn,
     conversation: &mut Conversation,
@@ -686,49 +733,170 @@ async fn run_turn(
     current: usize,
     tx: &mpsc::UnboundedSender<Event>,
     interrupt: &InterruptHandle,
+    deps: &TurnContext,
 ) {
+    let mut round = 0usize;
     loop {
-        tokio::select! {
-            biased;
-            _ = turn.cancel.cancelled() => {
-                finalize_aborted(turn, conversation, rollouts, current, tx);
-                interrupt.clear();
-                return;
-            }
-            item = turn.stream.next() => {
-                match item {
-                    Some(Ok(StreamItem::Delta(delta))) => {
-                        turn.assistant.push_str(&delta);
-                        let _ = tx.send(Event::new(
-                            turn.id.clone(),
-                            EventMsg::AgentMessageDelta { delta },
-                        ));
-                    }
-                    Some(Ok(StreamItem::Thinking(delta))) => {
-                        // Reasoning output stays out of the conversation and
-                        // the rollout; the front-end renders it display-only.
-                        let _ = tx.send(Event::new(
-                            turn.id.clone(),
-                            EventMsg::AgentThinkingDelta { delta },
-                        ));
-                    }
-                    Some(Ok(StreamItem::Usage { input, output })) => {
-                        turn.usage = Some((input, output));
-                    }
-                    Some(Err(error)) => {
-                        finalize_error(turn, conversation, rollouts, current, tx, &error.to_string());
-                        interrupt.clear();
-                        return;
-                    }
-                    None => {
-                        finalize_complete(turn, conversation, rollouts, current, tx);
-                        interrupt.clear();
-                        return;
+        round += 1;
+
+        // One round: stream to completion, keeping any tool calls the model
+        // asked for. Text and reasoning stream through exactly like a
+        // tool-less turn.
+        let mut requested: Vec<ToolCall> = Vec::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = turn.cancel.cancelled() => {
+                    finalize_aborted(turn, conversation, rollouts, current, tx);
+                    interrupt.clear();
+                    return;
+                }
+                item = turn.stream.next() => {
+                    match item {
+                        Some(Ok(StreamItem::Delta(delta))) => {
+                            turn.assistant.push_str(&delta);
+                            let _ = tx.send(Event::new(
+                                turn.id.clone(),
+                                EventMsg::AgentMessageDelta { delta },
+                            ));
+                        }
+                        Some(Ok(StreamItem::Thinking(delta))) => {
+                            // Reasoning output stays out of the conversation and
+                            // the rollout; the front-end renders it display-only.
+                            let _ = tx.send(Event::new(
+                                turn.id.clone(),
+                                EventMsg::AgentThinkingDelta { delta },
+                            ));
+                        }
+                        Some(Ok(StreamItem::ToolCalls(calls))) => {
+                            requested = calls;
+                        }
+                        Some(Ok(StreamItem::Usage { input, output })) => {
+                            turn.usage = Some((input, output));
+                        }
+                        Some(Err(error)) => {
+                            finalize_error(turn, conversation, rollouts, current, tx, &error.to_string());
+                            interrupt.clear();
+                            return;
+                        }
+                        None => break,
                     }
                 }
             }
         }
+
+        // No tool calls: the turn is over, exactly like the tool-less past.
+        if requested.is_empty() {
+            finalize_complete(turn, conversation, rollouts, current, tx);
+            interrupt.clear();
+            return;
+        }
+
+        // The model wants tools. Commit whatever text preceded the calls so
+        // the transcript keeps its order (text → calls → results), record the
+        // calls message, then run each call and feed the results back as
+        // tool messages.
+        commit_round_text(turn, conversation, rollouts, current, tx);
+        conversation.push_message(Message::assistant_tool_calls(requested.clone()));
+        rollouts.append(
+            current,
+            RolloutItem::AssistantToolCalls {
+                calls: requested.clone(),
+            },
+        );
+        for call in requested {
+            if turn.cancel.is_cancelled() {
+                finalize_aborted(turn, conversation, rollouts, current, tx);
+                interrupt.clear();
+                return;
+            }
+            execute_tool_call(turn, conversation, rollouts, current, tx, deps, call);
+        }
+
+        if round >= MAX_TOOL_ROUNDS {
+            finalize_error(
+                turn,
+                conversation,
+                rollouts,
+                current,
+                tx,
+                &format!("tool round limit reached ({MAX_TOOL_ROUNDS} rounds)"),
+            );
+            interrupt.clear();
+            return;
+        }
+
+        // The next round sees the tool results in the snapshot.
+        turn.stream = deps.client.stream_chat(
+            conversation.snapshot(),
+            deps.options.clone(),
+            turn.cancel.clone(),
+        );
     }
+}
+
+/// Commit the text streamed so far this round (assistant message in the
+/// conversation and rollout, `AgentMessage` to the front-end) and empty the
+/// accumulator so the next round starts clean.
+fn commit_round_text(
+    turn: &mut ActiveTurn,
+    conversation: &mut Conversation,
+    rollouts: &mut Rollouts,
+    current: usize,
+    tx: &mpsc::UnboundedSender<Event>,
+) {
+    if turn.assistant.is_empty() {
+        return;
+    }
+    let text = std::mem::take(&mut turn.assistant);
+    conversation.push_assistant(text.clone());
+    rollouts.append(current, RolloutItem::AssistantMessage { message: text.clone() });
+    let _ = tx.send(Event::new(turn.id.clone(), EventMsg::AgentMessage { message: text }));
+}
+
+/// Run one tool call, record it everywhere, and tell the front-end. Failures
+/// become the tool message's content so the model can react to them.
+fn execute_tool_call(
+    turn: &mut ActiveTurn,
+    conversation: &mut Conversation,
+    rollouts: &mut Rollouts,
+    current: usize,
+    tx: &mpsc::UnboundedSender<Event>,
+    deps: &TurnContext,
+    call: ToolCall,
+) {
+    let outcome = match deps.executor.as_ref() {
+        Some(executor) => executor.execute(&call),
+        None => Err(format!(
+            "tool `{}` is not available: no tool executor is configured",
+            call.name
+        )),
+    };
+    let (result, error) = match outcome {
+        Ok(output) => (output, None),
+        Err(message) => (String::new(), Some(message)),
+    };
+    let content = match &error {
+        Some(message) => format!("error: {message}"),
+        None => result.clone(),
+    };
+    let _ = tx.send(Event::new(
+        turn.id.clone(),
+        EventMsg::AgentToolCall {
+            name: call.name.clone(),
+            arguments: call.arguments,
+            result,
+            error,
+        },
+    ));
+    conversation.push_message(Message::tool_result(&call.id, content.clone()));
+    rollouts.append(
+        current,
+        RolloutItem::ToolResult {
+            tool_call_id: call.id,
+            content,
+        },
+    );
 }
 
 /// Switch the backend to `selection` and record it everywhere: the rollout
@@ -970,9 +1138,297 @@ mod tests {
         }
     }
 
+    /// A client that plays back one scripted stream per `stream_chat` call —
+    /// the shape a tool round-trip produces (tools first, then final text).
+    /// Exhausted scripts fall back to plain text so a runaway loop still ends.
+    struct ScriptedClient {
+        scripts: Arc<Mutex<Vec<Vec<StreamItem>>>>,
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+        options: Arc<Mutex<Vec<TurnOptions>>>,
+    }
+
+    impl ScriptedClient {
+        fn new(scripts: Vec<Vec<StreamItem>>) -> Self {
+            Self {
+                scripts: Arc::new(Mutex::new(scripts)),
+                seen: Arc::new(Mutex::new(Vec::new())),
+                options: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn snapshots(&self) -> Arc<Mutex<Vec<Vec<Message>>>> {
+            self.seen.clone()
+        }
+
+        fn turn_options(&self) -> Arc<Mutex<Vec<TurnOptions>>> {
+            self.options.clone()
+        }
+    }
+
+    impl ModelClient for ScriptedClient {
+        fn label(&self) -> String {
+            "scripted".to_string()
+        }
+
+        fn stream_chat(
+            &self,
+            messages: Vec<Message>,
+            options: TurnOptions,
+            _cancel: CancellationToken,
+        ) -> ModelStream {
+            self.seen.lock().expect("lock").push(messages);
+            self.options.lock().expect("lock").push(options);
+            let script = {
+                let mut scripts = self.scripts.lock().expect("lock");
+                if scripts.is_empty() {
+                    vec![StreamItem::Delta("done".to_string())]
+                } else {
+                    scripts.remove(0)
+                }
+            };
+            Box::pin(futures_util::stream::iter(
+                script.into_iter().map(Ok::<_, crate::core::model::ModelError>),
+            ))
+        }
+    }
+
+    /// Executes `ping`, fails everything else — the minimal plugin stand-in.
+    struct MapExecutor;
+
+    impl ToolExecutor for MapExecutor {
+        fn execute(&self, call: &ToolCall) -> Result<String, String> {
+            match call.name.as_str() {
+                "ping" => Ok(format!("pong {}", call.arguments)),
+                other => Err(format!("nope: {other}")),
+            }
+        }
+    }
+
+    static PING_SPEC: ToolSpec = ToolSpec {
+        name: "ping",
+        description: "reply with pong",
+        parameters_json: "",
+    };
+
+    fn tool_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        }
+    }
+
     #[tokio::test]
-    async fn second_turn_sends_the_full_history() {
-        let client = RecordingClient::new();
+    async fn tool_calls_execute_and_continue_the_turn() {
+        let client = ScriptedClient::new(vec![
+            vec![
+                StreamItem::Delta("checking".to_string()),
+                StreamItem::ToolCalls(vec![tool_call("c1", "ping")]),
+                StreamItem::Usage {
+                    input: 10,
+                    output: 2,
+                },
+            ],
+            vec![
+                StreamItem::Delta("all done".to_string()),
+                StreamItem::Usage {
+                    input: 20,
+                    output: 4,
+                },
+            ],
+        ]);
+        let seen = client.snapshots();
+        let options = client.turn_options();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        let events = collect_turn(&mut session).await;
+
+        // The pre-call text commits as its own message before the tool
+        // activity, then the second round answers.
+        let messages: Vec<&EventMsg> = events.iter().map(|event| &event.msg).collect();
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                EventMsg::TurnStarted,
+                EventMsg::AgentMessageDelta { .. },
+                EventMsg::AgentMessage { message },
+                EventMsg::AgentToolCall { name, result, error: None, .. },
+                EventMsg::AgentMessageDelta { .. },
+                EventMsg::AgentMessage { .. },
+                EventMsg::TurnUsage { input: 20, output: 4 },
+                EventMsg::TurnComplete,
+            ] if message == "checking" && name == "ping" && result == "pong {}"
+        ));
+
+        // The second request carries the tool round on the wire: the text,
+        // the calls message, and the tool result answering it.
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].len(), 5);
+        assert_eq!(seen[1][2].content, "checking");
+        assert_eq!(seen[1][3].role, Role::Assistant);
+        assert_eq!(
+            seen[1][3].tool_calls.as_deref(),
+            Some(&[tool_call("c1", "ping")][..])
+        );
+        assert_eq!(seen[1][4].role, Role::Tool);
+        assert_eq!(seen[1][4].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(seen[1][4].content, "pong {}");
+
+        // Both rounds offer the declared tools.
+        let options = options.lock().expect("lock");
+        assert_eq!(options[0].tools, vec![PING_SPEC]);
+        assert_eq!(options[1].tools, vec![PING_SPEC]);
+    }
+
+    #[tokio::test]
+    async fn tool_failures_are_fed_back_and_the_turn_continues() {
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "missing")])],
+            vec![StreamItem::Delta("recovered".to_string())],
+        ]);
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        let events = collect_turn(&mut session).await;
+
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::AgentToolCall { name, error: Some(error), .. }
+                if name == "missing" && error == "nope: missing"
+        )));
+
+        // The model sees the failure as the tool message content.
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[1][3].content, "error: nope: missing");
+    }
+
+    #[tokio::test]
+    async fn tool_calls_without_an_executor_error_but_keep_the_turn_going() {
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
+            vec![StreamItem::Delta("gave up".to_string())],
+        ]);
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        let events = collect_turn(&mut session).await;
+
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::AgentToolCall { error: Some(error), .. }
+                if error.contains("no tool executor is configured")
+        )));
+        let seen = seen.lock().expect("lock");
+        assert!(seen[1][3].content.starts_with("error: "));
+    }
+
+    #[tokio::test]
+    async fn a_runaway_tool_loop_hits_the_round_limit() {
+        let calls = || {
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])]
+        };
+        let client = ScriptedClient::new((0..MAX_TOOL_ROUNDS).map(|_| calls()).collect());
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        let events = collect_turn(&mut session).await;
+
+        let tool_events = events
+            .iter()
+            .filter(|event| matches!(event.msg, EventMsg::AgentToolCall { .. }))
+            .count();
+        assert_eq!(tool_events, MAX_TOOL_ROUNDS);
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::Error { message } if message.contains("tool round limit")
+        )));
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), MAX_TOOL_ROUNDS);
+    }
+
+    #[tokio::test]
+    async fn tool_rounds_persist_and_replay() {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-worker-test-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
+            vec![StreamItem::Delta("all done".to_string())],
+        ]);
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                fresh: true,
+                ..SessionBootstrap::default()
+            },
+        );
+        session.submit_user_turn("hi");
+        collect_turn(&mut session).await;
+        session.shutdown();
+        while session.next_event().await.is_some() {}
+
+        let loaded = crate::core::rollout::load_workspace_sessions(&dir).expect("load");
+        assert_eq!(loaded.len(), 1);
+        let messages = &loaded[0].messages;
+        assert_eq!(messages.len(), 4); // user, calls, tool result, final text
+        assert!(matches!(messages[1].tool_calls.as_deref(), Some([_])));
+        assert_eq!(messages[2].role, Role::Tool);
+        assert_eq!(messages[2].content, "pong {}");
+        assert_eq!(messages[3].content, "all done");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn second_turn_sends_the_full_history() {        let client = RecordingClient::new();
         let seen = client.snapshots();
         let mut session = AgentSession::spawn(Arc::new(client));
 
@@ -1115,6 +1571,7 @@ mod tests {
             rollout_dir: Some(dir.clone()),
             cwd: "/tmp/demo".to_string(),
             fresh,
+            ..SessionBootstrap::default()
         };
 
         // First run: one turn lands in a rollout file.
@@ -1176,6 +1633,7 @@ mod tests {
                 rollout_dir: Some(dir.clone()),
                 cwd: "/tmp/demo".to_string(),
                 fresh: true,
+                ..SessionBootstrap::default()
             },
         );
         session.rename_session(0, "my chat");
@@ -1196,6 +1654,7 @@ mod tests {
                 rollout_dir: Some(dir.clone()),
                 cwd: "/tmp/demo".to_string(),
                 fresh: true,
+                ..SessionBootstrap::default()
             },
         );
         session.rename_session(0, "my chat");
@@ -1499,6 +1958,7 @@ mod tests {
                 rollout_dir: Some(dir.clone()),
                 cwd: "/tmp/demo".to_string(),
                 fresh: true,
+                ..SessionBootstrap::default()
             },
         )
         .expect("initial selection resolves");
@@ -1598,6 +2058,7 @@ mod tests {
                 rollout_dir: None,
                 cwd: "/tmp/demo".to_string(),
                 fresh: true,
+                ..SessionBootstrap::default()
             },
         )
         .expect("spawn");
@@ -1674,6 +2135,7 @@ mod tests {
                 rollout_dir: Some(dir.clone()),
                 cwd: "/tmp/demo".to_string(),
                 fresh: true,
+                ..SessionBootstrap::default()
             },
         );
 

@@ -151,6 +151,17 @@ pub enum RolloutItem {
     AssistantMessage {
         message: String,
     },
+    /// The model asked for tool calls; one item carries the whole round's
+    /// calls and replays as one assistant message with `tool_calls`.
+    AssistantToolCalls {
+        calls: Vec<crate::core::tools::ToolCall>,
+    },
+    /// The result of one executed tool call, replayed as a `Role::Tool`
+    /// message answering `tool_call_id`.
+    ToolResult {
+        tool_call_id: String,
+        content: String,
+    },
     Renamed {
         name: String,
     },
@@ -358,6 +369,13 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             }
             RolloutItem::UserMessage { message } => messages.push(Message::user(message)),
             RolloutItem::AssistantMessage { message } => messages.push(Message::assistant(message)),
+            RolloutItem::AssistantToolCalls { calls } => {
+                messages.push(Message::assistant_tool_calls(calls))
+            }
+            RolloutItem::ToolResult {
+                tool_call_id,
+                content,
+            } => messages.push(Message::tool_result(tool_call_id, content)),
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
             RolloutItem::Cleared => {
                 messages.clear();

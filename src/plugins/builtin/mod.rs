@@ -6,6 +6,7 @@
 
 mod clear;
 mod help;
+mod prompt_debug;
 mod quit;
 mod status;
 
@@ -13,9 +14,15 @@ use crate::plugins::Plugin;
 
 pub use clear::CLEAR;
 pub use help::HELP;
+pub use prompt_debug::PROMPT_DEBUG;
 pub use quit::QUIT;
 pub use status::STATUS;
 
 /// Every plugin compiled into the binary, in hook and menu order.
-pub static BUILTIN_PLUGINS: &[&dyn Plugin] =
-    &[&help::HELP, &clear::CLEAR, &quit::QUIT, &status::STATUS];
+pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
+    &help::HELP,
+    &clear::CLEAR,
+    &quit::QUIT,
+    &status::STATUS,
+    &prompt_debug::PROMPT_DEBUG,
+];

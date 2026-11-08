@@ -12,6 +12,13 @@ Usage:
     cst    --base-url http://127.0.0.1:8080/v1 --api-key test --model test-model  # alias
 
 Pass `--port 0` to bind an ephemeral port; the chosen URL is printed on stdout.
+
+Tool-calling round trip: when the last user message contains `@tool`, the next
+streamed response is a `tool_calls` delta (a `ping` call with fragmented
+arguments) instead of text. codest executes it — no tool is registered in the
+binary, so the result is the `error: unknown tool …` text — and feeds it back
+as a `role: "tool"` message. The following response then summarizes what the
+tool round reported, completing the loop end-to-end.
 """
 
 from __future__ import annotations
@@ -90,6 +97,48 @@ def reasoning_for(body: dict[str, Any]) -> str:
     return (
         "The test server is thinking: this text arrives as reasoning_content "
         f"deltas, which codest renders dim. reasoning_effort={effort_text}."
+    )
+
+
+TOOL_TRIGGER = "@tool"
+TOOL_NAME = "ping"
+
+
+def conversation_has_tool_round(messages: Any) -> bool:
+    """Whether the transcript already carries a tool round (calls or results)."""
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool" or isinstance(message.get("tool_calls"), list):
+            return True
+    return False
+
+
+def last_tool_result(messages: Any) -> str:
+    """The content of the most recent `role: "tool"` message, for the summary."""
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if isinstance(message, dict) and message.get("role") == "tool":
+                content = message.get("content")
+                if isinstance(content, str):
+                    return content
+                return json.dumps(content, ensure_ascii=False)
+    return "(no tool result)"
+
+
+def tool_requested(messages: Any) -> bool:
+    """The `@tool` trigger in the last user message asks for a call round."""
+    return TOOL_TRIGGER in last_user_text(messages)
+
+
+def tool_call_reply(messages: Any) -> str:
+    """The text answer that follows a completed tool round."""
+    return (
+        "The previous round asked for the `ping` tool. codest executed it and\n"
+        f"fed the result back: {last_tool_result(messages)}\n\n"
+        "This completes the tool-calling round trip of the test server."
     )
 
 
@@ -196,6 +245,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         model = self._model(body)
         created = int(time.time())
         delay = getattr(self.server, "delay", 0.0)
+        messages = body.get("messages")
+
+        # Tool round trip: `@tool` asks for a call; a transcript that already
+        # carries one gets the summary instead (so the loop always terminates).
+        if tool_requested(messages) and not conversation_has_tool_round(messages):
+            self._send_tool_call_stream(body)
+            return
+        reply = (
+            tool_call_reply(messages)
+            if conversation_has_tool_round(messages)
+            else reply_for(messages)
+        )
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -225,7 +286,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 if delay > 0:
                     time.sleep(delay)
 
-            for token in tokenize(reply_for(body.get("messages"))):
+            for token in tokenize(reply):
                 self._send_chunk(
                     {
                         "id": "chatcmpl-test",
@@ -274,6 +335,76 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             # The client interrupted the turn or quit; that is not an error.
+            return
+
+    def _send_tool_call_stream(self, body: dict[str, Any]) -> None:
+        """Stream one `tool_calls` round for the `@tool` trigger.
+
+        The call's arguments arrive in fragments across chunks (the shape
+        real providers stream), so the client's reassembly is exercised too.
+        """
+        model = self._model(body)
+        created = int(time.time())
+        delay = getattr(self.server, "delay", 0.0)
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        call_chunks: list[list[dict[str, Any]]] = [
+            [
+                {
+                    "index": 0,
+                    "id": "call-test-1",
+                    "type": "function",
+                    "function": {"name": TOOL_NAME, "arguments": ""},
+                }
+            ],
+            [{"index": 0, "function": {"arguments": '{"note":'}}],
+            [{"index": 0, "function": {'arguments': '"called by the test server"}'}}],
+        ]
+        try:
+            for calls in call_chunks:
+                self._send_chunk(
+                    {
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": None}],
+                    }
+                )
+                if delay > 0:
+                    time.sleep(delay)
+
+            self._send_chunk(
+                {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                }
+            )
+            self._send_chunk(
+                {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 5,
+                        "total_tokens": 35,
+                    },
+                }
+            )
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
             return
 
     def _send_chunk(self, payload: dict[str, Any]) -> None:

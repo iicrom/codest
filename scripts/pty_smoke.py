@@ -546,6 +546,126 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
     return checks
 
 
+def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
+    """The tool-calling round trip: `@tool` makes the test server stream a
+    `ping` tool_call; no tool is registered, so codest feeds the unknown-tool
+    error back and the model's next reply summarizes the round."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+    env = dict(os.environ)
+    env["TERM"] = "xterm-256color"
+    home = tempfile.mkdtemp(prefix="codest-pty-tool-")
+    env["CODEST_HOME"] = home
+    process = subprocess.Popen(
+        [
+            binary,
+            "--tui-mode",
+            mode,
+            "--base-url",
+            base_url,
+            "--api-key",
+            "test-key",
+            "--model",
+            "test-model",
+        ],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave)
+
+    output = bytearray()
+    turn_start = 0
+    turn_end = 0
+    before_quit = 0
+    try:
+        if not pump(master, output, 1.5):
+            print(f"[{mode}] tool smoke exited during startup", file=sys.stderr)
+            print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
+            return {"tool startup": False}
+        turn_start = len(output)
+        os.write(master, b"use the ping tool @tool")
+        pump(master, output, 0.4)
+        os.write(master, b"\r")
+        # Snapshot the moment the ⚙ tool cell renders (it scrolls off as the
+        # summary reply streams in), then wait for the idle footer: the round
+        # spans two streamed requests, so durations are unreliable.
+        deadline = time.time() + 10
+        tool_end = 0
+        while time.time() < deadline:
+            if "⚙" in output[turn_start:].decode("utf-8", "replace"):
+                tool_end = len(output)
+                break
+            if not pump(master, output, 0.2):
+                break
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if b"ready" in bytes(output[turn_start:]):
+                break
+            if not pump(master, output, 0.3):
+                break
+        turn_end = len(output)
+        # `/context` needs an idle agent; the turn is done by now.
+        os.write(master, b"/context")
+        pump(master, output, 0.3)
+        os.write(master, b"\r")
+        pump(master, output, 0.8)
+        before_quit = len(output)
+        for _ in range(3):
+            if process.poll() is not None:
+                break
+            try:
+                os.write(master, b"\x03")
+            except OSError:
+                break
+            pump(master, output, 0.4)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+    raw = output.decode("utf-8", "replace")
+    screen_tool = render(output[:tool_end].decode("utf-8", "replace"))
+    screen_turn = render(output[:turn_end].decode("utf-8", "replace"))
+    raw_before_quit = output[:before_quit].decode("utf-8", "replace")
+    screen = render(raw_before_quit)
+    print(f"--- {mode} screen (tool cell) ---")
+    print(screen_tool)
+    print(f"--- {mode} screen (tool round) ---")
+    print(screen)
+    rollout_text = "".join(
+        path.read_text(encoding="utf-8")
+        for path in Path(home).glob("sessions/*/rollout-*.jsonl")
+    )
+    checks = {
+        "tool call rendered": '⚙ ping {"note":"called by the test server"}' in screen_tool,
+        "unknown tool surfaced": "unknown tool `ping`" in screen_turn,
+        "round trip reply": "tool-calling round trip of the test server" in screen_turn,
+        "context report title": "▪ context" in screen,
+        "context shows sections": "base  You are codest" in screen,
+        "context shows request": "/chat/completions" in screen,
+        "context shows tools": "Tools (0)" in screen,
+        "clean exit": process.poll() is not None or process.returncode == 0,
+    }
+    checks["rollout records tool round"] = (
+        '"type":"assistant_tool_calls"' in rollout_text
+        and '"type":"tool_result"' in rollout_text
+        and '"name":"ping"' in rollout_text
+    )
+    for name, passed in checks.items():
+        print(f"{'PASS' if passed else 'FAIL'}  {name}")
+    return checks
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", nargs="?", default="target/debug/codest")
@@ -554,6 +674,11 @@ def main() -> int:
         choices=["fullscreen", "inline", "both"],
         default="both",
         help="which TUI mode to exercise (default: both)",
+    )
+    parser.add_argument(
+        "--skip-tool",
+        action="store_true",
+        help="skip the tool-calling round-trip scenario",
     )
     args = parser.parse_args()
 
@@ -570,6 +695,11 @@ def main() -> int:
                 label = f"{mode}/{variant}"
                 print(f"=== {label} ===")
                 checks = run_case(args.binary, mode, base_url, variant=variant)
+                passed = passed and all(checks.values())
+                print()
+            if not args.skip_tool:
+                print(f"=== {mode}/tool ===")
+                checks = tool_smoke(args.binary, mode, base_url)
                 passed = passed and all(checks.values())
                 print()
     finally:

@@ -24,6 +24,10 @@ pub enum StreamItem {
     /// Incremental reasoning content (`delta.reasoning_content` on
     /// reasoning-tuned OpenAI-compatible providers).
     Thinking(String),
+    /// Complete tool calls the model asked for, flushed once their streamed
+    /// argument fragments have been reassembled (typically at
+    /// `finish_reason: "tool_calls"` or `[DONE]`).
+    ToolCalls(Vec<crate::core::tools::ToolCall>),
     /// Token usage reported for the turn.
     Usage { input: u64, output: u64 },
 }
@@ -38,6 +42,9 @@ pub struct TurnOptions {
     /// Reasoning effort for this turn (e.g. `"low"`/`"medium"`/`"high"`,
     /// `/effort`); `None` sends no effort field at all.
     pub effort: Option<String>,
+    /// Tools declared by plugins and offered to the model this turn. Empty
+    /// sends no `tools` field at all.
+    pub tools: Vec<crate::core::tools::ToolSpec>,
 }
 
 /// A streaming chat backend.

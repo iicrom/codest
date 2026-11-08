@@ -28,6 +28,9 @@ use std::fmt;
 use crate::core::commands::CommandTableError;
 use crate::core::commands::{CommandInput, CommandTable};
 use crate::core::providers::ProtocolFactory;
+use crate::core::tools::ToolCall;
+use crate::core::tools::ToolExecutor;
+use crate::core::tools::ToolSpec;
 
 pub use crate::core::commands::{ArgsPolicy, CommandCandidate, CommandSpec, Invocation};
 pub use builtin::BUILTIN_PLUGINS;
@@ -47,9 +50,28 @@ pub trait Plugin: Sync {
         &[]
     }
 
-    /// Extra system-prompt text appended when the session starts.
+    /// Extra system-prompt text appended when the session starts. Skills,
+    /// workspace instructions, and similar context are expected to arrive
+    /// through this hook as ordinary prompt fragments — the core treats all
+    /// of them alike, and `/context` shows each fragment attributed to its
+    /// plugin.
     fn system_prompt(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Tools offered to the model on every turn. Declaring a tool here also
+    /// makes this plugin the executor of its calls via [`Plugin::run_tool`].
+    fn tools(&self) -> &'static [ToolSpec] {
+        &[]
+    }
+
+    /// Execute one call of a tool this plugin declared via [`Plugin::tools`].
+    /// `Ok` output becomes the tool message content; `Err` reaches both the
+    /// model (as `error: …` content) and the transcript (as a failure line).
+    fn run_tool(&self, _call: &ToolCall) -> Result<String, PluginError> {
+        Err(PluginError::new(
+            "this plugin declares no tool executor",
+        ))
     }
 
     /// Protocol kinds contributed to the provider registry. A custom
@@ -97,6 +119,8 @@ pub enum PluginEffect {
     Notice(String),
     /// Append an error cell to the transcript.
     Error(String),
+    /// Append a titled report block to the transcript (`/context`).
+    Report(ReportBlock),
     /// Drop the transcript and the core conversation.
     ClearConversation,
     /// Exit the application.
@@ -105,6 +129,56 @@ pub enum PluginEffect {
     SetComposer(String),
     /// Submit a new user turn, if the agent is idle.
     SubmitUserTurn(String),
+}
+
+/// A plugin-authored report (e.g. `/context`): a bold title over titled
+/// groups, whose entries carry an optional highlighted label and dim text —
+/// the shape mirrors the loaded-context panels of reference TUIs. Pure data:
+/// the front-end decides the actual styling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportBlock {
+    pub title: String,
+    pub groups: Vec<ReportGroup>,
+}
+
+/// One titled group of a [`ReportBlock`], rendered as a bold section marker
+/// over its entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportGroup {
+    pub heading: String,
+    pub entries: Vec<ReportEntry>,
+}
+
+/// One entry of a [`ReportGroup`]: an optional highlighted label followed by
+/// the dim entry text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportEntry {
+    /// Highlighted before the text (`model`, `base`); empty for label-less
+    /// entries.
+    pub label: String,
+    /// Entry body; may span multiple lines.
+    pub text: String,
+}
+
+impl ReportEntry {
+    pub fn new(label: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            text: text.into(),
+        }
+    }
+}
+
+/// Per-request wire facts for `/context`-style displays: where the request
+/// goes and which static fields ride along.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestFacts<'a> {
+    pub protocol: &'a str,
+    pub base_url: &'a str,
+    /// The full chat-completions endpoint (`base_url` + `/chat/completions`).
+    pub endpoint: &'a str,
+    /// The instance's `body_overrides` as compact `key=value` strings.
+    pub overrides: &'a [(String, String)],
 }
 
 /// Read-only information passed to every hook and command handler.
@@ -122,6 +196,19 @@ pub struct PluginInfo<'a> {
     pub total_input: u64,
     pub total_output: u64,
     pub plugin_ids: &'a [&'static str],
+    /// The assembled system prompt as labeled sections: `base` first, then
+    /// one `plugin:<id>` entry per non-empty fragment.
+    pub system_sections: &'a [(String, String)],
+    /// The reasoning effort sent with each turn (`/effort`); `None` sends no
+    /// effort field at all.
+    pub effort: Option<&'a str>,
+    /// Where requests go and which static fields ride along.
+    pub request: RequestFacts<'a>,
+    /// Tools the plugins declared, in registration order.
+    pub tools: &'a [ToolSpec],
+    /// Approximate message count of the active session's conversation: the
+    /// system prompt plus one entry per user/assistant/tool transcript cell.
+    pub message_count: usize,
 }
 
 /// Mutable context handed to a plugin while it runs.
@@ -184,6 +271,31 @@ impl<'a> PluginContext<'a> {
         self.info.plugin_ids
     }
 
+    /// The assembled system prompt as labeled sections.
+    pub fn system_sections(&self) -> &[(String, String)] {
+        self.info.system_sections
+    }
+
+    /// The reasoning effort sent with each turn; `None` sends no field.
+    pub fn effort(&self) -> Option<&str> {
+        self.info.effort
+    }
+
+    /// Where requests go and which static fields ride along.
+    pub fn request(&self) -> RequestFacts<'_> {
+        self.info.request
+    }
+
+    /// Tools the plugins declared, in registration order.
+    pub fn tools(&self) -> &[ToolSpec] {
+        self.info.tools
+    }
+
+    /// Approximate message count of the active session's conversation.
+    pub fn message_count(&self) -> usize {
+        self.info.message_count
+    }
+
     pub fn effects(&self) -> &[PluginEffect] {
         &self.effects
     }
@@ -194,6 +306,10 @@ impl<'a> PluginContext<'a> {
 
     pub fn error(&mut self, text: impl Into<String>) {
         self.effects.push(PluginEffect::Error(text.into()));
+    }
+
+    pub fn report(&mut self, block: ReportBlock) {
+        self.effects.push(PluginEffect::Report(block));
     }
 
     pub fn clear_conversation(&mut self) {
@@ -244,6 +360,8 @@ pub enum PluginHostError {
     EmptyPluginId,
     #[error("plugin id `{id}` is registered more than once")]
     DuplicatePluginId { id: &'static str },
+    #[error("tool `{name}` is declared more than once")]
+    DuplicateTool { name: &'static str },
     #[error(transparent)]
     CommandTable(#[from] CommandTableError),
 }
@@ -253,6 +371,8 @@ pub struct PluginHost {
     plugins: &'static [&'static dyn Plugin],
     table: CommandTable,
     ids: Vec<&'static str>,
+    /// Declared tool names paired with the plugin that owns each one.
+    tools: Vec<(&'static str, &'static dyn Plugin)>,
 }
 
 impl PluginHost {
@@ -286,10 +406,25 @@ impl PluginHost {
             .flat_map(|plugin| plugin.commands())
             .chain(extra.iter().flat_map(|slice| slice.iter()));
         let table = CommandTable::new(specs)?;
+
+        // Tool declarations get the same duplicate treatment as ids and
+        // command names: two plugins answering the same tool name would make
+        // execution ambiguous.
+        let mut tools = Vec::new();
+        for plugin in plugins {
+            for spec in plugin.tools() {
+                if tools.iter().any(|(name, _)| *name == spec.name) {
+                    return Err(PluginHostError::DuplicateTool { name: spec.name });
+                }
+                tools.push((spec.name, *plugin));
+            }
+        }
+
         Ok(Self {
             plugins,
             table,
             ids,
+            tools,
         })
     }
 
@@ -345,6 +480,44 @@ impl PluginHost {
             prompt.push_str(fragment.trim());
         }
         prompt
+    }
+
+    /// The system prompt as labeled sections — the base prompt first, then
+    /// every non-empty plugin fragment attributed to its plugin. The same
+    /// assembly rules as [`PluginHost::system_prompt`], exposed for
+    /// `/context`-style displays.
+    pub fn system_prompt_sections(&self, base: &str) -> Vec<(String, String)> {
+        let mut sections = Vec::new();
+        if !base.trim_end().is_empty() {
+            sections.push((String::from("base"), base.trim_end().to_string()));
+        }
+        for plugin in self.plugins {
+            if let Some(fragment) = plugin
+                .system_prompt()
+                .filter(|fragment| !fragment.trim().is_empty())
+            {
+                sections.push((
+                    format!("plugin:{}", plugin.id()),
+                    fragment.trim().to_string(),
+                ));
+            }
+        }
+        sections
+    }
+
+    /// Every tool the plugins declared, in registration order.
+    pub fn tools(&self) -> Vec<ToolSpec> {
+        self.plugins
+            .iter()
+            .flat_map(|plugin| plugin.tools().iter().copied())
+            .collect()
+    }
+
+    fn tool_owner(&self, name: &str) -> Option<&'static dyn Plugin> {
+        self.tools
+            .iter()
+            .find(|(tool, _)| *tool == name)
+            .map(|(_, plugin)| *plugin)
     }
 
     pub fn parse(&self, input: &str) -> CommandInput {
@@ -416,6 +589,17 @@ impl PluginHost {
     }
 }
 
+/// The host is what the agent worker talks to when a model asks for a tool:
+/// dispatch to the plugin that declared the tool, errors included.
+impl ToolExecutor for PluginHost {
+    fn execute(&self, call: &ToolCall) -> Result<String, String> {
+        let plugin = self
+            .tool_owner(&call.name)
+            .ok_or_else(|| format!("unknown tool `{}`", call.name))?;
+        plugin.run_tool(call).map_err(|error| error.to_string())
+    }
+}
+
 impl fmt::Debug for PluginHost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PluginHost")
@@ -440,6 +624,12 @@ mod tests {
         "echo text",
         ArgsPolicy::Required,
     );
+
+    static PING_TOOL: ToolSpec = ToolSpec {
+        name: "ping",
+        description: "reply with pong",
+        parameters_json: r#"{ "type": "object" }"#,
+    };
 
     struct Echo;
 
@@ -535,6 +725,7 @@ mod tests {
     }
 
     fn info(host: &PluginHost) -> PluginInfo<'_> {
+        static NO_TOOLS: [ToolSpec; 0] = [];
         PluginInfo {
             model: "test-model",
             mode: "fullscreen",
@@ -544,6 +735,16 @@ mod tests {
             total_input: 16_200,
             total_output: 2_400,
             plugin_ids: host.plugin_ids(),
+            system_sections: &[],
+            effort: None,
+            request: RequestFacts {
+                protocol: "",
+                base_url: "",
+                endpoint: "",
+                overrides: &[],
+            },
+            tools: &NO_TOOLS,
+            message_count: 1,
         }
     }
 
@@ -649,6 +850,98 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_tools_are_rejected() {
+        struct ToolerA;
+        struct ToolerB;
+
+        impl Plugin for ToolerA {
+            fn id(&self) -> &'static str {
+                "tooler-a"
+            }
+
+            fn tools(&self) -> &'static [ToolSpec] {
+                std::slice::from_ref(&PING_TOOL)
+            }
+        }
+        impl Plugin for ToolerB {
+            fn id(&self) -> &'static str {
+                "tooler-b"
+            }
+
+            fn tools(&self) -> &'static [ToolSpec] {
+                std::slice::from_ref(&PING_TOOL)
+            }
+        }
+
+        static TOOLER_A: ToolerA = ToolerA;
+        static TOOLER_B: ToolerB = ToolerB;
+        static TOOLERS: &[&dyn Plugin] = &[&TOOLER_A, &TOOLER_B];
+
+        assert!(matches!(
+            PluginHost::new(TOOLERS),
+            Err(PluginHostError::DuplicateTool { name: "ping" })
+        ));
+    }
+
+    struct Tooler;
+
+    impl Plugin for Tooler {
+        fn id(&self) -> &'static str {
+            "tooler"
+        }
+
+        fn tools(&self) -> &'static [ToolSpec] {
+            std::slice::from_ref(&PING_TOOL)
+        }
+
+        fn run_tool(&self, call: &ToolCall) -> Result<String, PluginError> {
+            Ok(format!("pong {}", call.arguments))
+        }
+    }
+
+    static TOOLER_PLUGIN: Tooler = Tooler;
+    static TOOLER_PLUGINS: &[&dyn Plugin] = &[&TOOLER_PLUGIN];
+
+    #[test]
+    fn executor_dispatches_to_the_declaring_plugin() {
+        let host = PluginHost::new(TOOLER_PLUGINS).expect("valid plugins");
+        assert_eq!(host.tools(), vec![PING_TOOL]);
+
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            name: "ping".to_string(),
+            arguments: "{}".to_string(),
+        };
+        assert_eq!(host.execute(&call), Ok("pong {}".to_string()));
+
+        let unknown = ToolCall {
+            name: "nope".to_string(),
+            ..call
+        };
+        assert_eq!(
+            host.execute(&unknown),
+            Err("unknown tool `nope`".to_string())
+        );
+    }
+
+    #[test]
+    fn system_prompt_sections_label_base_and_plugins() {
+        let host = PluginHost::new(PERSONA_PLUGINS).expect("valid plugins");
+        assert_eq!(
+            host.system_prompt_sections("base"),
+            vec![
+                ("base".to_string(), "base".to_string()),
+                ("plugin:persona".to_string(), "Be terse.".to_string()),
+            ]
+        );
+        // An empty base prompt contributes no section at all.
+        assert_eq!(
+            host.system_prompt_sections(""),
+            vec![("plugin:persona".to_string(), "Be terse.".to_string())]
+        );
+    }
+
+    #[test]
     fn builtin_host_exposes_the_core_commands() {
         let host = PluginHost::builtin().expect("builtin plugins");
         let names = host
@@ -660,8 +953,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "clear", "quit", "status", "new", "rename", "sessions", "model",
-                "effort", "thinking"
+                "help", "clear", "quit", "status", "context", "new", "rename", "sessions",
+                "model", "effort", "thinking"
             ]
         );
     }

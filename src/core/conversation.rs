@@ -46,7 +46,7 @@ impl Conversation {
     pub fn push_message(&mut self, message: Message) {
         match message.role {
             Role::System => {}
-            Role::User | Role::Assistant => self.messages.push(message),
+            Role::User | Role::Assistant | Role::Tool => self.messages.push(message),
         }
     }
 

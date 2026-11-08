@@ -73,9 +73,11 @@ use crate::core::NO_MODEL_GUIDANCE;
 use crate::core::NO_MODEL_SELECTED;
 use crate::core::Selection;
 use crate::core::SessionBootstrap;
+use crate::core::ToolSpec;
 use crate::core::context_percent;
 use crate::core::format_context_usage;
 use crate::core::format_tokens;
+use crate::core::openai_compat::endpoint_url;
 use crate::core::reasoning;
 use crate::core::rollout;
 use crate::core::rollout::LoadedSession;
@@ -109,7 +111,7 @@ const ALT_WHEEL_LINES: usize = 15;
 /// discovery enabled are refreshed in the background, best-effort: results
 /// arrive as transcript notices.
 pub async fn run(
-    plugins: PluginHost,
+    plugins: Arc<PluginHost>,
     pool: Arc<ModelPool>,
     selection: Option<Selection>,
     system_prompt: Option<String>,
@@ -122,6 +124,7 @@ pub async fn run(
 
     let base_prompt = system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
     let system_prompt = plugins.system_prompt(&base_prompt);
+    let system_sections = plugins.system_prompt_sections(&base_prompt);
 
     // The workspace's saved sessions are always loaded so `/sessions` shows
     // the same list no matter how codest was started. Plain startup opens a
@@ -150,6 +153,8 @@ pub async fn run(
             rollout_dir: Some(sessions_dir),
             loaded: loaded.clone(),
             fresh,
+            tools: plugins.tools(),
+            executor: Some(plugins.clone()),
         },
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -168,6 +173,7 @@ pub async fn run(
         model_label,
         mode,
         plugins,
+        system_sections,
         views,
         active_view,
     );
@@ -366,7 +372,7 @@ fn inline_pane_height(rows: u16, composer_rows: usize, has_live: bool, menu_rows
 
 struct App {
     session: AgentSession,
-    plugins: PluginHost,
+    plugins: Arc<PluginHost>,
     /// The multi-provider registry behind `/model` and background discovery.
     pool: Arc<ModelPool>,
     /// Notices from background tasks (models discovery). The sender half is
@@ -399,6 +405,14 @@ struct App {
     /// effort field at all. Updated optimistically, confirmed by
     /// `ReasoningEffortSwitched`.
     effort: Option<String>,
+    /// The effective system prompt as labeled sections (`base` +
+    /// `plugin:<id>`), kept in registration order for the `/context` report.
+    system_sections: Vec<(String, String)>,
+    /// Per-request wire facts (protocol, endpoint, `body_overrides`) derived
+    /// from the active route; refreshed on every model switch.
+    request_facts: RequestFacts,
+    /// Tools the plugins declared; static for the whole run.
+    tools: Vec<ToolSpec>,
     /// Whether thinking output renders expanded. Global across sessions;
     /// `/thinking` toggles it, and committed Thinking cells re-fold with it.
     show_thinking: bool,
@@ -447,6 +461,29 @@ struct EffortMenuItem {
     current: bool,
 }
 
+/// Per-request wire facts for `/context`, derived from the active route's
+/// provider instance. An empty route (nothing configured) yields empty
+/// strings everywhere.
+#[derive(Debug, Clone, Default)]
+struct RequestFacts {
+    protocol: String,
+    base_url: String,
+    endpoint: String,
+    /// The instance's `body_overrides` as compact `key=value` strings, values
+    /// truncated for display.
+    overrides: Vec<(String, String)>,
+}
+
+/// One-line display form of a `body_overrides` JSON value (`0.2`,
+/// `"high"`, `{"a":1}`), truncated to keep the report narrow.
+fn compact_value(value: &serde_json::Value) -> String {
+    let text = match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    crate::tui::session::truncated(&text, 120)
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -456,7 +493,8 @@ impl App {
         notices: tokio::sync::mpsc::UnboundedReceiver<String>,
         model_label: String,
         mode: TuiMode,
-        plugins: PluginHost,
+        plugins: Arc<PluginHost>,
+        system_sections: Vec<(String, String)>,
         views: Vec<SessionView>,
         active_view: usize,
     ) -> Self {
@@ -473,7 +511,8 @@ impl App {
             .and_then(|route| pool.model_info(route))
             .and_then(|model| model.default_level);
 
-        Self {
+        let tools = plugins.tools();
+        let mut app = Self {
             session,
             plugins,
             pool,
@@ -489,6 +528,9 @@ impl App {
             model_menu: None,
             effort_menu: None,
             effort,
+            system_sections,
+            request_facts: RequestFacts::default(),
+            tools,
             show_thinking: true,
             composer: Composer::new(),
             command_selection: 0,
@@ -504,7 +546,37 @@ impl App {
             inline_height,
             inline_rows,
             inline_columns,
-        }
+        };
+        app.refresh_request_facts();
+        app
+    }
+
+    /// Re-derive [`RequestFacts`] from the active route's provider instance.
+    /// Called at startup and on every model switch, optimistic or confirmed.
+    fn refresh_request_facts(&mut self) {
+        self.request_facts = match self
+            .route
+            .as_ref()
+            .and_then(|route| self.pool.registry().instance(&route.provider))
+        {
+            Some(instance) => RequestFacts {
+                protocol: instance.protocol_id().to_string(),
+                base_url: instance.base_url.clone().unwrap_or_default(),
+                endpoint: instance
+                    .base_url
+                    .as_deref()
+                    .map(endpoint_url)
+                    .unwrap_or_default(),
+                overrides: instance
+                    .body_overrides
+                    .iter()
+                    .map(|(key, value)| {
+                        (key.clone(), compact_value(value))
+                    })
+                    .collect(),
+            },
+            None => RequestFacts::default(),
+        };
     }
 
     /// The view of the session being edited; only the active session is ever
@@ -1203,6 +1275,7 @@ impl App {
         }
         self.model_label = selection.to_string();
         self.route = Some(item.selection.clone());
+        self.refresh_request_facts();
         let view = self.view_mut();
         view.history
             .push(HistoryCell::Notice(format!("switched to {selection}")));
@@ -1437,6 +1510,28 @@ impl App {
             total_input: view.total_input,
             total_output: view.total_output,
             plugin_ids: self.plugins.plugin_ids(),
+            system_sections: &self.system_sections,
+            effort: self.effort.as_deref(),
+            request: crate::plugins::RequestFacts {
+                protocol: &self.request_facts.protocol,
+                base_url: &self.request_facts.base_url,
+                endpoint: &self.request_facts.endpoint,
+                overrides: &self.request_facts.overrides,
+            },
+            tools: &self.tools,
+            message_count: 1
+                + view
+                    .history
+                    .iter()
+                    .filter(|cell| {
+                        matches!(
+                            cell,
+                            HistoryCell::User(_)
+                                | HistoryCell::Assistant(_)
+                                | HistoryCell::ToolCall { .. }
+                        )
+                    })
+                    .count(),
         }
     }
 
@@ -1450,6 +1545,9 @@ impl App {
                 }
                 PluginEffect::Error(text) => {
                     self.view_mut().history.push(HistoryCell::Error(text));
+                }
+                PluginEffect::Report(block) => {
+                    self.view_mut().history.push(HistoryCell::Report(block));
                 }
                 PluginEffect::ClearConversation => {
                     self.clear_transcript();
@@ -1537,6 +1635,7 @@ impl App {
                 // non-TUI front-ends).
                 self.route = Selection::parse(&model).ok();
                 self.model_label = model;
+                self.refresh_request_facts();
             }
             EventMsg::ReasoningEffortSwitched { effort } => {
                 // `/effort` already updated optimistically; the core confirms
@@ -1545,6 +1644,23 @@ impl App {
             }
             EventMsg::AgentMessage { message } => {
                 self.view_mut().live = Some(message);
+            }
+            EventMsg::AgentToolCall {
+                name,
+                arguments,
+                result,
+                error,
+            } => {
+                // Any text streamed before the calls is complete by now:
+                // commit it so the tool activity renders below it, then show
+                // the call. The next round's deltas start a fresh live buffer.
+                self.finalize_live();
+                self.view_mut().history.push(HistoryCell::ToolCall {
+                    name,
+                    arguments,
+                    result,
+                    error,
+                });
             }
             EventMsg::TurnAborted { .. } => {
                 self.finalize_live();
@@ -2414,7 +2530,8 @@ mod tests {
             notice_rx,
             "test/one".to_string(),
             TuiMode::Fullscreen,
-            PluginHost::builtin().expect("builtin plugins"),
+            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
         )
@@ -2455,7 +2572,8 @@ mod tests {
             notice_rx,
             "openai/m1".to_string(),
             TuiMode::Fullscreen,
-            PluginHost::builtin().expect("builtin plugins"),
+            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Vec::new(),
             vec![SessionView::initial("openai/m1", TuiMode::Fullscreen)],
             0,
         )
@@ -2499,7 +2617,8 @@ mod tests {
             notice_rx,
             "test/one".to_string(),
             TuiMode::Fullscreen,
-            PluginHost::builtin().expect("builtin plugins"),
+            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
         )
@@ -2542,7 +2661,8 @@ mod tests {
             notice_rx,
             "test/one".to_string(),
             TuiMode::Fullscreen,
-            PluginHost::builtin().expect("builtin plugins"),
+            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
         )
@@ -2606,7 +2726,8 @@ mod tests {
             notice_rx,
             "no model".to_string(),
             TuiMode::Fullscreen,
-            PluginHost::builtin().expect("builtin plugins"),
+            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Vec::new(),
             vec![SessionView::initial("no model", TuiMode::Fullscreen)],
             0,
         )
@@ -2632,7 +2753,8 @@ mod tests {
             notice_rx,
             "no model".to_string(),
             TuiMode::Fullscreen,
-            PluginHost::builtin().expect("builtin plugins"),
+            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Vec::new(),
             vec![SessionView::initial("no model", TuiMode::Fullscreen)],
             0,
         )
@@ -2798,7 +2920,7 @@ mod tests {
         // Wide enough that the alias hints are not clipped.
         let lines = render_lines(&mut app, 110, 20);
         let rendered = lines.join("\n");
-        // Twelve names (eight commands plus four aliases) share a six-row
+        // Fifteen names (eleven commands plus four aliases) share a six-row
         // window; the first page shows /help with its aliases and the first
         // commands, aliases labeled with the command they point at.
         assert!(rendered.contains("▸ /help"), "{rendered}");
@@ -2821,7 +2943,7 @@ mod tests {
 
         // Moving the selection pages the window onto the tail; the longest
         // command name still gets a separating space before its summary.
-        for _ in 0..10 {
+        for _ in 0..11 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let lines = render_lines(&mut app, 110, 20);
@@ -3526,8 +3648,8 @@ mod tests {
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            14,
-            "ten commands plus four aliases"
+            15,
+            "eleven commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -3574,9 +3696,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 13);
+        assert_eq!(app.command_selection, 14);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 12);
+        assert_eq!(app.command_selection, 13);
     }
 
     #[tokio::test]

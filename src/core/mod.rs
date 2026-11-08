@@ -32,6 +32,7 @@ pub mod session;
 pub mod sessions;
 pub mod sse;
 pub mod tokens;
+pub mod tools;
 
 pub use commands::{
     ArgsPolicy, CommandCandidate, CommandError, CommandInput, CommandSpec, CommandTable,
@@ -53,3 +54,4 @@ pub use rollout::{LoadedSession, RolloutItem, RolloutWriter, SessionMeta};
 pub use session::{AgentSession, SessionBootstrap};
 pub use sessions::SESSION_COMMANDS;
 pub use tokens::{context_percent, format_context_usage, format_tokens};
+pub use tools::{MAX_TOOL_ROUNDS, ToolCall, ToolExecutor, ToolSpec};

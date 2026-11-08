@@ -71,7 +71,7 @@ pub async fn run(program: &'static str) -> anyhow::Result<()> {
     let matches = command.get_matches();
     let args = Args::from_arg_matches(&matches)?;
 
-    let plugins = PluginHost::builtin()?;
+    let plugins = std::sync::Arc::new(PluginHost::builtin()?);
     let global = config::load_global(&config::config_path())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let pool = build_pool(&plugins, &global, &args)?;

@@ -13,6 +13,7 @@
 //!
 //! This module deliberately knows nothing about terminals or conversations.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -28,6 +29,8 @@ use crate::core::model::StreamItem;
 use crate::core::model::TurnOptions;
 use crate::core::protocol::Message;
 use crate::core::sse::SseDecoder;
+use crate::core::tools::ToolCall;
+use crate::core::tools::ToolSpec;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
@@ -79,39 +82,91 @@ impl OpenAiCompatClient {
 
     /// Accepts either a base URL (`https://host/v1`) or the full endpoint.
     fn endpoint(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/chat/completions") {
-            base.to_string()
-        } else {
-            format!("{base}/chat/completions")
-        }
+        endpoint_url(&self.base_url)
     }
 
     /// The request body: the standard fields with `body_overrides` merged on
-    /// top (overrides win), and a per-turn `reasoning_effort` merged last so
-    /// an interactive `/effort` beats a static override for that one field.
-    fn request_body(&self, messages: &[Message], effort: Option<&str>) -> Value {
+    /// top (overrides win), per-turn `tools` included when the plugins
+    /// declared any, and a per-turn `reasoning_effort` merged last so an
+    /// interactive `/effort` beats a static override for that one field.
+    fn request_body(&self, messages: &[Message], options: &TurnOptions) -> Value {
         let mut body = json!({
             "model": self.model,
             "stream": true,
-            "messages": messages.iter().map(|message| {
-                json!({
-                    "role": message.role.as_str(),
-                    "content": message.content,
-                })
-            }).collect::<Vec<_>>(),
+            "messages": messages.iter().map(message_json).collect::<Vec<_>>(),
         });
         let object = body
             .as_object_mut()
             .expect("the standard request body is an object");
+        if !options.tools.is_empty() {
+            object.insert(
+                "tools".to_string(),
+                Value::Array(
+                    options
+                        .tools
+                        .iter()
+                        .map(ToolSpec::function_json)
+                        .collect(),
+                ),
+            );
+        }
         for (key, value) in &self.body_overrides {
             object.insert(key.clone(), value.clone());
         }
-        if let Some(effort) = effort {
+        if let Some(effort) = &options.effort {
             object.insert("reasoning_effort".to_string(), json!(effort));
         }
         body
     }
+}
+
+/// The full chat-completions endpoint for a configured `base_url`: accepts
+/// either a base URL (`https://host/v1`) or a URL that already is the
+/// endpoint. Shared with `/context`'s request display so both show exactly
+/// where requests go.
+pub fn endpoint_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
+/// One conversation message on the wire: role and content, plus the
+/// tool-calling fields when present.
+fn message_json(message: &Message) -> Value {
+    let mut object = json!({
+        "role": message.role.as_str(),
+        "content": message.content,
+    });
+    let map = object
+        .as_object_mut()
+        .expect("the message envelope is an object");
+    if let Some(calls) = &message.tool_calls {
+        map.insert(
+            "tool_calls".to_string(),
+            Value::Array(
+                calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments,
+                            },
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(id) = &message.tool_call_id {
+        map.insert("tool_call_id".to_string(), json!(id));
+    }
+    object
 }
 
 impl ModelClient for OpenAiCompatClient {
@@ -138,7 +193,7 @@ impl ModelClient for OpenAiCompatClient {
 
         let url = self.endpoint();
         let api_key = self.api_key.clone();
-        let body = self.request_body(&messages, options.effort.as_deref());
+        let body = self.request_body(&messages, &options);
         let http = self.http.clone();
         let headers = self.headers.clone();
 
@@ -159,6 +214,7 @@ impl ModelClient for OpenAiCompatClient {
             if status.is_success() {
                 let mut bytes = response.bytes_stream();
                 let mut decoder = SseDecoder::default();
+                let mut tool_calls = ToolCallAccumulator::default();
 
                 loop {
                     let next = tokio::select! {
@@ -171,9 +227,14 @@ impl ModelClient for OpenAiCompatClient {
                         Some(Err(error)) => Err(ModelError::network(error))?,
                         Some(Ok(chunk)) => {
                             for frame in decoder.feed(&chunk) {
-                                match parse_sse_frame(&frame)? {
+                                match parse_sse_frame(&frame, &mut tool_calls)? {
                                     Parsed::Delta(item) => yield item,
-                                    Parsed::Done => return,
+                                    Parsed::Done => {
+                                        if let Some(calls) = tool_calls.finish() {
+                                            yield StreamItem::ToolCalls(calls);
+                                        }
+                                        return;
+                                    }
                                     Parsed::Ignore => {}
                                 }
                             }
@@ -184,11 +245,18 @@ impl ModelClient for OpenAiCompatClient {
                 // A well-behaved server ends with a blank line, but tolerate a
                 // final frame that doesn't.
                 if let Some(frame) = decoder.finish() {
-                    match parse_sse_frame(&frame)? {
+                    match parse_sse_frame(&frame, &mut tool_calls)? {
                         Parsed::Delta(item) => yield item,
                         Parsed::Done => {}
                         Parsed::Ignore => {}
                     }
+                }
+
+                // Tool calls are only complete once the stream is: flush what
+                // the accumulator reassembled even without an explicit
+                // `[DONE]` frame.
+                if let Some(calls) = tool_calls.finish() {
+                    yield StreamItem::ToolCalls(calls);
                 }
             } else {
                 let body = response.text().await.unwrap_or_default();
@@ -216,7 +284,88 @@ enum Parsed {
     Ignore,
 }
 
-fn parse_sse_frame(frame: &crate::core::sse::SseFrame) -> Result<Parsed, ModelError> {
+/// Reassembles streamed `delta.tool_calls` fragments into complete calls.
+/// OpenAI-compatible providers stream one entry per call index per chunk,
+/// each carrying (across successive chunks) the call's `id`, its function
+/// `name`, and successive text fragments of `function.arguments`.
+#[derive(Debug, Default)]
+pub struct ToolCallAccumulator {
+    parts: BTreeMap<u64, PartialToolCall>,
+}
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCallAccumulator {
+    /// Feed one frame's `delta` object; frames without `tool_calls` are
+    /// ignored.
+    pub fn feed(&mut self, delta: Option<&Value>) {
+        let Some(calls) = delta
+            .and_then(|delta| delta.get("tool_calls"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for call in calls {
+            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let part = self.parts.entry(index).or_default();
+            if let Some(id) = call.get("id").and_then(Value::as_str)
+                && !id.is_empty()
+            {
+                part.id = id.to_string();
+            }
+            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                && !name.is_empty()
+            {
+                part.name = name.to_string();
+            }
+            if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                part.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    /// Drain the reassembled calls in index order; `None` when the stream
+    /// asked for no tools. A call the provider never named gets a fallback
+    /// id; one with no streamed arguments gets `{}`.
+    pub fn finish(&mut self) -> Option<Vec<ToolCall>> {
+        if self.parts.is_empty() {
+            return None;
+        }
+        let parts = std::mem::take(&mut self.parts);
+        let calls = parts
+            .into_iter()
+            .filter(|(_, part)| !part.name.is_empty())
+            .map(|(index, part)| ToolCall {
+                id: if part.id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    part.id
+                },
+                name: part.name,
+                arguments: if part.arguments.is_empty() {
+                    "{}".to_string()
+                } else {
+                    part.arguments
+                },
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            None
+        } else {
+            Some(calls)
+        }
+    }
+}
+
+fn parse_sse_frame(
+    frame: &crate::core::sse::SseFrame,
+    tool_calls: &mut ToolCallAccumulator,
+) -> Result<Parsed, ModelError> {
     let data = frame.data.trim();
     if data.is_empty() {
         return Ok(Parsed::Ignore);
@@ -240,7 +389,8 @@ fn parse_sse_frame(frame: &crate::core::sse::SseFrame) -> Result<Parsed, ModelEr
         return Ok(Parsed::Delta(usage));
     }
 
-    let delta = &value.pointer("/choices/0/delta");
+    let delta = value.pointer("/choices/0/delta");
+    tool_calls.feed(delta);
     let content = delta
         .and_then(|delta| delta.get("content"))
         .and_then(Value::as_str)
@@ -311,7 +461,7 @@ mod tests {
         let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m")
             .unwrap()
             .with_body_overrides(overrides);
-        let body = client.request_body(&[Message::user("hi")], None);
+        let body = client.request_body(&[Message::user("hi")], &TurnOptions::default());
 
         assert_eq!(body["model"], "override");
         assert_eq!(body["temperature"], 0.5);
@@ -322,21 +472,69 @@ mod tests {
     #[test]
     fn effort_is_sent_last_and_only_when_set() {
         let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+        let options = |effort: Option<&str>| TurnOptions {
+            effort: effort.map(str::to_string),
+            tools: Vec::new(),
+        };
 
         // No effort: the field is absent entirely, not null.
-        let body = client.request_body(&[Message::user("hi")], None);
+        let body = client.request_body(&[Message::user("hi")], &options(None));
         assert!(body.get("reasoning_effort").is_none());
 
         // Some effort: sent as the OpenAI-standard top-level field…
-        let body = client.request_body(&[Message::user("hi")], Some("high"));
+        let body = client.request_body(&[Message::user("hi")], &options(Some("high")));
         assert_eq!(body["reasoning_effort"], "high");
 
         // …and a per-turn effort beats a static `body_overrides` value.
         let mut overrides = serde_json::Map::new();
         overrides.insert("reasoning_effort".to_string(), json!("low"));
         let client = client.with_body_overrides(overrides);
-        let body = client.request_body(&[Message::user("hi")], Some("high"));
+        let body = client.request_body(&[Message::user("hi")], &options(Some("high")));
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn tools_are_sent_as_function_schemas_only_when_declared() {
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+
+        let body = client.request_body(&[Message::user("hi")], &TurnOptions::default());
+        assert!(body.get("tools").is_none());
+
+        let options = TurnOptions {
+            effort: None,
+            tools: vec![crate::core::tools::ToolSpec {
+                name: "ping",
+                description: "reply with pong",
+                parameters_json: r#"{ "type": "object" }"#,
+            }],
+        };
+        let body = client.request_body(&[Message::user("hi")], &options);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "ping");
+        assert_eq!(body["tools"][0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn tool_messages_serialize_with_call_references() {
+        let call = crate::core::tools::ToolCall {
+            id: "call_1".to_string(),
+            name: "ping".to_string(),
+            arguments: r#"{ "n": 2 }"#.to_string(),
+        };
+        let assistant = Message::assistant_tool_calls(vec![call.clone()]);
+        let result = Message::tool_result("call_1", "pong");
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+        let body = client.request_body(&[assistant, result], &TurnOptions::default());
+
+        assert_eq!(body["messages"][0]["role"], "assistant");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["type"], "function");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["name"], "ping");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["arguments"], r#"{ "n": 2 }"#);
+
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
+        assert_eq!(body["messages"][1]["content"], "pong");
     }
 
     #[test]
@@ -345,22 +543,36 @@ mod tests {
             event: None,
             data: data.to_string(),
         };
-        let parsed = parse_sse_frame(&frame(r#"{"choices":[{"delta":{"content":"hello"}}]}"#))
-            .unwrap();
+        let parsed = parse_sse_frame(
+            &frame(r#"{"choices":[{"delta":{"content":"hello"}}]}"#),
+            &mut ToolCallAccumulator::default(),
+        )
+        .unwrap();
         assert_eq!(
             parsed,
             Parsed::Delta(StreamItem::Delta("hello".to_string()))
         );
 
-        assert_eq!(parse_sse_frame(&frame("")).unwrap(), Parsed::Ignore);
-        assert_eq!(parse_sse_frame(&frame("[DONE]")).unwrap(), Parsed::Done);
+        assert_eq!(
+            parse_sse_frame(&frame(""), &mut ToolCallAccumulator::default()).unwrap(),
+            Parsed::Ignore
+        );
+        assert_eq!(
+            parse_sse_frame(&frame("[DONE]"), &mut ToolCallAccumulator::default()).unwrap(),
+            Parsed::Done
+        );
 
-        let error = parse_sse_frame(&frame(r#"{"error":{"message":"bad key"}}"#)).unwrap_err();
+        let error = parse_sse_frame(
+            &frame(r#"{"error":{"message":"bad key"}}"#),
+            &mut ToolCallAccumulator::default(),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("bad key"));
 
-        let parsed = parse_sse_frame(&frame(
-            r#"{"choices":[{"delta":{"reasoning_content":"thinking…"}}]}"#,
-        ))
+        let parsed = parse_sse_frame(
+            &frame(r#"{"choices":[{"delta":{"reasoning_content":"thinking…"}}]}"#),
+            &mut ToolCallAccumulator::default(),
+        )
         .unwrap();
         assert_eq!(
             parsed,
@@ -368,7 +580,11 @@ mod tests {
         );
 
         // A delta with neither content nor reasoning is ignored.
-        let parsed = parse_sse_frame(&frame(r#"{"choices":[{"delta":{}}]}"#)).unwrap();
+        let parsed = parse_sse_frame(
+            &frame(r#"{"choices":[{"delta":{}}]}"#),
+            &mut ToolCallAccumulator::default(),
+        )
+        .unwrap();
         assert_eq!(parsed, Parsed::Ignore);
     }
 
@@ -378,21 +594,71 @@ mod tests {
             event: None,
             data: data.to_string(),
         };
-        let parsed = parse_sse_frame(&frame(
-            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#,
-        ))
+        let parsed = parse_sse_frame(
+            &frame(r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4}}"#),
+            &mut ToolCallAccumulator::default(),
+        )
         .unwrap();
         assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 10, output: 4 }));
 
-        let parsed = parse_sse_frame(&frame(
-            r#"{"usage":{"input_tokens":7,"output_tokens":2}}"#,
-        ))
+        let parsed = parse_sse_frame(
+            &frame(r#"{"usage":{"input_tokens":7,"output_tokens":2}}"#),
+            &mut ToolCallAccumulator::default(),
+        )
         .unwrap();
         assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 7, output: 2 }));
 
         // No usage pair at all: ignored, not an error.
-        let parsed = parse_sse_frame(&frame(r#"{"usage":{}}"#)).unwrap();
+        let parsed = parse_sse_frame(
+            &frame(r#"{"usage":{}}"#),
+            &mut ToolCallAccumulator::default(),
+        )
+        .unwrap();
         assert_eq!(parsed, Parsed::Ignore);
+    }
+
+    #[test]
+    fn accumulator_reassembles_fragmented_and_parallel_tool_calls() {
+        let frame = |data: &str| crate::core::sse::SseFrame {
+            event: None,
+            data: data.to_string(),
+        };
+        let feed = |accumulator: &mut ToolCallAccumulator, data: &str| {
+            parse_sse_frame(&frame(data), accumulator).unwrap()
+        };
+
+        let mut accumulator = ToolCallAccumulator::default();
+        // Two calls streamed side by side; the second one's arguments arrive
+        // in fragments, and its id/name repeat on later chunks.
+        feed(
+            &mut accumulator,
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"index":0,"id":"call_a","type":"function","function":{"name":"ping","arguments":""}},
+                {"index":1,"id":"call_b","type":"function","function":{"name":"echo","arguments":"{\"x\":"}}
+            ]}}]}"#,
+        );
+        feed(
+            &mut accumulator,
+            r#"{"choices":[{"delta":{"tool_calls":[
+                {"index":1,"function":{"arguments":"1}"}}
+            ]}}]}"#,
+        );
+        assert_eq!(
+            feed(&mut accumulator, r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+            Parsed::Ignore
+        );
+
+        let calls = accumulator.finish().expect("two complete calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "ping");
+        assert_eq!(calls[0].arguments, "{}");
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].name, "echo");
+        assert_eq!(calls[1].arguments, r#"{"x":1}"#);
+
+        // Draining twice is safe: the second flush is empty.
+        assert_eq!(accumulator.finish(), None);
     }
 
     #[tokio::test]
