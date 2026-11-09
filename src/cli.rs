@@ -9,11 +9,13 @@
 //! For local end-to-end testing, run `scripts/openai_test_server.py` and
 //! point an instance's `base_url` at it.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::Parser;
+use clap::Subcommand;
 
 use crate::core::config;
 use crate::core::providers::ModelPool;
@@ -21,12 +23,16 @@ use crate::core::providers::ProviderRegistry;
 use crate::core::providers::RegistryError;
 use crate::core::providers::Selection;
 use crate::plugins::PluginHost;
+use crate::plugins::install;
 use crate::tui::RestoreMode;
 use crate::tui::TuiMode;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "A minimal TUI chat agent distilled from codex")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Model id sent to the backend (the `model` half of a selection).
     #[arg(long, env = "CST_MODEL")]
     model: Option<String>,
@@ -68,14 +74,127 @@ struct Args {
     tui_mode: TuiMode,
 }
 
+/// Subcommands. Without one, codest starts the TUI as usual.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Install, remove, list, and rebuild linked plugins.
+    ///
+    /// Linked plugins live in a generated crate under `~/.codest/`, so the
+    /// codest checkout is never modified.
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+// clap's derive builds each variant's fields in place, so boxing the payload
+// is not available here. The enum lives on the stack once at startup.
+#[allow(clippy::large_enum_variant)]
+enum PluginAction {
+    /// Add (or reinstall) a plugin and rebuild the plugin-linked binary.
+    Install {
+        /// A checkout path, a crates.io package name, or a git URL.
+        target: Option<String>,
+
+        /// Install the named package from this git repository.
+        #[arg(long, value_name = "URL")]
+        git: Option<String>,
+
+        /// Package name, when it cannot be inferred from the target.
+        #[arg(long, value_name = "NAME")]
+        package: Option<String>,
+
+        /// Pin a git revision.
+        #[arg(long, conflicts_with_all = ["branch", "tag"])]
+        rev: Option<String>,
+
+        /// Follow a git branch.
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Pin a git tag.
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Version requirement for a crates.io install (default `*`).
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Exported `static` to link; repeat for several (default `PLUGIN`,
+        /// or the plugin's `[package.metadata.codest] plugins`).
+        #[arg(long = "symbol", value_name = "NAME")]
+        symbols: Vec<String>,
+
+        /// Rust identifier for the plugin crate (default: package name with
+        /// `-` replaced by `_`).
+        #[arg(long = "crate-name", value_name = "NAME")]
+        crate_name: Option<String>,
+
+        /// The codest checkout to link against (default: this source tree,
+        /// recorded state, or `$CODEST_SRC`).
+        #[arg(long = "codest-src", value_name = "PATH")]
+        codest_src: Option<PathBuf>,
+
+        /// Only rewrite the plugin list and generated crate; do not build.
+        #[arg(long)]
+        no_build: bool,
+    },
+
+    /// Remove a plugin and rebuild the plugin-linked binary.
+    Uninstall {
+        /// Package name as listed by `codest plugin list`.
+        name: String,
+
+        /// Only rewrite the plugin list and generated crate; do not build.
+        #[arg(long)]
+        no_build: bool,
+    },
+
+    /// List installed plugins.
+    List,
+
+    /// Regenerate the wrapper from the saved list and build it.
+    Build {
+        /// Build with optimizations.
+        #[arg(long)]
+        release: bool,
+
+        /// `cargo install` the result instead of only building it.
+        #[arg(long)]
+        install: bool,
+
+        /// The codest checkout to link against.
+        #[arg(long = "codest-src", value_name = "PATH")]
+        codest_src: Option<PathBuf>,
+    },
+}
+
 /// Parse arguments and run the TUI.
 ///
 /// `program` is the invoked binary name (`codest` or its `cst` alias); it is
 /// used in clap's help and version output.
 pub async fn run(program: &'static str) -> anyhow::Result<()> {
+    run_with(program, &[]).await
+}
+
+/// [`run`] with externally-linked plugins injected into the registry.
+///
+/// A binary built by `codest plugin install` passes the `static` slice from
+/// its generated crate here; the shipped binary passes an empty one.
+pub async fn run_with(
+    program: &'static str,
+    local: &'static [&'static dyn crate::plugins::Plugin],
+) -> anyhow::Result<()> {
     let command = Args::command().name(program);
     let matches = command.get_matches();
     let args = Args::from_arg_matches(&matches)?;
+
+    // A subcommand is a one-shot operation: it must not touch the config
+    // files or the TUI, which would fail in a fresh terminal-less context.
+    if let Some(command) = args.command {
+        return run_command(command);
+    }
 
     let profiles = std::sync::Arc::new(
         config::load_profiles(&config::profiles_path())
@@ -89,7 +208,8 @@ pub async fn run(program: &'static str) -> anyhow::Result<()> {
         }
         profile.map(|profile| (name, profile))
     });
-    let plugins = std::sync::Arc::new(PluginHost::builtin_with_tools(
+    let plugins = std::sync::Arc::new(PluginHost::with_local(
+        local,
         active.and_then(|(_, profile)| profile.tools.as_deref()),
     )?);
     let global = config::load_global(&config::config_path())
@@ -123,6 +243,189 @@ pub async fn run(program: &'static str) -> anyhow::Result<()> {
         },
     )
     .await
+}
+
+/// Blocking entry point for generated wrapper binaries.
+///
+/// The generated crate has no `tokio`/`anyhow` dependency of its own, so this
+/// builds a runtime, runs [`run_with`], and reports a failure on stderr with a
+/// non-zero exit instead of unwinding.
+pub fn run_blocking(
+    program: &'static str,
+    local: &'static [&'static dyn crate::plugins::Plugin],
+) {
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("{program}: cannot start the async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = runtime.block_on(run_with(program, local)) {
+        eprintln!("{program}: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+/// Run one of the `codest plugin …` subcommands.
+fn run_command(command: Command) -> anyhow::Result<()> {
+    match command {
+        Command::Plugin { action } => run_plugin(action),
+    }
+}
+
+fn run_plugin(action: PluginAction) -> anyhow::Result<()> {
+    match action {
+        PluginAction::Install {
+            target,
+            git,
+            package,
+            rev,
+            branch,
+            tag,
+            version,
+            symbols,
+            crate_name,
+            codest_src,
+            no_build,
+        } => {
+            let request = install::InstallRequest {
+                target,
+                git,
+                package,
+                rev,
+                branch,
+                tag,
+                version,
+                symbols,
+                crate_name,
+                codest_src,
+            };
+            // Remembered before the request moves into the installer: a
+            // non-path source cannot be inspected up front, so a failure
+            // there gets one extra line of guidance.
+            let remote = request.git.is_some()
+                || request
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| !std::path::Path::new(target).exists());
+            let outcome = install::install(&request, !no_build).map_err(|error| {
+                if remote {
+                    anyhow::anyhow!(
+                        "{error}\n\n\
+                         note: a git or crates.io plugin must depend on `cst-plugin-api` \
+                         by version, not by a relative `path` — a checkout that only \
+                         works next to this repo cannot be built from a clone. \
+                         Install such a plugin with `codest plugin install <local path>` \
+                         instead."
+                    )
+                } else {
+                    anyhow::anyhow!("{error}")
+                }
+            })?;
+            let verb = if outcome.replaced { "replaced" } else { "installed" };
+            println!(
+                "{verb} {} ({})",
+                outcome.plugin.name,
+                source_label(&outcome.plugin)
+            );
+            println!("  list   {}", outcome.state_path.display());
+            println!("  crate  {}", outcome.crate_dir.display());
+            match &outcome.binary {
+                Some(binary) => {
+                    println!("  binary {}", binary.display());
+                    println!();
+                    println!("Run it, or `codest plugin build --install` to replace the");
+                    println!("installed command.");
+                }
+                None => println!("  (not built; run `codest plugin build`)"),
+            }
+            Ok(())
+        }
+        PluginAction::Uninstall { name, no_build } => {
+            let outcome =
+                install::uninstall(&name, !no_build).map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!("removed {} ({} plugin(s) left)", outcome.name, outcome.remaining);
+            match &outcome.binary {
+                Some(binary) => println!("  rebuilt {}", binary.display()),
+                None => println!("  (not rebuilt; run `codest plugin build`)"),
+            }
+            Ok(())
+        }
+        PluginAction::List => {
+            let state = install::list().map_err(|error| anyhow::anyhow!("{error}"))?;
+            if state.plugins.is_empty() {
+                println!("no plugins installed");
+                println!(
+                    "note: linked plugins are compile-time — absent ones are simply not in \
+                     this binary"
+                );
+                return Ok(());
+            }
+            for plugin in &state.plugins {
+                println!(
+                    "{}  {}  symbols: {}",
+                    plugin.name,
+                    source_label(plugin),
+                    plugin.symbols.join(", ")
+                );
+            }
+            if let Some(src) = &state.codest_src {
+                println!();
+                println!("linked against {src}");
+            }
+            Ok(())
+        }
+        PluginAction::Build {
+            release,
+            install,
+            codest_src,
+        } => {
+            if release && install {
+                // `cargo install` picks release on its own; asking for both
+                // would silently ignore the flag.
+                return Err(anyhow::anyhow!(
+                    "--release and --install are alternatives: `cargo install` \
+                     always builds optimized"
+                ));
+            }
+            let outcome = install::build(codest_src.as_deref(), release, install)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!("built {} ({})", outcome.crate_dir.display(), outcome.profile);
+            for binary in &outcome.binaries {
+                println!("  {}", binary.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn source_label(plugin: &install::InstalledPlugin) -> String {
+    match plugin.kind() {
+        install::SourceKind::Path => format!(
+            "path {}",
+            plugin.path.as_deref().unwrap_or_default()
+        ),
+        install::SourceKind::Git => {
+            let mut label = format!(
+                "git {}",
+                plugin.git.as_deref().unwrap_or_default()
+            );
+            for (key, value) in [
+                ("rev", &plugin.rev),
+                ("branch", &plugin.branch),
+                ("tag", &plugin.tag),
+            ] {
+                if let Some(value) = value {
+                    label.push_str(&format!(" ({key} {value})"));
+                }
+            }
+            label
+        }
+        install::SourceKind::Registry => {
+            format!("crates.io {}", plugin.version.as_deref().unwrap_or("*"))
+        }
+    }
 }
 
 /// The note for a `--profile` naming nothing: the run continues without a
@@ -532,5 +835,124 @@ mod tests {
             requires_api_key: false,
         };
         assert_eq!(pool_of(keyless).missing_credential_raw("local"), None);
+    }
+
+    #[test]
+    fn no_subcommand_still_parses_the_tui_flags() {
+        let parsed = args(&["--model", "m1", "--provider", "p"]);
+        assert!(parsed.command.is_none());
+        assert_eq!(parsed.model.as_deref(), Some("m1"));
+        assert_eq!(parsed.provider.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn plugin_install_parses_a_path_target() {
+        let parsed = args(&["plugin", "install", "../cst-provider-qoder"]);
+        let Some(Command::Plugin {
+            action:
+                PluginAction::Install {
+                    target,
+                    git,
+                    no_build,
+                    symbols,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected `plugin install`");
+        };
+        assert_eq!(target.as_deref(), Some("../cst-provider-qoder"));
+        assert!(git.is_none());
+        assert!(!no_build);
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn plugin_install_parses_a_git_source_with_revision_and_symbols() {
+        let parsed = args(&[
+            "plugin",
+            "install",
+            "cst-provider-qoder",
+            "--git",
+            "https://example.invalid/p.git",
+            "--tag",
+            "v1",
+            "--symbol",
+            "PLUGIN",
+            "--symbol",
+            "EXTRA",
+            "--crate-name",
+            "p",
+            "--codest-src",
+            "/src/cst",
+        ]);
+        let Some(Command::Plugin {
+            action:
+                PluginAction::Install {
+                    target,
+                    git,
+                    tag,
+                    symbols,
+                    crate_name,
+                    codest_src,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("expected `plugin install`");
+        };
+        assert_eq!(target.as_deref(), Some("cst-provider-qoder"));
+        assert_eq!(git.as_deref(), Some("https://example.invalid/p.git"));
+        assert_eq!(tag.as_deref(), Some("v1"));
+        assert_eq!(symbols, vec!["PLUGIN".to_string(), "EXTRA".to_string()]);
+        assert_eq!(crate_name.as_deref(), Some("p"));
+        assert_eq!(codest_src.as_deref(), Some(std::path::Path::new("/src/cst")));
+    }
+
+    #[test]
+    fn plugin_revision_flags_are_mutually_exclusive() {
+        let error = Args::try_parse_from([
+            "codest", "plugin", "install", "p", "--git", "u", "--rev", "a", "--tag", "b",
+        ])
+        .expect_err("rev and tag conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn plugin_list_and_uninstall_parse() {
+        let Some(Command::Plugin {
+            action: PluginAction::List,
+        }) = args(&["plugin", "list"]).command
+        else {
+            panic!("expected `plugin list`");
+        };
+        let Some(Command::Plugin {
+            action:
+                PluginAction::Uninstall {
+                    name,
+                    no_build: false,
+                },
+        }) = args(&["plugin", "uninstall", "cst-provider-qoder"]).command
+        else {
+            panic!("expected `plugin uninstall`");
+        };
+        assert_eq!(name, "cst-provider-qoder");
+    }
+
+    #[test]
+    fn plugin_build_parses_release_and_install() {
+        let Some(Command::Plugin {
+            action:
+                PluginAction::Build {
+                    release,
+                    install,
+                    ..
+                },
+        }) = args(&["plugin", "build", "--release"]).command
+        else {
+            panic!("expected `plugin build`");
+        };
+        assert!(release);
+        assert!(!install);
     }
 }

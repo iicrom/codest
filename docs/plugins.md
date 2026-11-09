@@ -55,24 +55,33 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] =
 - 新增插件必须改代码并重新编译，第三方无法“丢一个文件”就扩展；
 - 不能按用户配置动态启停（可以在编译期用 feature/常量做裁剪）。
 
-### 第三方接入点：契约 crate + 本地槽
+### 第三方接入点：契约 crate + 仓库外的生成 crate
 
 “第三方无法扩展”这一点已经改观，但**不是**通过动态加载：契约类型被拆到
 `crates/cst-plugin-api`（`Plugin`、`ProtocolFactory`、`ModelClient`、`Message`、
 `ToolSpec`、`SseDecoder`、`AuthProvider` …），插件仓库依赖它、宿主依赖插件，
-因此没有 Cargo 循环依赖。用户侧接入是两步：
+因此没有 Cargo 循环依赖。
 
-```toml
-cst-provider-qoder = { path = "../cst-provider-qoder" }
+用户侧接入是一条命令，**不改宿主源码**：
+
+```bash
+codest plugin install ../cst-provider-qoder
 ```
+
+它把插件记进 `~/.codest/plugins.toml`，生成 `~/.codest/plugins/crate/`——一个
+依赖宿主与各插件的独立 Cargo 包，里面唯一的实质内容是：
 
 ```rust
-// src/plugins/local.rs
-pub static LOCAL_PLUGINS: &[&dyn Plugin] = &[&cst_provider_qoder::PLUGIN];
+static LOCAL_PLUGINS: &[&dyn Plugin] = &[&cst_provider_qoder::PLUGIN];
 ```
 
-`PluginHost` 接收分组切片 `[BUILTIN_PLUGINS, LOCAL_PLUGINS]`，id / 命令名 / 工具名
-在两组之间统一校验，所以本地插件不能覆盖内置插件；`PluginHost::shipped()` 只返回
+然后在那里 `cargo build`。宿主侧提供两个接缝：`PluginHost::with_local(local,
+filter)` 负责把注入的插件与内置插件合并校验，`codest::cli::run_with` /
+`run_blocking` 负责把它接入启动流程。因为生成物住在仓库外，`git status` 永远
+是干净的，也不需要 `git update-index --skip-worktree`。
+
+`PluginHost` 仍按分组拼接 `[BUILTIN_PLUGINS, local]`，id / 命令名 / 工具名在两组
+之间统一校验，所以本地插件不能覆盖内置插件；`PluginHost::shipped()` 只返回
 内置插件，是测试用的稳定表。完整说明见 `docs/local-plugins.md`。
 
 仍然没有动态加载：改插件就要重新编译宿主，这是编译期链接的代价。
@@ -477,8 +486,8 @@ cargo clippy --all-targets -- -D warnings
 ## 10. 边界与非目标
 
 - **没有动态加载**：插件与主程序同生命周期，新增/修改插件必须重新编译。第三方
-  插件通过 `cst-plugin-api` + `src/plugins/local.rs` 接入（见
-  `docs/local-plugins.md`），而不是放一个 `.so` 到某个目录。
+  插件通过 `cst-plugin-api` 契约 + `codest plugin install` 生成的仓库外 wrapper
+  接入（见 `docs/local-plugins.md`），而不是放一个 `.so` 到某个目录。
 - **没有隔离**：插件和主程序共享地址空间与权限；panic 不会被捕获。
 - **没有异步钩子**：钩子在 TUI 线程同步执行，不能做阻塞 I/O；需要慢操作时
   应通过未来的异步 effect 或独立任务实现。
@@ -505,3 +514,6 @@ cargo clippy --all-targets -- -D warnings
    设计已并入 profile 方案——`tools` 字段驱动过滤，见 `docs/profiles.md`
    §4、§8；provider 侧的字段拼写差异同样走数据层（`[providers.wire]`
    quirk 字段，`docs/profiles.md` §5）。
+7. **安装方式**：`codest plugin install` 已落地（本地路径 / git / crates.io，
+   见 `docs/local-plugins.md`）。剩余的是等 `cst-plugin-api` 发布后去掉
+   `[patch.crates-io]`，以及可选的插件签名与版本约束求解。

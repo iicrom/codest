@@ -178,7 +178,15 @@ models = [{ id = "vendor-large" }]
 
 协议插件与命令插件一样是编译期静态链接的：它给的是维护者的模块化，不是运行时可扩展性。工厂示例与扩展契约见 [`docs/multi-provider.md`](docs/multi-provider.md) 第 8 节。
 
-第三方插件仓库可以独立维护：契约类型在 `crates/cst-plugin-api`，插件依赖它，宿主依赖插件（所以没有 Cargo 循环依赖）。接入是 `cargo add --path ../my-plugin` 加 `src/plugins/local.rs` 里的一行。完整步骤见 [`docs/local-plugins.md`](docs/local-plugins.md)；参考实现是 [`../cst-provider-qoder`](../cst-provider-qoder)（Qoder 的 COSY 签名协议 + 浏览器/PAT 登录）。
+第三方插件仓库可以独立维护：契约类型在 `crates/cst-plugin-api`，插件依赖它，宿主依赖插件（所以没有 Cargo 循环依赖）。接入是一条命令，**不改本仓库源码**：
+
+```bash
+./target/debug/codest plugin install ../my-plugin   # 本地 checkout；也支持 --git <url> 或 crates.io 包名
+```
+
+它把插件记进 `~/.codest/plugins.toml`，在 `~/.codest/plugins/crate/` 生成一个依赖宿主与插件的独立 crate 并在那里 `cargo build`；`codest plugin list` 查看已装项，`codest plugin uninstall <name>` 移除，`codest plugin build [--release|--install]` 重建。因为生成物住在仓库外，`git status` 始终干净（不再需要 `git update-index --skip-worktree`）。
+
+完整步骤见 [`docs/local-plugins.md`](docs/local-plugins.md)；参考实现是 [`../cst-provider-qoder`](../cst-provider-qoder)（Qoder 的 COSY 签名协议 + 浏览器/PAT 登录）。
 
 ## TUI 模式（fullscreen / inline）
 
@@ -285,6 +293,7 @@ codest 的指令和生命周期扩展都来自**编译期链接**的插件，不
 - 插件可以贡献 slash 命令、系统提示词片段、`on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` 钩子、工具（`tools()` 声明 + `run_tool()` 执行），以及多 Provider 的协议工厂（`protocols()`，见"多 Provider"）。
 - 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、报告块、清屏、退出、设置输入框、提交新回合），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
 - 重复插件 id、重复命令名/别名、重复工具名、非法命令名会在启动时被拒绝。
+- 外部插件（第三方仓库）通过 `codest plugin install` 装进一个仓库外生成的 wrapper crate，不需要改动本仓库；`PluginHost::shipped()` 始终只含内置插件，是测试用的稳定表。
 
 内置的 `/help`、`/clear`、`/quit`、`/status`、`/context` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)；外部插件的安装与契约版本规则见 [`docs/local-plugins.md`](docs/local-plugins.md)。
 
@@ -366,6 +375,7 @@ codest/
     │   └── session.rs       # agent worker（持有全部会话）+ AgentSession
     ├── plugins/
     │   ├── mod.rs           # Plugin trait / PluginHost / effects / 协议收集
+    │   ├── install.rs       # codest plugin install|uninstall|list|build
     │   └── builtin/
     │       ├── mod.rs       # 静态注册表
     │       ├── help.rs      # /help
@@ -404,4 +414,4 @@ codest/
 5. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
 6. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。
 7. 用 `inventory`/`linkme` 做分布式静态注册，保持 `Plugin` 契约不变（`cst-plugin-api` 拆分后只影响宿主侧收集方式）。
-8. 统一本地插件安装方式（`cargo install --git` / 私有 registry / `cst plugin add` 子命令），取决于第三方插件的实际数量。
+8. ~~统一本地插件安装方式~~ 已实现：`codest plugin install|uninstall|list|build`（本地路径 / git / crates.io，生成仓库外的 wrapper crate，不脏 git）。剩余项是等 `cst-plugin-api` 发布后去掉 `[patch.crates-io]`，以及可选的插件签名与版本约束求解。

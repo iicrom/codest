@@ -213,7 +213,10 @@ pub fn save_providers(path: &Path, instances: &[ProviderInstance]) -> Result<(),
 }
 
 /// Replace `path` with `text` through a temporary sibling.
-fn write_checked(path: &Path, text: &str) -> Result<(), ConfigError> {
+///
+/// Shared with the plugin installer, which writes its own state file and the
+/// generated wrapper manifests under `~/.codest/`.
+pub(crate) fn write_checked(path: &Path, text: &str) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {

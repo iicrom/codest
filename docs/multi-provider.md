@@ -223,13 +223,15 @@ impl Plugin for Vendor {
 要诚实的边界：静态插件体系下，协议插件给的是**维护者的模块化**（vendor 协议代码
 不进 core、可按 feature 裁剪），不是最终用户的可扩展性——第三方仍需重新编译。
 
-不过“第三方要重新编译”已经变成**两步可达的操作**，而不是“改宿主源码”：
+不过“第三方要重新编译”已经变成**一条命令**，而不是“改宿主源码”：
 
 - 契约类型（`ProtocolFactory`、`ModelClient`、`ProviderInstance`、`SseDecoder` …）
   拆到了独立的 `cst-plugin-api` crate。插件仓库依赖它，宿主依赖插件，因此没有
   Cargo 循环依赖（§8 的 `VendorFactory` 例子现在写在插件仓库里）；
-- 宿主侧只需 `cargo add --path` 加依赖，并在 `src/plugins/local.rs` 登记一行，
-  然后 `cargo build`。详见 `docs/local-plugins.md`。
+- 宿主侧只需要 `codest plugin install <path|--git|name>`：它把插件记进
+  `~/.codest/plugins.toml`，在 `~/.codest/plugins/crate/` 生成一个依赖宿主与插件
+  的独立 crate，并在那里 `cargo build`。仓库本身零改动。详见
+  `docs/local-plugins.md`。
 
 `ProviderInstance` 为此新增了一个通用口袋 `[providers.options]`：插件私有配置原样
 传给 `ProtocolFactory`，宿主从不解释任何键。守住的底线是——未知的**顶层**键仍然
