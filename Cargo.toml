@@ -7,6 +7,10 @@ description = "A minimal TUI chat agent distilled from codex's TUI + core archit
 license = "Apache-2.0"
 default-run = "codest"
 
+[workspace]
+members = ["crates/cst-plugin-api"]
+resolver = "3"
+
 [lib]
 name = "codest"
 path = "src/lib.rs"
@@ -24,6 +28,7 @@ anyhow = "1"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
+cst-plugin-api = { path = "crates/cst-plugin-api", version = "0.1.0" }
 futures-util = "0.3"
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = [

@@ -25,11 +25,10 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -60,6 +59,22 @@ pub static MODEL_COMMAND: CommandSpec = CommandSpec::new(
 /// Merged into the shipped command table next to the session commands; no
 /// plugin owns it.
 pub static MODEL_COMMANDS: &[CommandSpec] = &[MODEL_COMMAND];
+
+/// `/provider`: opens the provider wizard — add an OpenAI-compatible endpoint
+/// by base URL and key, sign in to a provider a plugin contributed, or review
+/// what is configured. Like `/model`, the spec only gives every front-end a
+/// shared, parseable shape; the wizard itself is a front-end concern.
+pub static PROVIDER_COMMAND: CommandSpec = CommandSpec::new(
+    "provider",
+    &[],
+    "/provider",
+    "add or sign in to a provider",
+    ArgsPolicy::None,
+);
+
+/// Merged into the shipped command table next to the session commands; no
+/// plugin owns it.
+pub static PROVIDER_COMMANDS: &[CommandSpec] = &[PROVIDER_COMMAND];
 
 /// Shown when a turn is requested with no model selected at all (no
 /// providers configured). Shared by the worker's own guard and the TUI's
@@ -137,51 +152,10 @@ pub enum SelectionError {
     },
 }
 
-/// A future yielding the models one provider exposes through its models API.
-pub type ListModelsFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<ModelInfo>, ModelError>> + Send + 'a>>;
-
-/// One compile-time protocol kind. Factories are `&'static` values shared by
-/// the registry; all per-instance state (URL, key, headers) arrives through
-/// `instance`, so one factory serves every instance of its protocol.
-pub trait ProtocolFactory: Sync {
-    /// Stable id referenced by `providers.toml` (`protocol = "..."`).
-    fn id(&self) -> &'static str;
-
-    /// Human-readable protocol name for diagnostics.
-    fn display_name(&self) -> &'static str;
-
-    /// Build the client for one model of one instance. Failures here (an
-    /// unusable base URL, say) surface at selection time as a turn error —
-    /// never as a failed startup, so one broken instance cannot take the
-    /// rest down.
-    fn create(
-        &self,
-        instance: &ProviderInstance,
-        model: &str,
-    ) -> Result<Arc<dyn ModelClient>, ModelError>;
-
-    /// Models discovery for instances of this protocol, if it has one
-    /// (`GET {base_url}/models` for `openai-compat`). `None` means the
-    /// protocol cannot list models.
-    fn list_models<'a>(
-        &'a self,
-        _instance: &'a ProviderInstance,
-        _cancel: CancellationToken,
-    ) -> Option<ListModelsFuture<'a>> {
-        None
-    }
-
-    /// The missing endpoint piece this protocol requires from `instance`,
-    /// if a request cannot even be attempted. Protocols that need nothing
-    /// (the in-process echo) keep the default; `openai-compat` requires a
-    /// `base_url` always and an `api_key` wherever one was expected
-    /// ([`ProviderInstance::requires_api_key`], the partial CLI synthesis
-    /// case) — config-declared keyless endpoints stay keyless by intent.
-    fn missing_credential(&self, _instance: &ProviderInstance) -> Option<&'static str> {
-        None
-    }
-}
+/// The protocol contract lives in the contract crate so an external plugin can
+/// implement it without depending on this binary. This path stays the
+/// historical import site for the host and its built-in protocols.
+pub use cst_plugin_api::providers::{ListModelsFuture, ProtocolFactory};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -212,6 +186,11 @@ pub enum RegistryError {
 /// validation point: an instance naming an unknown protocol, or a duplicate
 /// name, is a startup error — never a runtime surprise.
 pub struct ProviderRegistry {
+    /// Plugin-contributed factories only. A rebuild after
+    /// [`ModelPool::install_instance`] must pass these back to `build`, which
+    /// adds the built-ins itself — carrying the merged list would trip the
+    /// duplicate-protocol check.
+    extra: Vec<&'static dyn ProtocolFactory>,
     factories: Vec<&'static dyn ProtocolFactory>,
     instances: Vec<ProviderInstance>,
 }
@@ -286,6 +265,7 @@ impl ProviderRegistry {
         }
 
         Ok(Self {
+            extra: extra.to_vec(),
             factories,
             instances,
         })
@@ -370,6 +350,12 @@ fn known_protocol_ids(factories: &[&'static dyn ProtocolFactory]) -> Vec<&'stati
     factories.iter().map(|factory| factory.id()).collect()
 }
 
+/// The plugin-contributed factories of a live registry, for a rebuild that
+/// keeps every plugin protocol while replacing the instance list.
+fn factories_of(registry: &ProviderRegistry) -> Vec<&'static dyn ProtocolFactory> {
+    registry.extra.clone()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
     #[error(transparent)]
@@ -389,7 +375,7 @@ pub enum PoolError {
 /// Clients per selection, built on first use; plus the fetched-models overlay
 /// and its on-disk cache.
 pub struct ModelPool {
-    registry: ProviderRegistry,
+    registry: RwLock<Arc<ProviderRegistry>>,
     clients: Mutex<HashMap<String, Arc<dyn ModelClient>>>,
     /// Models discovered through the providers' models APIs, merged over the
     /// declared ones. Keyed by provider name.
@@ -400,7 +386,7 @@ pub struct ModelPool {
 impl ModelPool {
     pub fn new(registry: ProviderRegistry) -> Self {
         Self {
-            registry,
+            registry: RwLock::new(Arc::new(registry)),
             clients: Mutex::new(HashMap::new()),
             fetched: Mutex::new(BTreeMap::new()),
             cache_path: None,
@@ -415,15 +401,88 @@ impl ModelPool {
         self
     }
 
-    pub fn registry(&self) -> &ProviderRegistry {
-        &self.registry
+    /// The current registry, as an owned snapshot.
+    ///
+    /// Callers hold this for the duration of one lookup rather than borrowing
+    /// the pool, because [`ModelPool::install_instance`] replaces the snapshot
+    /// while the TUI may be iterating (the `/provider` wizard runs between
+    /// frames, but discovery tasks read the registry from another task).
+    pub fn registry(&self) -> Arc<ProviderRegistry> {
+        self.registry.read().expect("pool lock").clone()
+    }
+
+    /// Add or replace one instance at runtime — the write half of `/provider`.
+    ///
+    /// `instance` is validated the same way startup validates configuration: a
+    /// duplicate name in the *current* set is a replacement (that is what
+    /// "sign in to an existing provider" does), but an unknown protocol, an
+    /// empty model id, or invalid wire quirks are errors and leave the pool
+    /// untouched.
+    ///
+    /// Cached clients for the provider are evicted: they were built from the
+    /// old `base_url`/`api_key`, and keeping them would silently send requests
+    /// to the previous endpoint.
+    pub fn install_instance(&self, instance: ProviderInstance) -> Result<(), RegistryError> {
+        let name = instance.name.clone();
+        let mut guard = self.registry.write().expect("pool lock");
+        let mut instances: Vec<ProviderInstance> = guard
+            .instances()
+            .iter()
+            .filter(|existing| existing.name != name)
+            .cloned()
+            .collect();
+        instances.push(instance);
+        let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
+        *guard = Arc::new(rebuilt);
+        drop(guard);
+
+        self.clients
+            .lock()
+            .expect("pool lock")
+            .retain(|selection, _| {
+                !selection
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            });
+        self.fetched.lock().expect("pool lock").remove(&name);
+        Ok(())
+    }
+
+    /// Drop one instance, plus its fetched models and cached clients. Used by
+    /// the wizard's delete action.
+    pub fn remove_instance(&self, name: &str) -> Result<bool, RegistryError> {
+        let mut guard = self.registry.write().expect("pool lock");
+        if guard.instance(name).is_none() {
+            return Ok(false);
+        }
+        let instances: Vec<ProviderInstance> = guard
+            .instances()
+            .iter()
+            .filter(|existing| existing.name != name)
+            .cloned()
+            .collect();
+        let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
+        *guard = Arc::new(rebuilt);
+        drop(guard);
+
+        self.clients
+            .lock()
+            .expect("pool lock")
+            .retain(|selection, _| {
+                !selection
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            });
+        self.fetched.lock().expect("pool lock").remove(name);
+        Ok(true)
     }
 
     /// The raw missing piece name (`"base_url"` / `"api_key"`), if the
     /// provider's protocol says the endpoint is half specified.
     pub fn missing_credential_raw(&self, provider: &str) -> Option<&'static str> {
-        let instance = self.registry.instance(provider)?;
-        let factory = self.registry.factory(instance.protocol_id())?;
+        let registry = self.registry();
+        let instance = registry.instance(provider)?;
+        let factory = registry.factory(instance.protocol_id())?;
         factory.missing_credential(instance)
     }
 
@@ -441,12 +500,19 @@ impl ModelPool {
             return Ok(client.clone());
         }
 
-        let instance = self
-            .registry
+        let registry = self.registry();
+        let instance = registry
             .instance(&selection.provider)
-            .expect("provider existence is validated by parse_selection");
-        let factory = self
-            .registry
+            .ok_or_else(|| PoolError::Selection(SelectionError::UnknownProvider {
+                provider: selection.provider.clone(),
+                configured: registry
+                    .instances()
+                    .iter()
+                    .map(|instance| instance.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }))?;
+        let factory = registry
             .factory(instance.protocol_id())
             .expect("protocol existence is validated at registry build");
         let client = factory
@@ -470,7 +536,7 @@ impl ModelPool {
     /// rest of the advisory metadata) the models API reports.
     pub fn models_of(&self, provider: &str) -> Vec<ModelInfo> {
         let mut models = self
-            .registry
+            .registry()
             .instance(provider)
             .map(|instance| instance.models.clone())
             .unwrap_or_default();
@@ -511,7 +577,8 @@ impl ModelPool {
     /// instance, in declaration order.
     pub fn selections(&self) -> Vec<Selection> {
         let mut out = Vec::new();
-        for instance in self.registry.instances() {
+        let registry = self.registry();
+        for instance in registry.instances() {
             for model in self.models_of(&instance.name) {
                 out.push(Selection::new(&instance.name, &model.id));
             }
@@ -523,8 +590,8 @@ impl ModelPool {
     /// declared list, and refresh the cache. Bounded by a timeout so a menu
     /// refresh can never hang the UI. Returns the merged model count.
     pub async fn refresh(&self, provider: &str) -> Result<usize, PoolError> {
-        let instance = self
-            .registry
+        let registry = self.registry();
+        let instance = registry
             .instance(provider)
             .ok_or_else(|| PoolError::DiscoveryNotConfigured {
                 provider: provider.to_string(),
@@ -539,8 +606,7 @@ impl ModelPool {
                 reason: format!("`{missing}` is not set"),
             });
         }
-        let factory = self
-            .registry
+        let factory = registry
             .factory(instance.protocol_id())
             .expect("protocol existence is validated at registry build");
         let list = factory.list_models(&instance, CancellationToken::new()).ok_or_else(|| {
@@ -576,10 +642,11 @@ impl ModelPool {
 
     /// Whether the provider's factory can list models at all (menu hint).
     pub fn can_discover(&self, provider: &str) -> bool {
-        self.registry
+        let registry = self.registry();
+        registry
             .instance(provider)
             .is_some_and(|instance| {
-                self.registry
+                registry
                     .factory(instance.protocol_id())
                     .is_some_and(|factory| {
                         factory
@@ -813,6 +880,7 @@ mod tests {
             headers: BTreeMap::new(),
             body_overrides: serde_json::Map::new(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         }
     }
@@ -978,6 +1046,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry =
@@ -1089,6 +1158,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry =
@@ -1111,5 +1181,68 @@ mod tests {
             Some("low".to_string())
         );
         assert!(pool.model_info(&Selection::new("p", "nope")).is_none());
+    }
+
+    /// `/provider` installs an instance after the pool exists: the registry
+    /// must see it, a replacement must win, and cached clients built from the
+    /// old endpoint must not survive.
+    #[test]
+    fn install_instance_registers_and_evicts_stale_clients() {
+        let registry = ProviderRegistry::build(&[], vec![instance("p", None, &["m1"])]).unwrap();
+        let pool = ModelPool::new(registry);
+        let before = pool.client(&Selection::new("p", "m1")).expect("client");
+
+        let mut replacement = instance("p", None, &["m1"]);
+        replacement.base_url = Some("http://127.0.0.1:2/v1".to_string());
+        pool.install_instance(replacement).expect("install");
+
+        let after = pool.client(&Selection::new("p", "m1")).expect("client");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a client built from the old endpoint must be evicted"
+        );
+
+        // A brand-new provider becomes selectable.
+        pool.install_instance(instance("q", None, &["qm"]))
+            .expect("install new");
+        assert!(pool.registry().instance("q").is_some());
+        assert!(pool.client(&Selection::new("q", "qm")).is_ok());
+
+        // Replacing keeps one instance per name rather than appending.
+        let names: Vec<String> = pool
+            .registry()
+            .instances()
+            .iter()
+            .map(|instance| instance.name.clone())
+            .collect();
+        assert_eq!(names, vec!["p".to_string(), "q".to_string()]);
+    }
+
+    /// The install path validates exactly like startup: an unknown protocol is
+    /// rejected and the previous registry stays intact.
+    #[test]
+    fn install_instance_rejects_unknown_protocol() {
+        let registry = ProviderRegistry::build(&[], vec![instance("p", None, &["m1"])]).unwrap();
+        let pool = ModelPool::new(registry);
+        let broken = instance("p", Some("no-such-protocol"), &["m1"]);
+
+        let error = pool.install_instance(broken).expect_err("must reject");
+        assert!(matches!(error, RegistryError::UnknownProtocol { .. }));
+        assert_eq!(
+            pool.registry()
+                .instance("p")
+                .map(|instance| instance.protocol_id().to_string()),
+            Some(DEFAULT_PROTOCOL.to_string()),
+            "the failed install left the old instance in place"
+        );
+    }
+
+    #[test]
+    fn remove_instance_reports_whether_it_existed() {
+        let registry = ProviderRegistry::build(&[], vec![instance("p", None, &["m1"])]).unwrap();
+        let pool = ModelPool::new(registry);
+        assert!(pool.remove_instance("p").expect("remove"));
+        assert!(pool.registry().instance("p").is_none());
+        assert!(!pool.remove_instance("p").expect("remove again"));
     }
 }

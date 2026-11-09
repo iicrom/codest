@@ -296,6 +296,7 @@ dependencies = [
  "async-stream",
  "clap",
  "crossterm",
+ "cst-plugin-api",
  "futures-util",
  "ratatui",
  "reqwest",
@@ -407,6 +408,18 @@ checksum = "eb2a7d3066da2de787b7f032c736763eb7ae5d355f81a68bab2675a96008b0bf"
 dependencies = [
  "lab",
  "phf",
+]
+
+[[package]]
+name = "cst-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio-util",
+ "toml",
 ]
 
 [[package]]

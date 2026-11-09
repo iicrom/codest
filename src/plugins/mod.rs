@@ -3,8 +3,9 @@
 //! Plugins are ordinary Rust values linked into the binary. There is no
 //! dynamic loading, no scripting layer, and no runtime discovery: the shipped
 //! set is a `static` slice, so registration order and contents are fixed at
-//! compile time. Adding a plugin means adding a module and one entry to
-//! [`builtin::BUILTIN_PLUGINS`].
+//! compile time. Adding a built-in plugin means adding a module and one entry
+//! to [`builtin::BUILTIN_PLUGINS`]; adding a *local* one means adding one entry
+//! to [`local::LOCAL_PLUGINS`] (see `docs/local-plugins.md`).
 //!
 //! The contract has two halves:
 //!
@@ -20,338 +21,34 @@
 //!   ▲                                            │
 //!   └──────────── PluginEffect (data) ───────────┘
 //! ```
+//!
+//! The `Plugin` trait and its data types live in [`cst_plugin_api::plugin`]:
+//! an external plugin crate implements the trait against that crate rather
+//! than against this binary, which is what breaks the dependency cycle a
+//! "link the plugin into the host" install would otherwise create. Everything
+//! in this module is host-side — discovery, validation, dispatch.
 
 pub mod builtin;
+pub mod local;
 
 use std::fmt;
 
-use crate::core::commands::CommandTableError;
-use crate::core::commands::{CommandInput, CommandTable};
-use crate::core::providers::ProtocolFactory;
-use crate::core::tools::ToolCall;
-use crate::core::tools::ToolExecutor;
-use crate::core::tools::ToolSpec;
+use cst_plugin_api::auth::AuthProvider;
+use cst_plugin_api::auth::AuthStatus;
+use cst_plugin_api::commands::CommandTableError;
+use cst_plugin_api::commands::{CommandInput, CommandTable};
+use cst_plugin_api::providers::ProtocolFactory;
+use cst_plugin_api::tools::ToolCall;
+use cst_plugin_api::tools::ToolExecutor;
+use cst_plugin_api::tools::ToolSpec;
 
-pub use crate::core::commands::{ArgsPolicy, CommandCandidate, CommandSpec, Invocation};
+pub use cst_plugin_api::commands::{ArgsPolicy, CommandCandidate, CommandSpec, Invocation};
+pub use cst_plugin_api::plugin::{
+    Plugin, PluginContext, PluginEffect, PluginError, PluginInfo, ReportBlock, ReportEntry,
+    ReportGroup, RequestFacts,
+};
 pub use builtin::BUILTIN_PLUGINS;
-
-/// One compile-time extension.
-///
-/// Plugins are shared immutably (`&'static dyn Plugin`), so hooks and command
-/// handlers take `&self`. A plugin that needs mutable state should use interior
-/// mutability (`Mutex`, atomics, …), exactly like the rest of the static
-/// registry.
-pub trait Plugin: Sync {
-    /// Stable identifier used in diagnostics and `/status`.
-    fn id(&self) -> &'static str;
-
-    /// Commands contributed by this plugin, in menu order.
-    fn commands(&self) -> &'static [CommandSpec] {
-        &[]
-    }
-
-    /// Extra system-prompt text appended when the session starts. Skills,
-    /// workspace instructions, and similar context are expected to arrive
-    /// through this hook as ordinary prompt fragments — the core treats all
-    /// of them alike, and `/context` shows each fragment attributed to its
-    /// plugin.
-    fn system_prompt(&self) -> Option<&'static str> {
-        None
-    }
-
-    /// Tools offered to the model on every turn. Declaring a tool here also
-    /// makes this plugin the executor of its calls via [`Plugin::run_tool`].
-    fn tools(&self) -> &'static [ToolSpec] {
-        &[]
-    }
-
-    /// Execute one call of a tool this plugin declared via [`Plugin::tools`].
-    /// `Ok` output becomes the tool message content; `Err` reaches both the
-    /// model (as `error: …` content) and the transcript (as a failure line).
-    fn run_tool(&self, _call: &ToolCall) -> Result<String, PluginError> {
-        Err(PluginError::new(
-            "this plugin declares no tool executor",
-        ))
-    }
-
-    /// Protocol kinds contributed to the provider registry. A custom
-    /// provider = a `ProtocolFactory` here (the wire protocol, compile-time)
-    /// plus instances in `providers.toml` (the endpoints, runtime config).
-    /// See `core::providers`.
-    fn protocols(&self) -> &'static [&'static dyn ProtocolFactory] {
-        &[]
-    }
-
-    /// Called once after the session is created and before the first frame.
-    fn on_startup(&self, _ctx: &mut PluginContext<'_>) {}
-
-    /// Called when a user turn is submitted, before it reaches the model.
-    fn on_user_message(&self, _text: &str, _ctx: &mut PluginContext<'_>) {}
-
-    /// Called when a turn finishes successfully, with the final assistant text.
-    fn on_turn_complete(&self, _message: &str, _ctx: &mut PluginContext<'_>) {}
-
-    /// Called after the core confirms that the conversation was cleared.
-    fn on_conversation_cleared(&self, _ctx: &mut PluginContext<'_>) {}
-
-    /// Handle one invocation. Returning `Err` becomes a visible error effect;
-    /// returning `Ok` with no effects is a silent no-op.
-    fn run_command(
-        &self,
-        invocation: &Invocation,
-        _ctx: &mut PluginContext<'_>,
-    ) -> Result<(), PluginError> {
-        Err(PluginError::new(format!(
-            "plugin `{}` does not handle `/{}`",
-            self.id(),
-            invocation.spec.name
-        )))
-    }
-}
-
-/// A side effect requested by a plugin.
-///
-/// The host collects effects in plugin order; the front-end applies them in the
-/// same order. This is the only way a plugin can touch the UI or the session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PluginEffect {
-    /// Append a dim notice to the transcript.
-    Notice(String),
-    /// Append an error cell to the transcript.
-    Error(String),
-    /// Append a titled report block to the transcript (`/context`).
-    Report(ReportBlock),
-    /// Drop the transcript and the core conversation.
-    ClearConversation,
-    /// Exit the application.
-    Quit,
-    /// Replace the composer contents.
-    SetComposer(String),
-    /// Submit a new user turn, if the agent is idle.
-    SubmitUserTurn(String),
-}
-
-/// A plugin-authored report (e.g. `/context`): a bold title over titled
-/// groups, whose entries carry an optional highlighted label and dim text —
-/// the shape mirrors the loaded-context panels of reference TUIs. Pure data:
-/// the front-end decides the actual styling.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportBlock {
-    pub title: String,
-    pub groups: Vec<ReportGroup>,
-}
-
-/// One titled group of a [`ReportBlock`], rendered as a bold section marker
-/// over its entries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportGroup {
-    pub heading: String,
-    pub entries: Vec<ReportEntry>,
-}
-
-/// One entry of a [`ReportGroup`]: an optional highlighted label followed by
-/// the dim entry text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportEntry {
-    /// Highlighted before the text (`model`, `base`); empty for label-less
-    /// entries.
-    pub label: String,
-    /// Entry body; may span multiple lines.
-    pub text: String,
-}
-
-impl ReportEntry {
-    pub fn new(label: impl Into<String>, text: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            text: text.into(),
-        }
-    }
-}
-
-/// Per-request wire facts for `/context`-style displays: where the request
-/// goes and which static fields ride along.
-#[derive(Debug, Clone, Copy)]
-pub struct RequestFacts<'a> {
-    pub protocol: &'a str,
-    pub base_url: &'a str,
-    /// The full chat-completions endpoint (`base_url` + `/chat/completions`).
-    pub endpoint: &'a str,
-    /// The instance's `body_overrides` as compact `key=value` strings.
-    pub overrides: &'a [(String, String)],
-}
-
-/// Read-only information passed to every hook and command handler.
-#[derive(Debug, Clone, Copy)]
-pub struct PluginInfo<'a> {
-    pub model: &'a str,
-    pub mode: &'a str,
-    pub transcript_len: usize,
-    /// The active model's context window, when declared or discovered.
-    pub context_window: Option<u64>,
-    /// Usage of the last completed turn: `(input, output)` tokens. `None`
-    /// before the first measured turn of this run.
-    pub last_usage: Option<(u64, u64)>,
-    /// Cumulative measured tokens across the session's completed turns.
-    pub total_input: u64,
-    pub total_output: u64,
-    pub plugin_ids: &'a [&'static str],
-    /// The assembled system prompt as labeled sections: `base` first, then
-    /// one `plugin:<id>` entry per non-empty fragment.
-    pub system_sections: &'a [(String, String)],
-    /// The reasoning effort sent with each turn (`/effort`); `None` sends no
-    /// effort field at all.
-    pub effort: Option<&'a str>,
-    /// Where requests go and which static fields ride along.
-    pub request: RequestFacts<'a>,
-    /// Tools the plugins declared, in registration order.
-    pub tools: &'a [ToolSpec],
-    /// Approximate message count of the active session's conversation: the
-    /// system prompt plus one entry per user/assistant/tool transcript cell.
-    pub message_count: usize,
-}
-
-/// Mutable context handed to a plugin while it runs.
-///
-/// The context exposes read-only session facts and collects effects. It never
-/// gives the plugin direct access to the terminal or the agent worker.
-pub struct PluginContext<'a> {
-    table: &'a CommandTable,
-    info: PluginInfo<'a>,
-    effects: Vec<PluginEffect>,
-}
-
-impl<'a> PluginContext<'a> {
-    fn new(table: &'a CommandTable, info: PluginInfo<'a>) -> Self {
-        Self {
-            table,
-            info,
-            effects: Vec::new(),
-        }
-    }
-
-    /// The full command table, useful for `/help`-style commands.
-    pub fn command_table(&self) -> &CommandTable {
-        self.table
-    }
-
-    pub fn model(&self) -> &str {
-        self.info.model
-    }
-
-    pub fn mode(&self) -> &str {
-        self.info.mode
-    }
-
-    pub fn transcript_len(&self) -> usize {
-        self.info.transcript_len
-    }
-
-    /// The active model's context window, when known.
-    pub fn context_window(&self) -> Option<u64> {
-        self.info.context_window
-    }
-
-    /// The last completed turn's `(input, output)` tokens, if measured.
-    pub fn last_usage(&self) -> Option<(u64, u64)> {
-        self.info.last_usage
-    }
-
-    /// Cumulative measured input tokens across the session.
-    pub fn total_input(&self) -> u64 {
-        self.info.total_input
-    }
-
-    /// Cumulative measured output tokens across the session.
-    pub fn total_output(&self) -> u64 {
-        self.info.total_output
-    }
-
-    pub fn plugin_ids(&self) -> &[&'static str] {
-        self.info.plugin_ids
-    }
-
-    /// The assembled system prompt as labeled sections.
-    pub fn system_sections(&self) -> &[(String, String)] {
-        self.info.system_sections
-    }
-
-    /// The reasoning effort sent with each turn; `None` sends no field.
-    pub fn effort(&self) -> Option<&str> {
-        self.info.effort
-    }
-
-    /// Where requests go and which static fields ride along.
-    pub fn request(&self) -> RequestFacts<'_> {
-        self.info.request
-    }
-
-    /// Tools the plugins declared, in registration order.
-    pub fn tools(&self) -> &[ToolSpec] {
-        self.info.tools
-    }
-
-    /// Approximate message count of the active session's conversation.
-    pub fn message_count(&self) -> usize {
-        self.info.message_count
-    }
-
-    pub fn effects(&self) -> &[PluginEffect] {
-        &self.effects
-    }
-
-    pub fn notice(&mut self, text: impl Into<String>) {
-        self.effects.push(PluginEffect::Notice(text.into()));
-    }
-
-    pub fn error(&mut self, text: impl Into<String>) {
-        self.effects.push(PluginEffect::Error(text.into()));
-    }
-
-    pub fn report(&mut self, block: ReportBlock) {
-        self.effects.push(PluginEffect::Report(block));
-    }
-
-    pub fn clear_conversation(&mut self) {
-        self.effects.push(PluginEffect::ClearConversation);
-    }
-
-    pub fn quit(&mut self) {
-        self.effects.push(PluginEffect::Quit);
-    }
-
-    pub fn set_composer(&mut self, text: impl Into<String>) {
-        self.effects.push(PluginEffect::SetComposer(text.into()));
-    }
-
-    pub fn submit_user_turn(&mut self, text: impl Into<String>) {
-        self.effects.push(PluginEffect::SubmitUserTurn(text.into()));
-    }
-
-    fn into_effects(self) -> Vec<PluginEffect> {
-        self.effects
-    }
-}
-
-/// An error reported by a plugin. It is turned into a visible
-/// [`PluginEffect::Error`] by the host.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{message}")]
-pub struct PluginError {
-    message: String,
-}
-
-impl PluginError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
+pub use local::LOCAL_PLUGINS;
 
 /// Why the plugin registry could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -367,6 +64,17 @@ pub enum PluginHostError {
     #[error(transparent)]
     CommandTable(#[from] CommandTableError),
 }
+
+/// Commands the front-end ships with and handles itself. They live in the
+/// shared table so parsing, the command menu, and `/help` agree with what the
+/// TUI can actually do; no plugin owns them.
+static SHIPPED_COMMAND_GROUPS: &[&[CommandSpec]] = &[
+    crate::core::sessions::SESSION_COMMANDS,
+    crate::core::providers::MODEL_COMMANDS,
+    crate::core::providers::PROVIDER_COMMANDS,
+    crate::core::reasoning::REASONING_COMMANDS,
+    crate::core::config::PROFILE_COMMANDS,
+];
 
 /// Owns the static plugin list and the command table they contribute.
 pub struct PluginHost {
@@ -384,20 +92,29 @@ pub struct PluginHost {
 impl PluginHost {
     /// Validate plugin ids and build the command table they contribute.
     pub fn new(plugins: &'static [&'static dyn Plugin]) -> Result<Self, PluginHostError> {
-        Self::with_extra_commands(plugins, &[], None)
+        Self::with_extra_commands(&[plugins], &[], None)
     }
 
     /// Build a host whose command table also carries front-end built-in
-    /// commands that no plugin owns (the core session commands and `/model`).
-    /// Name collisions between plugins and extras are rejected like
-    /// duplicates.
+    /// commands that no plugin owns (the core session commands, `/model`,
+    /// `/provider`). Name collisions between plugins and extras are rejected
+    /// like duplicates.
+    ///
+    /// `groups` lets the binary keep separately-owned registries — the shipped
+    /// plugins and the user's local ones — without flattening them into one
+    /// `static`. Flattening order is group order, then slice order; duplicate
+    /// ids across groups fail here, so a local plugin cannot shadow a shipped
+    /// one.
     fn with_extra_commands(
-        plugins: &'static [&'static dyn Plugin],
+        groups: &[&'static [&'static dyn Plugin]],
         extra: &[&'static [CommandSpec]],
         tool_filter: Option<Vec<String>>,
     ) -> Result<Self, PluginHostError> {
+        let plugins: Vec<&'static dyn Plugin> =
+            groups.iter().flat_map(|group| group.iter().copied()).collect();
+
         let mut ids = Vec::with_capacity(plugins.len());
-        for plugin in plugins {
+        for plugin in &plugins {
             let id = plugin.id();
             if id.is_empty() {
                 return Err(PluginHostError::EmptyPluginId);
@@ -432,7 +149,7 @@ impl PluginHost {
         // command names: two plugins answering the same tool name would make
         // execution ambiguous.
         let mut tools = Vec::new();
-        for plugin in plugins {
+        for plugin in &plugins {
             for spec in plugin.tools() {
                 if tools.iter().any(|(name, _)| *name == spec.name) {
                     return Err(PluginHostError::DuplicateTool { name: spec.name });
@@ -442,7 +159,7 @@ impl PluginHost {
         }
 
         Ok(Self {
-            plugins: plugins.to_vec(),
+            plugins,
             table,
             ids,
             tools,
@@ -451,8 +168,8 @@ impl PluginHost {
     }
 
     /// The plugins compiled into the binary, plus the built-in front-end
-    /// commands (`/new`, `/rename`, `/sessions`, `/model`, `/effort`,
-    /// `/thinking`, `/profile`) that the front-end handles itself.
+    /// commands (`/new`, `/rename`, `/sessions`, `/model`, `/provider`,
+    /// `/effort`, `/thinking`, `/profile`) that the front-end handles itself.
     pub fn builtin() -> Result<Self, PluginHostError> {
         Self::builtin_with_tools(None)
     }
@@ -464,15 +181,16 @@ impl PluginHost {
     /// it does not uninstall plugins.
     pub fn builtin_with_tools(enabled: Option<&[String]>) -> Result<Self, PluginHostError> {
         Self::with_extra_commands(
-            BUILTIN_PLUGINS,
-            &[
-                crate::core::sessions::SESSION_COMMANDS,
-                crate::core::providers::MODEL_COMMANDS,
-                crate::core::reasoning::REASONING_COMMANDS,
-                crate::core::config::PROFILE_COMMANDS,
-            ],
+            &[BUILTIN_PLUGINS, LOCAL_PLUGINS],
+            SHIPPED_COMMAND_GROUPS,
             enabled.map(<[String]>::to_vec),
         )
+    }
+
+    /// The shipped plugins only — a stable table for tests and diagnostics,
+    /// unaffected by whatever a user added to `plugins/local.rs`.
+    pub fn shipped() -> Result<Self, PluginHostError> {
+        Self::with_extra_commands(&[BUILTIN_PLUGINS], SHIPPED_COMMAND_GROUPS, None)
     }
 
     pub fn plugins(&self) -> &[&'static dyn Plugin] {
@@ -495,6 +213,38 @@ impl PluginHost {
             .iter()
             .flat_map(|plugin| plugin.protocols().iter().copied())
             .collect()
+    }
+
+    /// Every sign-in entry the plugins contribute, paired with the plugin that
+    /// owns it — the `/provider` menu's "sign in to a plugin provider" list.
+    pub fn auth_providers(&self) -> Vec<(&'static dyn Plugin, AuthProvider)> {
+        let mut entries = Vec::new();
+        for plugin in &self.plugins {
+            for auth in plugin.auth_providers() {
+                entries.push((*plugin, *auth));
+            }
+        }
+        entries
+    }
+
+    /// The plugin that contributes `protocol`, if any. `/provider` uses this
+    /// to decide whether an instance's protocol has a sign-in entry behind it.
+    pub fn auth_plugin_for_protocol(&self, protocol: &str) -> Option<&'static dyn Plugin> {
+        self.plugins.iter().copied().find(|plugin| {
+            plugin
+                .auth_providers()
+                .iter()
+                .any(|auth| auth.protocol == protocol)
+        })
+    }
+
+    /// The sign-in state of `instance`, as reported by the plugin that serves
+    /// its protocol. `Unsupported` when nothing serves it.
+    pub fn auth_status(&self, instance: &str, protocol: &str) -> AuthStatus {
+        match self.auth_plugin_for_protocol(protocol) {
+            Some(plugin) => plugin.auth_status(instance),
+            None => AuthStatus::Unsupported,
+        }
     }
 
     /// Build the effective system prompt: the base prompt followed by every
@@ -975,7 +725,7 @@ mod tests {
         // Enabling only echo's tools strips the tool but keeps its command.
         static FILTERED: &[&dyn Plugin] = &[&ECHO, &TOOLER_PLUGIN];
         let host = PluginHost::with_extra_commands(
-            FILTERED,
+            &[FILTERED],
             &[],
             Some(vec!["echo".to_string()]),
         )
@@ -997,7 +747,7 @@ mod tests {
 
         // Enabling tooler keeps the tool, and `None` keeps everything.
         let host = PluginHost::with_extra_commands(
-            FILTERED,
+            &[FILTERED],
             &[],
             Some(vec!["tooler".to_string()]),
         )
@@ -1035,7 +785,9 @@ mod tests {
 
     #[test]
     fn builtin_host_exposes_the_core_commands() {
-        let host = PluginHost::builtin().expect("builtin plugins");
+        // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
+        // must not break the shipped-table assertion.
+        let host = PluginHost::shipped().expect("shipped plugins");
         let names = host
             .table()
             .specs()
@@ -1046,7 +798,7 @@ mod tests {
             names,
             vec![
                 "help", "clear", "quit", "status", "context", "new", "rename", "sessions",
-                "model", "effort", "thinking", "profile"
+                "model", "provider", "effort", "thinking", "profile"
             ]
         );
     }
@@ -1114,6 +866,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry = crate::core::providers::ProviderRegistry::build(&factories, vec![instance])
@@ -1132,7 +885,9 @@ mod tests {
 
     #[test]
     fn help_lists_plugin_commands() {
-        let host = PluginHost::builtin().expect("builtin plugins");
+        // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
+        // must not break the shipped-table assertion.
+        let host = PluginHost::shipped().expect("shipped plugins");
         let effects = host.dispatch_command(&invocation(&host, "/help"), info(&host));
         let [PluginEffect::Notice(text)] = effects.as_slice() else {
             panic!("expected one help notice, got {effects:?}");
@@ -1143,7 +898,9 @@ mod tests {
 
     #[test]
     fn clear_and_quit_are_effects() {
-        let host = PluginHost::builtin().expect("builtin plugins");
+        // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
+        // must not break the shipped-table assertion.
+        let host = PluginHost::shipped().expect("shipped plugins");
         assert_eq!(
             host.dispatch_command(&invocation(&host, "/clear"), info(&host)),
             vec![PluginEffect::ClearConversation]
@@ -1156,7 +913,9 @@ mod tests {
 
     #[test]
     fn status_reports_host_context() {
-        let host = PluginHost::builtin().expect("builtin plugins");
+        // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
+        // must not break the shipped-table assertion.
+        let host = PluginHost::shipped().expect("shipped plugins");
         let effects = host.dispatch_command(&invocation(&host, "/status"), info(&host));
         let [PluginEffect::Notice(text)] = effects.as_slice() else {
             panic!("expected one status notice, got {effects:?}");

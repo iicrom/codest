@@ -8,6 +8,7 @@
 pub mod app;
 pub mod chat;
 pub mod composer;
+pub mod provider_wizard;
 pub mod session;
 pub mod theme;
 pub mod wrap;

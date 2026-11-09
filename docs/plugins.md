@@ -55,6 +55,28 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] =
 - 新增插件必须改代码并重新编译，第三方无法“丢一个文件”就扩展；
 - 不能按用户配置动态启停（可以在编译期用 feature/常量做裁剪）。
 
+### 第三方接入点：契约 crate + 本地槽
+
+“第三方无法扩展”这一点已经改观，但**不是**通过动态加载：契约类型被拆到
+`crates/cst-plugin-api`（`Plugin`、`ProtocolFactory`、`ModelClient`、`Message`、
+`ToolSpec`、`SseDecoder`、`AuthProvider` …），插件仓库依赖它、宿主依赖插件，
+因此没有 Cargo 循环依赖。用户侧接入是两步：
+
+```toml
+cst-provider-qoder = { path = "../cst-provider-qoder" }
+```
+
+```rust
+// src/plugins/local.rs
+pub static LOCAL_PLUGINS: &[&dyn Plugin] = &[&cst_provider_qoder::PLUGIN];
+```
+
+`PluginHost` 接收分组切片 `[BUILTIN_PLUGINS, LOCAL_PLUGINS]`，id / 命令名 / 工具名
+在两组之间统一校验，所以本地插件不能覆盖内置插件；`PluginHost::shipped()` 只返回
+内置插件，是测试用的稳定表。完整说明见 `docs/local-plugins.md`。
+
+仍然没有动态加载：改插件就要重新编译宿主，这是编译期链接的代价。
+
 为什么不用 `inventory` / `linkme`：它们能把注册分散到各个模块、由链接器收集，
 但会引入链接器 section 行为、平台差异和不确定的注册顺序；对 codest 这种
 “插件数量少、要求可读和确定性”的项目，显式静态数组更合适。`PluginHost` 的
@@ -454,7 +476,9 @@ cargo clippy --all-targets -- -D warnings
 
 ## 10. 边界与非目标
 
-- **没有动态加载**：插件与主程序同生命周期，新增/修改插件必须重新编译。
+- **没有动态加载**：插件与主程序同生命周期，新增/修改插件必须重新编译。第三方
+  插件通过 `cst-plugin-api` + `src/plugins/local.rs` 接入（见
+  `docs/local-plugins.md`），而不是放一个 `.so` 到某个目录。
 - **没有隔离**：插件和主程序共享地址空间与权限；panic 不会被捕获。
 - **没有异步钩子**：钩子在 TUI 线程同步执行，不能做阻塞 I/O；需要慢操作时
   应通过未来的异步 effect 或独立任务实现。
@@ -466,6 +490,8 @@ cargo clippy --all-targets -- -D warnings
 ## 11. 演进路线
 
 1. **分布式注册**：用 `inventory`/`linkme` 替换静态数组，保持 `Plugin` 契约不变。
+   注意 `cst-plugin-api` 拆分后，这个替换只影响宿主侧收集方式，插件的 `static`
+   与 trait 契约都不用变。
 2. **编译期开关**：按 Cargo feature 裁剪内置插件，做“最小 cst”。
 3. **异步 effect**：`PluginEffect::Task` 或 `on_turn_complete` 的 async 版本，
    让插件做网络/文件操作而不阻塞渲染。工具调用这一半已先行落地——回合

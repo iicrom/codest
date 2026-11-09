@@ -95,7 +95,8 @@ pub async fn run(program: &'static str) -> anyhow::Result<()> {
     let global = config::load_global(&config::config_path())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let pool = build_pool(&plugins, &global, &args)?;
-    let selection = initial_selection(pool.registry(), &global, &args, active.map(|(_, p)| p))?;
+    let registry = pool.registry();
+    let selection = initial_selection(&registry, &global, &args, active.map(|(_, p)| p))?;
 
     // Fail fast on an unusable selection rather than at the first turn.
     if let Some(selection) = &selection {
@@ -167,12 +168,10 @@ fn build_pool(
                 synthesized = true;
             }
             None => {
+                let factories = plugins.protocol_factories();
                 return Ok(Arc::new(
-                    ModelPool::new(ProviderRegistry::build(
-                        &plugins.protocol_factories(),
-                        Vec::new(),
-                    )?)
-                    .with_cache(config::model_cache_path()),
+                    ModelPool::new(ProviderRegistry::build(&factories, Vec::new())?)
+                        .with_cache(config::model_cache_path()),
                 ));
             }
         }
@@ -200,7 +199,8 @@ fn build_pool(
         }
     }
 
-    let registry = ProviderRegistry::build(&plugins.protocol_factories(), instances)
+    let factories = plugins.protocol_factories();
+    let registry = ProviderRegistry::build(&factories, instances)
         .map_err(|error: RegistryError| anyhow::anyhow!("{error}"))?;
     if synthesized {
         eprintln!(
@@ -256,6 +256,7 @@ fn synthesized_openai_instance(args: &Args) -> Option<config::ProviderInstance> 
         headers: Default::default(),
         body_overrides: Default::default(),
         wire: None,
+        options: Default::default(),
         requires_api_key: true,
     })
 }
@@ -408,6 +409,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         ProviderRegistry::build(&[], vec![instance("p"), instance("q")]).expect("registry")
@@ -526,6 +528,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         assert_eq!(pool_of(keyless).missing_credential_raw("local"), None);

@@ -25,23 +25,17 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::core::commands::ArgsPolicy;
 use crate::core::commands::CommandSpec;
 use crate::core::rollout::codest_home;
 
-/// The protocol kind assumed for instances that do not name one.
-pub const DEFAULT_PROTOCOL: &str = "openai-compat";
-
-/// The delta field read as reasoning text by default (the DeepSeek spelling).
-pub const DEFAULT_THINKING_FIELD: &str = "reasoning_content";
-/// The request field that carries the per-turn effort by default (the
-/// OpenAI-standard top-level spelling).
-pub const DEFAULT_EFFORT_FIELD: &str = "reasoning_effort";
-/// The `wire.effort_field` value that never sends the per-turn effort, for
-/// endpoints that reject unknown request fields outright.
-pub const EFFORT_FIELD_NONE: &str = "none";
+/// The provider vocabulary lives in the contract crate so an external plugin
+/// can name it. The host keeps this path as the historical import site.
+pub use cst_plugin_api::config::{
+    DEFAULT_EFFORT_FIELD, DEFAULT_PROTOCOL, DEFAULT_THINKING_FIELD, EFFORT_FIELD_NONE, ModelInfo,
+    ProviderInstance, WireQuirks, expand_env_template, toml_table_to_json_map, toml_to_json,
+};
 
 /// `config.toml` — global settings.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
@@ -49,159 +43,6 @@ pub const EFFORT_FIELD_NONE: &str = "none";
 pub struct GlobalConfig {
     /// Initial model selection, `"provider/model"`.
     pub default: Option<String>,
-}
-
-/// One model of a provider: an id plus optional display metadata. The fields
-/// beyond `id` are advisory — `reasoning` and `default_level` feed `/effort`,
-/// the rest await consumers.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelInfo {
-    pub id: String,
-    pub name: Option<String>,
-    pub context_window: Option<u64>,
-    /// Reasoning effort levels the model accepts, lowest first.
-    pub reasoning: Option<Vec<String>>,
-    /// The reasoning effort this model prefers when none is set explicitly.
-    /// Adopted when the model is selected (startup or `/model`) until
-    /// `/effort` overrides it. Accepted from providers.toml and the models
-    /// API alike.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_level: Option<String>,
-}
-
-impl ModelInfo {
-    /// The id reduced to a bare `ModelInfo`, as produced by models discovery.
-    pub fn from_id(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            name: None,
-            context_window: None,
-            reasoning: None,
-            default_level: None,
-        }
-    }
-
-    pub fn display_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.id)
-    }
-}
-
-/// Per-instance wire quirks for the `openai-compat` protocol: the
-/// field-spelling variations providers actually disagree on, lifted out of
-/// code into data. Zero configuration reproduces the built-in behavior, so
-/// only the endpoint that needs it pays.
-///
-/// The vocabulary is deliberately small and free-form: providers invent new
-/// spellings faster than an enum can follow, and a field name is data, not
-/// logic. `WireQuirks` covers only the two points where the wire shape has no
-/// safe fallback — which delta field carries reasoning text, and where the
-/// per-turn effort goes. Everything else (usage token spellings, context
-/// window spellings, request body fixes) is already tolerated in code or
-/// expressible through [`ProviderInstance::body_overrides`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct WireQuirks {
-    /// Delta fields tried in order as reasoning text (first hit wins). An
-    /// empty list disables thinking parsing for the instance.
-    pub thinking_fields: Vec<String>,
-    /// The top-level request field that carries the per-turn effort selected
-    /// with `/effort`. [`EFFORT_FIELD_NONE`] never sends the field.
-    pub effort_field: String,
-}
-
-impl Default for WireQuirks {
-    fn default() -> Self {
-        Self {
-            thinking_fields: vec![DEFAULT_THINKING_FIELD.to_string()],
-            effort_field: DEFAULT_EFFORT_FIELD.to_string(),
-        }
-    }
-}
-
-impl WireQuirks {
-    /// Startup-time sanity checks: field names must be non-empty. Values
-    /// outside the documented vocabulary are allowed on purpose — a
-    /// provider's novel spelling is exactly what this layer is for.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.effort_field.trim().is_empty() {
-            return Err("wire.effort_field must not be empty".to_string());
-        }
-        for field in &self.thinking_fields {
-            if field.trim().is_empty() {
-                return Err("wire.thinking_fields entries must not be empty".to_string());
-            }
-        }
-        Ok(())
-    }
-}
-
-/// One provider instance: an endpoint configuration bound to a protocol kind
-/// ([`ProviderInstance::protocol_id`]). This is pure config data — turning it
-/// into a client is the registry's job.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderInstance {
-    /// Unique instance name; also the `provider` half of a selection. Must
-    /// not contain `/` (selections parse at the first slash).
-    pub name: String,
-    /// Protocol kind id; defaults to [`DEFAULT_PROTOCOL`].
-    pub protocol: Option<String>,
-    pub base_url: Option<String>,
-    /// API key or `$VAR` template. An empty/unresolved key fails the turn
-    /// with `NotConfigured` instead of failing startup, so a partial
-    /// providers.toml still boots.
-    pub api_key: Option<String>,
-    #[serde(default)]
-    pub models: Vec<ModelInfo>,
-    /// Fetch the model list from the provider's models API. Defaults to true
-    /// for instances that declare no models and false otherwise.
-    pub fetch_models: Option<bool>,
-    /// Static headers sent with every request (provider quirks, disguises).
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    /// JSON fields merged over the request body; overrides win.
-    #[serde(default, deserialize_with = "toml_table_to_json_map")]
-    pub body_overrides: serde_json::Map<String, Value>,
-    /// Wire quirks for the `openai-compat` protocol, baked into the client at
-    /// construction. `None` uses the built-in spellings
-    /// (`thinking_fields = [reasoning_content]`, `effort_field =
-    /// "reasoning_effort"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wire: Option<WireQuirks>,
-    /// Set only for instances synthesized from partial CLI/env input, where
-    /// `base_url` and `api_key` are expected as a pair: the openai-compat
-    /// factory gates such an instance at use time with a completion prompt
-    /// instead of sending a doomed request. Config-declared instances may
-    /// legitimately omit `api_key` (keyless endpoints), so they are never
-    /// gated for it.
-    #[serde(skip)]
-    pub requires_api_key: bool,
-}
-
-impl ProviderInstance {
-    pub fn protocol_id(&self) -> &str {
-        self.protocol.as_deref().unwrap_or(DEFAULT_PROTOCOL)
-    }
-
-    /// Whether models discovery should run for this instance.
-    pub fn should_fetch_models(&self) -> bool {
-        self.fetch_models.unwrap_or(self.models.is_empty())
-    }
-
-    /// The key resolved from its `$VAR` template, if any. `None` means the
-    /// instance carries no key (or its template is unset); `Some("")` is
-    /// impossible by construction.
-    pub fn resolved_api_key(&self) -> Option<String> {
-        self.api_key.as_deref().and_then(expand_env_template)
-    }
-
-    /// Whether the base URL is usable for a request.
-    pub fn has_base_url(&self) -> bool {
-        self.base_url
-            .as_deref()
-            .is_some_and(|url| !url.trim().is_empty())
-    }
 }
 
 /// The `/profile` command: with a name, switch this run's active profile;
@@ -295,6 +136,10 @@ pub enum ConfigError {
     Read { path: PathBuf, source: std::io::Error },
     #[error("cannot parse {path}: {source}")]
     Parse { path: PathBuf, source: toml::de::Error },
+    #[error("cannot write {path}: {source}")]
+    Write { path: PathBuf, source: std::io::Error },
+    #[error("cannot serialize {path}: {message}")]
+    Serialize { path: PathBuf, message: String },
 }
 
 /// `~/.codest/config.toml`; missing file → empty settings.
@@ -325,11 +170,67 @@ pub fn load_providers(path: &Path) -> Result<Vec<ProviderInstance>, ConfigError>
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProvidersFile {
     #[serde(default)]
     providers: Vec<ProviderInstance>,
+}
+
+/// Write `instances` back to `path` as `[[providers]]` entries.
+///
+/// This is the write half the `/provider` wizard needs. Two consequences are
+/// deliberate:
+///
+/// * **Comments and layout are lost.** The file becomes machine-managed after
+///   the first write (no `toml_edit` dependency for in-place edits). Users who
+///   want hand-formatted files should keep editing them by hand — the wizard
+///   only writes when it is explicitly asked to add a provider.
+/// * **The write is validated and atomic.** [`write_checked`] rejects a set the
+///   registry rules would reject, and the file is replaced via a temporary
+///   sibling + rename so a failure never leaves a half-written config.
+pub fn save_providers(path: &Path, instances: &[ProviderInstance]) -> Result<(), ConfigError> {
+    // `body_overrides` is a raw JSON map, and JSON can carry `null` where TOML
+    // cannot. Drop nulls rather than failing the write over a value that would
+    // never round-trip through TOML in the first place.
+    let sanitized: Vec<ProviderInstance> = instances
+        .iter()
+        .map(|instance| {
+            let mut instance = instance.clone();
+            instance.body_overrides.retain(|_, value| !value.is_null());
+            instance.options.retain(|_, value| !value.is_null());
+            instance
+        })
+        .collect();
+    let file = ProvidersFile {
+        providers: sanitized,
+    };
+    let text = toml::to_string_pretty(&file).map_err(|source| ConfigError::Serialize {
+        path: path.to_path_buf(),
+        message: source.to_string(),
+    })?;
+    write_checked(path, &text)
+}
+
+/// Replace `path` with `text` through a temporary sibling.
+fn write_checked(path: &Path, text: &str) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    std::fs::write(&temporary, text).map_err(|source| ConfigError::Write {
+        path: temporary.clone(),
+        source,
+    })?;
+    std::fs::rename(&temporary, path).map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> {
@@ -340,20 +241,6 @@ fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> {
             path: path.to_path_buf(),
             source,
         }),
-    }
-}
-
-/// Expand a `$VAR` template. A literal (no leading `$`) passes through;
-/// `$VAR` reads the environment, and an unset or empty variable yields `None`
-/// so callers can report the missing template instead of sending garbage.
-pub fn expand_env_template(value: &str) -> Option<String> {
-    match value.strip_prefix('$') {
-        None => Some(value.to_string()),
-        Some("") => Some(value.to_string()),
-        Some(var) => std::env::var(var)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
     }
 }
 
@@ -375,33 +262,6 @@ pub fn profiles_path() -> PathBuf {
 /// `~/.codest/model-cache.json` — the fetched model lists.
 pub fn model_cache_path() -> PathBuf {
     codest_home().join("model-cache.json")
-}
-
-/// Deserialize a TOML table into a `serde_json` map. TOML is JSON-compatible
-/// apart from datetimes, which render as their RFC 3339 string.
-fn toml_table_to_json_map<'de, D>(deserializer: D) -> Result<serde_json::Map<String, Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let table = toml::Table::deserialize(deserializer)?;
-    Ok(toml_to_json(&toml::Value::Table(table))
-        .as_object()
-        .cloned()
-        .unwrap_or_default())
-}
-
-fn toml_to_json(value: &toml::Value) -> Value {
-    match value {
-        toml::Value::String(text) => Value::String(text.clone()),
-        toml::Value::Integer(number) => Value::from(*number),
-        toml::Value::Float(number) => Value::from(*number),
-        toml::Value::Boolean(flag) => Value::from(*flag),
-        toml::Value::Datetime(stamp) => Value::String(stamp.to_string()),
-        toml::Value::Array(items) => Value::Array(items.iter().map(toml_to_json).collect()),
-        toml::Value::Table(table) => {
-            Value::Object(table.iter().map(|(k, v)| (k.clone(), toml_to_json(v))).collect())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -675,5 +535,103 @@ append = "你是资深 Rust 工程师…"
         );
         unsafe { std::env::set_var("CODEST_TEST_EMPTY_XYZ", "   ") };
         assert_eq!(expand_env_template("$CODEST_TEST_EMPTY_XYZ"), None);
+    }
+
+    /// The wizard's write path: what it saves must load back identically,
+    /// including the plugin-private `[providers.options]` pocket.
+    #[test]
+    fn save_providers_round_trips_through_the_loader() {
+        let path = std::env::temp_dir().join(format!(
+            "codest-config-{}-save/providers.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+        let instances = vec![
+            ProviderInstance {
+                name: "qoder".to_string(),
+                protocol: Some("qoder".to_string()),
+                base_url: Some("https://api3.qoder.sh/".to_string()),
+                api_key: None,
+                models: vec![ModelInfo::from_id("auto")],
+                fetch_models: Some(true),
+                headers: Default::default(),
+                body_overrides: Default::default(),
+                wire: None,
+                options: [(
+                    "open_api_url".to_string(),
+                    serde_json::json!("https://openapi.qoder.sh"),
+                )]
+                .into_iter()
+                .collect(),
+                requires_api_key: false,
+            },
+            ProviderInstance {
+                name: "local".to_string(),
+                protocol: None,
+                base_url: Some("http://127.0.0.1:8080/v1".to_string()),
+                api_key: Some("$LOCAL_KEY".to_string()),
+                models: Vec::new(),
+                fetch_models: None,
+                headers: [("X-Test".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+                body_overrides: [("temperature".to_string(), serde_json::json!(0.2))]
+                    .into_iter()
+                    .collect(),
+                wire: None,
+                options: Default::default(),
+                requires_api_key: false,
+            },
+        ];
+
+        save_providers(&path, &instances).expect("write");
+        // The parent directory is created, not required to exist.
+        assert!(path.exists());
+        assert_eq!(load_providers(&path).expect("read back"), instances);
+
+        // A second write replaces the file rather than appending to it.
+        save_providers(&path, &instances[1..]).expect("rewrite");
+        let loaded = load_providers(&path).expect("read back");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "local");
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+    }
+
+    /// JSON can carry `null`; TOML cannot. A null in `body_overrides` is
+    /// dropped instead of failing the whole write.
+    #[test]
+    fn save_providers_drops_null_overrides() {
+        let path = std::env::temp_dir().join(format!(
+            "codest-config-{}-null/providers.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
+        let instance = ProviderInstance {
+            name: "x".to_string(),
+            protocol: None,
+            base_url: None,
+            api_key: None,
+            models: Vec::new(),
+            fetch_models: None,
+            headers: Default::default(),
+            body_overrides: [
+                ("keep".to_string(), serde_json::json!(1)),
+                ("drop".to_string(), serde_json::Value::Null),
+            ]
+            .into_iter()
+            .collect(),
+            wire: None,
+            options: Default::default(),
+            requires_api_key: false,
+        };
+        save_providers(&path, &[instance]).expect("write");
+        let loaded = load_providers(&path).expect("read back");
+        assert_eq!(
+            loaded[0].body_overrides.get("keep"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(loaded[0].body_overrides.get("drop"), None);
+        let _ = std::fs::remove_dir_all(path.parent().expect("parent"));
     }
 }

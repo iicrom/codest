@@ -142,6 +142,19 @@ effort = "low"
 - 开启了 `fetch_models` 的实例在启动时后台发现模型，结果合并进菜单并缓存到 `~/.codest/model-cache.json`（失败只产生一条通知，绝不阻塞会话）；
 - 会话 rollout 记录初始与切换后的模型（`SessionMeta` 与 `model_switched` 行），旧 rollout 文件照常加载。
 
+### `/provider` 添加 provider 与登录
+
+| 指令 | 行为 |
+| --- | --- |
+| `/provider` | 打开 provider 向导：新增 OpenAI 兼容端点、登录插件贡献的 provider、查看已配置列表 |
+
+- **Add an OpenAI-compatible provider**：依次填 route name、base URL、API key（可空，支持 `$VAR`）、model id（可空 = 启动时发现）；进入确认屏前探测一次 `GET /models`，探测失败不阻塞写入；
+- **Sign in to a plugin provider**：只有插件贡献了登录入口时才出现。宿主按协议把已配置实例与插件配对，登录状态读自插件的本地凭据；浏览器/设备流授权后自动完成，`Esc` 取消；
+- 确认后先原子写回 `~/.codest/providers.toml`，再让新 provider 立即出现在 `/model`，随后后台发现模型；
+- 写回会丢失文件里的注释与排版（不引入 `toml_edit`），所以向导只在明确添加时才写。
+
+细节见 `docs/provider.md`。
+
 ### 插件贡献自定义协议
 
 端点说 OpenAI 方言时**不需要写代码**（配置 `headers` / `body_overrides` 即可）；请求体结构、流格式、签名机制不同时，插件实现 `ProtocolFactory`（编译期）并在 `providers.toml` 里以 `protocol = "<id>"` 引用：
@@ -164,6 +177,8 @@ models = [{ id = "vendor-large" }]
 ```
 
 协议插件与命令插件一样是编译期静态链接的：它给的是维护者的模块化，不是运行时可扩展性。工厂示例与扩展契约见 [`docs/multi-provider.md`](docs/multi-provider.md) 第 8 节。
+
+第三方插件仓库可以独立维护：契约类型在 `crates/cst-plugin-api`，插件依赖它，宿主依赖插件（所以没有 Cargo 循环依赖）。接入是 `cargo add --path ../my-plugin` 加 `src/plugins/local.rs` 里的一行。完整步骤见 [`docs/local-plugins.md`](docs/local-plugins.md)；参考实现是 [`../cst-provider-qoder`](../cst-provider-qoder)（Qoder 的 COSY 签名协议 + 浏览器/PAT 登录）。
 
 ## TUI 模式（fullscreen / inline）
 
@@ -218,6 +233,7 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 | `/rename <name>` | — | 重命名当前会话；默认名取该会话第一句用户输入 |
 | `/sessions` | `/resume` | 打开会话列表菜单，切换并继续以前的会话 |
 | `/model` | — | 打开模型菜单，在 `provider/model` 之间切换（见"多 Provider"） |
+| `/provider` | — | 打开 provider 向导：新增 OpenAI 兼容端点、登录插件贡献的 provider、查看已配置列表（见"`/provider`"） |
 | `/effort [level]` | — | 查看或设置模型推理等级：无参数打开 `↑`/`↓` 选择菜单，`/effort <level>` 直接设置，`off` 清除；随请求以 `reasoning_effort` 字段发送。等级表来自模型的 `reasoning` 声明或 models API 的 `default_level`（选中模型时自动采纳为初始值） |
 | `/thinking` | — | 切换模型思考过程（thinking 输出）的折叠/展开 |
 
@@ -270,7 +286,7 @@ codest 的指令和生命周期扩展都来自**编译期链接**的插件，不
 - 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、报告块、清屏、退出、设置输入框、提交新回合），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
 - 重复插件 id、重复命令名/别名、重复工具名、非法命令名会在启动时被拒绝。
 
-内置的 `/help`、`/clear`、`/quit`、`/status`、`/context` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)。
+内置的 `/help`、`/clear`、`/quit`、`/status`、`/context` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)；外部插件的安装与契约版本规则见 [`docs/local-plugins.md`](docs/local-plugins.md)。
 
 新增插件的最小步骤：
 
@@ -384,7 +400,8 @@ codest/
 1. 在 `Op` 中加入工具调用与审批事件，向 codex 的 SQ/EQ 靠拢，并让插件可以注册工具。
 2. 为 `Conversation` 增加 token 预算与压缩（消费 `ModelInfo::context_window` 与 `TurnUsage`）。
 3. `/effort` 写回 `config.toml` 作为全局默认。
-4. `/model` 菜单内添加/编辑端点（表单向导或 `$EDITOR`），写回 `providers.toml`。
+4. `/provider` 菜单里删除 provider（`ModelPool::remove_instance()` 已就绪，尚未接菜单）；以及保留注释的 `toml_edit` 写回。
 5. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
 6. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。
-7. 用 `inventory`/`linkme` 做分布式静态注册，保持 `Plugin` 契约不变。
+7. 用 `inventory`/`linkme` 做分布式静态注册，保持 `Plugin` 契约不变（`cst-plugin-api` 拆分后只影响宿主侧收集方式）。
+8. 统一本地插件安装方式（`cargo install --git` / 私有 registry / `cst plugin add` 子命令），取决于第三方插件的实际数量。

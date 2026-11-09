@@ -874,6 +874,11 @@ async fn run_turn(
                         Some(Ok(StreamItem::Usage { input, output })) => {
                             turn.usage = Some((input, output));
                         }
+                        // `StreamItem` is `#[non_exhaustive]` and lives in the
+                        // contract crate, so a plugin protocol adding a variant
+                        // cannot break this build: unknown items are ignored
+                        // rather than ending the turn.
+                        Some(Ok(_)) => {}
                         Some(Err(error)) => {
                             finalize_error(turn, conversation, rollouts, current, tx, &error.to_string());
                             interrupt.clear();
@@ -1881,6 +1886,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry =
@@ -1961,6 +1967,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry = crate::core::providers::ProviderRegistry::build(
@@ -2075,6 +2082,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: true,
         };
         let registry = crate::core::providers::ProviderRegistry::build(&[], vec![instance])
@@ -2207,6 +2215,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry =

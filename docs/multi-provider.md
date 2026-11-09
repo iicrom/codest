@@ -222,7 +222,23 @@ impl Plugin for Vendor {
 
 要诚实的边界：静态插件体系下，协议插件给的是**维护者的模块化**（vendor 协议代码
 不进 core、可按 feature 裁剪），不是最终用户的可扩展性——第三方仍需重新编译。
-配置文件才是面向用户的扩展面。
+
+不过“第三方要重新编译”已经变成**两步可达的操作**，而不是“改宿主源码”：
+
+- 契约类型（`ProtocolFactory`、`ModelClient`、`ProviderInstance`、`SseDecoder` …）
+  拆到了独立的 `cst-plugin-api` crate。插件仓库依赖它，宿主依赖插件，因此没有
+  Cargo 循环依赖（§8 的 `VendorFactory` 例子现在写在插件仓库里）；
+- 宿主侧只需 `cargo add --path` 加依赖，并在 `src/plugins/local.rs` 登记一行，
+  然后 `cargo build`。详见 `docs/local-plugins.md`。
+
+`ProviderInstance` 为此新增了一个通用口袋 `[providers.options]`：插件私有配置原样
+传给 `ProtocolFactory`，宿主从不解释任何键。守住的底线是——未知的**顶层**键仍然
+是启动错误，配置文件继续是面向用户的扩展面。
+
+运行时新增 provider 也已落地：`ModelPool` 的注册表由不可变字段改为
+`RwLock<Arc<ProviderRegistry>>`，`install_instance()` 复用启动时的校验并逐出该
+provider 的 client 缓存（旧 client 烘焙着旧 `base_url`/`api_key`）。`/provider`
+向导是它的唯一调用方，见 `docs/provider.md`。
 
 ## 9. 测试策略
 

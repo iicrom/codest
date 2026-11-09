@@ -216,6 +216,7 @@ pub async fn run(
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel::<ProviderTask>();
     let model_label = selection
         .as_ref()
         .map(Selection::as_str)
@@ -226,6 +227,8 @@ pub async fn run(
         pool,
         notice_tx.clone(),
         notice_rx,
+        provider_tx,
+        provider_tasks,
         model_label,
         mode,
         plugins,
@@ -429,6 +432,23 @@ fn inline_pane_height(rows: u16, composer_rows: usize, has_live: bool, menu_rows
     (composer + live + menu + 1).min(rows.max(1))
 }
 
+/// A result from background `/provider` work, delivered to the event loop.
+///
+/// The wizard never blocks the render thread: a probe or a browser sign-in
+/// runs on its own task and reports back through this channel, exactly like
+/// `spawn_discovery` reports through `notice_tx`.
+enum ProviderTask {
+    /// Model discovery for a draft endpoint finished.
+    Probed(Result<Vec<crate::core::config::ModelInfo>, String>),
+    /// A sign-in flow reported progress (a device URL, a wait notice).
+    SignInNotice {
+        message: String,
+        url: Option<String>,
+    },
+    /// A sign-in flow finished. `Ok(Some(account))` carries a label.
+    SignedIn(Result<Option<String>, String>),
+}
+
 struct App {
     session: AgentSession,
     plugins: Arc<PluginHost>,
@@ -460,6 +480,14 @@ struct App {
     model_menu: Option<ModelMenu>,
     /// Open `/effort` picker over the reasoning effort levels.
     effort_menu: Option<EffortMenu>,
+    /// Open `/provider` wizard (`Some` while it owns the input).
+    provider_wizard: Option<crate::tui::provider_wizard::Wizard>,
+    /// Results from background wizard work (model probes, sign-ins).
+    provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderTask>,
+    provider_tasks: tokio::sync::mpsc::UnboundedReceiver<ProviderTask>,
+    provider_tasks_closed: bool,
+    /// Cancels the wizard's in-flight background task on Esc.
+    provider_cancel: Option<tokio_util::sync::CancellationToken>,
     /// The reasoning effort sent with every turn (`/effort`); `None` sends no
     /// effort field at all. Updated optimistically, confirmed by
     /// `ReasoningEffortSwitched`.
@@ -555,6 +583,8 @@ impl App {
         pool: Arc<ModelPool>,
         notice_tx: tokio::sync::mpsc::UnboundedSender<String>,
         notices: tokio::sync::mpsc::UnboundedReceiver<String>,
+        provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderTask>,
+        provider_tasks: tokio::sync::mpsc::UnboundedReceiver<ProviderTask>,
         model_label: String,
         mode: TuiMode,
         plugins: Arc<PluginHost>,
@@ -600,6 +630,11 @@ impl App {
             session_menu: None,
             model_menu: None,
             effort_menu: None,
+            provider_wizard: None,
+            provider_tx,
+            provider_tasks,
+            provider_tasks_closed: false,
+            provider_cancel: None,
             effort,
             profiles,
             active_profile,
@@ -629,10 +664,13 @@ impl App {
     /// Re-derive [`RequestFacts`] from the active route's provider instance.
     /// Called at startup and on every model switch, optimistic or confirmed.
     fn refresh_request_facts(&mut self) {
+        // The registry is now swapped by `/provider`, so a snapshot is taken
+        // first and the facts are cloned out of it.
+        let registry = self.pool.registry();
         self.request_facts = match self
             .route
             .as_ref()
-            .and_then(|route| self.pool.registry().instance(&route.provider))
+            .and_then(|route| registry.instance(&route.provider))
         {
             Some(instance) => RequestFacts {
                 protocol: instance.protocol_id().to_string(),
@@ -687,6 +725,12 @@ impl App {
                     match maybe_event {
                         Some(event) => self.handle_agent_event(event),
                         None => break,
+                    }
+                }
+                maybe_task = self.provider_tasks.recv(), if !self.provider_tasks_closed => {
+                    match maybe_task {
+                        Some(task) => self.handle_provider_task(task),
+                        None => self.provider_tasks_closed = true,
                     }
                 }
                 maybe_notice = self.notices.recv(), if !self.notices_closed => {
@@ -900,6 +944,77 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        // The `/provider` wizard owns the keyboard while it is open: its text
+        // steps type into the composer, its pickers take ↑↓, and Enter/Esc mean
+        // "next"/"back" rather than "submit"/"interrupt". It returns here so
+        // the pickers below never see the same key.
+        if self.provider_wizard.is_some() {
+            if self.handle_provider_key(key) {
+                return;
+            }
+            // A text step: typing and editing fall through to the composer.
+            match key.code {
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    self.composer.insert_char(c);
+                    return;
+                }
+                KeyCode::Backspace => {
+                    self.composer.backspace();
+                    return;
+                }
+                KeyCode::Delete => {
+                    self.composer.delete();
+                    return;
+                }
+                KeyCode::Left => {
+                    self.composer.move_left();
+                    return;
+                }
+                KeyCode::Right => {
+                    self.composer.move_right();
+                    return;
+                }
+                KeyCode::Home => {
+                    self.composer.home();
+                    return;
+                }
+                KeyCode::End => {
+                    self.composer.end();
+                    return;
+                }
+                KeyCode::Char('a') if ctrl => {
+                    self.composer.home();
+                    return;
+                }
+                KeyCode::Char('e') if ctrl => {
+                    self.composer.end();
+                    return;
+                }
+                KeyCode::Char('u') if ctrl => {
+                    self.composer.kill_to_start();
+                    return;
+                }
+                KeyCode::Char('k') if ctrl => {
+                    self.composer.kill_to_end();
+                    return;
+                }
+                KeyCode::Char('w') if ctrl => {
+                    self.composer.delete_word_backward();
+                    return;
+                }
+                KeyCode::Enter if ctrl || alt || shift => {
+                    self.composer.insert_char('\n');
+                    return;
+                }
+                KeyCode::Char('c') if ctrl => {
+                    // Ctrl+C always leaves the wizard rather than quitting.
+                    self.close_provider_wizard();
+                    return;
+                }
+                _ => return,
+            }
+        }
+
         // The `/sessions`, `/model`, and `/effort` pickers are modal for
         // navigation keys: ↑↓ move, plain Enter confirms, Esc closes.
         // Everything else (typing, Ctrl+C, ...) still reaches its normal
@@ -1050,6 +1165,7 @@ impl App {
             || self.session_menu.is_some()
             || self.model_menu.is_some()
             || self.effort_menu.is_some()
+            || self.provider_wizard.is_some()
         {
             return Vec::new();
         }
@@ -1170,6 +1286,7 @@ impl App {
             "rename" => return self.rename_session(&invocation.args),
             "sessions" => return self.open_session_menu(),
             "model" => return self.open_model_menu(),
+            "provider" => return self.open_provider_wizard(),
             // `/effort` with a level sets it directly; with no argument it
             // opens the picker (the argument policy is Optional).
             "effort" => {
@@ -1397,6 +1514,400 @@ impl App {
             return;
         };
         self.spawn_discovery(&item.selection.provider);
+    }
+
+    // -----------------------------------------------------------------------
+    // `/provider` wizard
+    // -----------------------------------------------------------------------
+
+    /// `/provider`: open the wizard. The sign-in targets are assembled from the
+    /// plugins' entries crossed with the configured instances, so an instance
+    /// whose protocol a plugin serves gets a sign-in row even though the plugin
+    /// knows nothing about `providers.toml`.
+    fn open_provider_wizard(&mut self) {
+        self.command_menu_dismissed = true;
+        let targets = self.sign_in_targets();
+        let configured = self.configured_rows();
+        let mut wizard = crate::tui::provider_wizard::Wizard::new(targets);
+        wizard.configured = configured;
+        self.provider_wizard = Some(wizard);
+        self.composer.clear();
+    }
+
+    /// The read-only "what is configured" rows, with a sign-in badge for any
+    /// protocol a plugin serves.
+    fn configured_rows(&self) -> Vec<crate::tui::provider_wizard::ConfiguredRow> {
+        use crate::tui::provider_wizard::ConfiguredRow;
+
+        let registry = self.pool.registry();
+        registry
+            .instances()
+            .iter()
+            .map(|instance| {
+                let protocol = instance.protocol_id();
+                let status = self.plugins.auth_status(&instance.name, protocol);
+                ConfiguredRow {
+                    name: instance.name.clone(),
+                    protocol: protocol.to_string(),
+                    base_url: instance.base_url.clone().unwrap_or_default(),
+                    models: self.pool.models_of(&instance.name).len(),
+                    status: match status {
+                        cst_plugin_api::auth::AuthStatus::Unsupported => None,
+                        other => Some(other),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Every sign-in row the menu offers: one per configured instance whose
+    /// protocol has a plugin entry, plus one per entry that no instance uses
+    /// yet (selecting it signs in and then creates the instance).
+    fn sign_in_targets(&self) -> Vec<crate::tui::provider_wizard::SignInTarget> {
+        use crate::tui::provider_wizard::SignInTarget;
+
+        let registry = self.pool.registry();
+        let entries = self.plugins.auth_providers();
+        let mut targets: Vec<SignInTarget> = Vec::new();
+
+        for instance in registry.instances() {
+            let protocol = instance.protocol_id();
+            let Some((_, provider)) = entries
+                .iter()
+                .find(|(_, provider)| provider.protocol == protocol)
+                .copied()
+            else {
+                continue;
+            };
+            let status = self.plugins.auth_status(&instance.name, protocol);
+            targets.push(SignInTarget {
+                instance: instance.name.clone(),
+                configured: true,
+                provider,
+                status,
+            });
+        }
+
+        // Entries whose protocol no instance uses yet: the wizard creates the
+        // instance on success.
+        let configured_protocols: Vec<&str> = targets
+            .iter()
+            .map(|target| target.provider.protocol)
+            .collect();
+        for (_, provider) in entries {
+            if configured_protocols.contains(&provider.protocol) {
+                continue;
+            }
+            if targets.iter().any(|target| target.instance == provider.id) {
+                continue;
+            }
+            targets.push(SignInTarget {
+                instance: provider.id.to_string(),
+                configured: false,
+                provider,
+                status: self.plugins.auth_status(provider.id, provider.protocol),
+            });
+        }
+        targets
+    }
+
+    /// Route a keystroke into the wizard. Returns `true` when the wizard
+    /// consumed it, so the composer never sees it.
+    fn handle_provider_key(&mut self, key: KeyEvent) -> bool {
+        let Some(wizard) = self.provider_wizard.as_ref() else {
+            return false;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // While background work runs, only cancellation is meaningful.
+        if wizard.step.is_busy() {
+            if key.code == KeyCode::Esc {
+                self.cancel_provider_task();
+            }
+            return true;
+        }
+
+        match key.code {
+            KeyCode::Up if wizard.step.is_picker() => {
+                if let Some(wizard) = self.provider_wizard.as_mut() {
+                    wizard.move_selection(-1);
+                }
+                true
+            }
+            KeyCode::Down if wizard.step.is_picker() => {
+                if let Some(wizard) = self.provider_wizard.as_mut() {
+                    wizard.move_selection(1);
+                }
+                true
+            }
+            KeyCode::Enter if !ctrl && !alt && !shift => {
+                self.confirm_provider_step();
+                true
+            }
+            KeyCode::Esc => {
+                self.back_provider_step();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Enter inside the wizard: confirm the highlighted row, or submit the text
+    /// field the current step collects.
+    fn confirm_provider_step(&mut self) {
+        let existing: Vec<String> = self
+            .pool
+            .registry()
+            .instances()
+            .iter()
+            .map(|instance| instance.name.clone())
+            .collect();
+        let Some(wizard) = self.provider_wizard.as_mut() else {
+            return;
+        };
+        let action = if let Some(field) = wizard.field() {
+            let value = self.composer.text();
+            match wizard.submit_field(&value, &existing) {
+                Ok(action) => {
+                    self.composer.clear();
+                    if field.is_secret() {
+                        // A secret must not survive in the input history.
+                        self.prompts.pop();
+                    }
+                    action
+                }
+                Err(error) => {
+                    wizard.status = Some(error.message());
+                    return;
+                }
+            }
+        } else {
+            wizard.confirm()
+        };
+        self.run_provider_action(action);
+    }
+
+    /// Esc inside the wizard: one step back, or leave from the top.
+    fn back_provider_step(&mut self) {
+        let Some(wizard) = self.provider_wizard.as_mut() else {
+            return;
+        };
+        let action = wizard.back();
+        if action == crate::tui::provider_wizard::WizardAction::Close {
+            self.close_provider_wizard();
+        } else {
+            self.composer.clear();
+        }
+    }
+
+    fn close_provider_wizard(&mut self) {
+        self.cancel_provider_task();
+        self.provider_wizard = None;
+        self.composer.clear();
+    }
+
+    /// Cancel whatever background work the wizard started.
+    fn cancel_provider_task(&mut self) {
+        if let Some(cancel) = self.provider_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(wizard) = self.provider_wizard.as_mut() {
+            wizard.status = Some("cancelled".to_string());
+            if wizard.step.is_busy() {
+                wizard.step = crate::tui::provider_wizard::Step::Action;
+                wizard.selected = 0;
+            }
+        }
+    }
+
+    /// Perform one transition's side effect.
+    fn run_provider_action(&mut self, action: crate::tui::provider_wizard::WizardAction) {
+        use crate::tui::provider_wizard::WizardAction;
+
+        match action {
+            WizardAction::None => {}
+            WizardAction::Close => self.close_provider_wizard(),
+            WizardAction::ProbeModels(instance) => self.spawn_probe(instance),
+            WizardAction::BeginSignIn {
+                instance,
+                method,
+                secret,
+            } => self.spawn_sign_in(&instance, method, secret),
+            WizardAction::Persist(instance) | WizardAction::InstallDefaults(instance) => {
+                self.persist_provider(instance);
+            }
+        }
+    }
+
+    /// Probe a draft endpoint's model list in the background. A probe is
+    /// advisory: it fills the confirm screen with a count and never blocks the
+    /// write.
+    fn spawn_probe(&mut self, instance: crate::core::config::ProviderInstance) {
+        let pool = self.pool.clone();
+        let tx = self.provider_tx.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let token = cancel.clone();
+        self.provider_cancel = Some(cancel);
+        tokio::spawn(async move {
+            // Register the draft provisionally so the pool can answer the
+            // models call, then put the previous instance back: the probe must
+            // not leave a half-configured provider selectable.
+            let previous = pool.registry().instance(&instance.name).cloned();
+            if pool.install_instance(instance.clone()).is_err() {
+                let _ = tx.send(ProviderTask::Probed(Err(
+                    "the draft endpoint is not a valid provider configuration".to_string(),
+                )));
+                return;
+            }
+            let models = pool.refresh(&instance.name).await;
+            match previous {
+                Some(previous) => {
+                    let _ = pool.install_instance(previous);
+                }
+                None => {
+                    let _ = pool.remove_instance(&instance.name);
+                }
+            }
+            if token.is_cancelled() {
+                return;
+            }
+            let result = match models {
+                Ok(_) => Ok(pool.models_of(&instance.name)),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = tx.send(ProviderTask::Probed(result));
+        });
+    }
+
+    /// Run a plugin's sign-in flow in the background and forward its notices.
+    fn spawn_sign_in(&mut self, instance: &str, method: &'static str, secret: Option<String>) {
+        let protocol = self.protocol_of(instance).unwrap_or_default();
+        let Some(plugin) = self.plugins.auth_plugin_for_protocol(&protocol) else {
+            if let Some(wizard) = self.provider_wizard.as_mut() {
+                wizard.status = Some(format!("no plugin signs in to `{instance}`"));
+                wizard.step = crate::tui::provider_wizard::Step::Action;
+            }
+            return;
+        };
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let token = cancel.clone();
+        self.provider_cancel = Some(cancel);
+
+        let tx = self.provider_tx.clone();
+        let notify_tx = tx.clone();
+        let notifier = cst_plugin_api::auth::SignInNotifier::new(move |notice| {
+            let _ = notify_tx.send(ProviderTask::SignInNotice {
+                message: notice.message,
+                url: notice.url,
+            });
+        });
+        let instance_name = instance.to_string();
+        let method = method.to_string();
+
+        let Some(future) =
+            plugin.begin_sign_in(&instance_name, &method, secret, notifier, token.clone())
+        else {
+            if let Some(wizard) = self.provider_wizard.as_mut() {
+                wizard.status =
+                    Some(format!("`{instance_name}` does not support that sign-in method"));
+                wizard.step = crate::tui::provider_wizard::Step::Action;
+            }
+            return;
+        };
+
+        tokio::spawn(async move {
+            let result = future.await;
+            if token.is_cancelled() {
+                return;
+            }
+            let _ = tx.send(ProviderTask::SignedIn(match result {
+                Ok(outcome) => Ok(outcome.account),
+                Err(error) => Err(error.to_string()),
+            }));
+        });
+    }
+
+    /// The protocol an instance (or a plugin's default route) uses.
+    fn protocol_of(&self, instance: &str) -> Option<String> {
+        if let Some(configured) = self.pool.registry().instance(instance) {
+            return Some(configured.protocol_id().to_string());
+        }
+        self.plugins
+            .auth_providers()
+            .into_iter()
+            .find(|(_, provider)| provider.id == instance)
+            .map(|(_, provider)| provider.protocol.to_string())
+    }
+
+    /// Write one instance to `providers.toml` and make it live.
+    ///
+    /// The file write happens first: if it fails nothing else changes, so the
+    /// in-memory pool never disagrees with what a restart would load. The file
+    /// is rewritten from the pool's current instances plus the new one, which
+    /// is why an instance the wizard did not touch keeps its values.
+    fn persist_provider(&mut self, instance: crate::core::config::ProviderInstance) {
+        let name = instance.name.clone();
+        let mut instances: Vec<crate::core::config::ProviderInstance> = self
+            .pool
+            .registry()
+            .instances()
+            .iter()
+            .filter(|existing| existing.name != name)
+            .cloned()
+            .collect();
+        instances.push(instance.clone());
+
+        if let Err(error) = crate::core::config::save_providers(
+            &crate::core::config::providers_path(),
+            &instances,
+        ) {
+            if let Some(wizard) = self.provider_wizard.as_mut() {
+                wizard.status = Some(format!("cannot write providers.toml: {error}"));
+            }
+            return;
+        }
+
+        if let Err(error) = self.pool.install_instance(instance) {
+            if let Some(wizard) = self.provider_wizard.as_mut() {
+                wizard.status =
+                    Some(format!("provider `{name}` was written but is unusable: {error}"));
+            }
+            return;
+        }
+
+        self.provider_wizard = None;
+        self.composer.clear();
+        self.refresh_request_facts();
+        self.view_mut()
+            .history
+            .push(HistoryCell::Notice(format!("added provider `{name}`")));
+        self.spawn_discovery(&name);
+    }
+
+    /// Apply a background result to the open wizard, or ignore it when the
+    /// wizard was closed.
+    fn handle_provider_task(&mut self, task: ProviderTask) {
+        let Some(wizard) = self.provider_wizard.as_mut() else {
+            return;
+        };
+        let action = match task {
+            ProviderTask::Probed(result) => {
+                wizard.probe_finished(result);
+                None
+            }
+            ProviderTask::SignInNotice { message, url } => {
+                wizard.sign_in_notice(message, url);
+                None
+            }
+            ProviderTask::SignedIn(result) => Some(wizard.sign_in_finished(result)),
+        };
+        self.provider_cancel = None;
+        if let Some(action) = action {
+            self.run_provider_action(action);
+        }
     }
 
     /// The effort levels the active model accepts: its declared `reasoning`
@@ -2023,6 +2534,11 @@ impl App {
     /// `/model`, `/effort`) when it is open, otherwise the slash-command
     /// candidates. Empty when neither is visible.
     fn menu_row_count(&self) -> usize {
+        if let Some(wizard) = self.provider_wizard.as_ref() {
+            // Pickers show their rows; a text step shows the prompt; a running
+            // step shows the status line. Never more than the shared cap.
+            return wizard_rows(wizard).min(MAX_COMMAND_MENU_ROWS);
+        }
         if let Some(menu) = self.model_menu.as_ref() {
             menu.items.len().min(MAX_COMMAND_MENU_ROWS)
         } else if let Some(menu) = self.effort_menu.as_ref() {
@@ -2037,6 +2553,9 @@ impl App {
     /// The menu lines, windowed around the selection so it stays visible
     /// within `height` rows.
     fn menu_lines(&self, height: usize) -> Vec<Line<'static>> {
+        if let Some(wizard) = self.provider_wizard.as_ref() {
+            return provider_menu_lines(wizard, &self.composer.text());
+        }
         if let Some(menu) = self.model_menu.as_ref() {
             let window = command_menu_window(menu.items.len(), menu.selected, height);
             return window
@@ -2251,7 +2770,9 @@ impl App {
         } else {
             "ready".to_string()
         };
-        let hints = if self.session_menu.is_some() {
+        let hints = if let Some(wizard) = self.provider_wizard.as_ref() {
+            wizard.hint()
+        } else if self.session_menu.is_some() {
             "↑↓ select · Enter switch · Esc close"
         } else if self.model_menu.is_some() {
             "↑↓ select · Enter switch · r refresh · Esc close"
@@ -2339,6 +2860,274 @@ fn command_menu_window(len: usize, selected: usize, height: usize) -> std::ops::
     let selected = selected.min(len - 1);
     let start = selected.saturating_sub(height - 1).min(len - height);
     start..start + height
+}
+
+/// How many rows the wizard needs: one per picker row, plus a persistent
+/// status line when one exists. Text steps keep a single prompt row so the
+/// composer directly underneath reads as its input.
+fn wizard_rows(wizard: &crate::tui::provider_wizard::Wizard) -> usize {
+    use crate::tui::provider_wizard::Step;
+    let rows = match wizard.step {
+        Step::Action | Step::SignInPick | Step::SignInMethod => wizard.row_count(),
+        Step::AddConfirm => 5,
+        Step::Configured => wizard.row_count().max(1),
+        _ => 1,
+    };
+    if wizard.status.is_some() && !matches!(
+        wizard.step,
+        Step::AddConfirm | Step::AddProbe | Step::SignInRunning
+    ) {
+        rows + 1
+    } else {
+        rows
+    }
+}
+
+/// Render the wizard as menu-strip lines above the composer — the same
+/// non-overlay shape every other picker uses, so nothing has to be erased.
+fn provider_menu_lines(
+    wizard: &crate::tui::provider_wizard::Wizard,
+    input: &str,
+) -> Vec<Line<'static>> {
+    use crate::tui::provider_wizard::Step;
+
+    let mut lines = Vec::new();
+    match wizard.step {
+        Step::Action => {
+            let actions = wizard.actions();
+            for (index, action) in actions.iter().enumerate() {
+                lines.push(provider_option_line(
+                    index,
+                    action_label(*action),
+                    action_description(*action),
+                    index == wizard.selected,
+                ));
+            }
+        }
+        Step::SignInPick => {
+            if wizard.targets.is_empty() {
+                lines.push(provider_note("no plugin offers a sign-in entry"));
+            } else {
+                for (index, target) in wizard.targets.iter().enumerate() {
+                    let description = if target.configured {
+                        target.provider.label.to_string()
+                    } else {
+                        format!("{} · creates the route", target.provider.label)
+                    };
+                    let mut line = provider_option_line(
+                        index,
+                        target.instance.clone(),
+                        description,
+                        index == wizard.selected,
+                    );
+                    let badge = target.status_label();
+                    if !badge.is_empty() {
+                        line.spans.push(Span::styled(
+                            format!(" · {badge}"),
+                            Style::default()
+                                .fg(theme::DIM)
+                                .add_modifier(Modifier::ITALIC),
+                        ));
+                    }
+                    lines.push(line);
+                }
+            }
+        }
+        Step::SignInMethod => {
+            let methods = wizard
+                .chosen
+                .as_ref()
+                .map(|target| target.provider.methods)
+                .unwrap_or_default();
+            for (index, method) in methods.iter().enumerate() {
+                lines.push(provider_option_line(
+                    index,
+                    method.label.to_string(),
+                    if index == 0 {
+                        "recommended".to_string()
+                    } else {
+                        String::new()
+                    },
+                    index == wizard.selected,
+                ));
+            }
+        }
+        Step::Configured => {
+            if wizard.configured.is_empty() {
+                lines.push(provider_note("no providers are configured yet"));
+            } else {
+                for (index, row) in wizard.configured.iter().enumerate() {
+                    let mut line = provider_option_line(
+                        index,
+                        row.name.clone(),
+                        format!("{} · {}", row.protocol, row.base_url),
+                        false,
+                    );
+                    line.spans.push(Span::styled(
+                        format!(" · {} model(s)", row.models),
+                        Style::default().fg(theme::DIM),
+                    ));
+                    if let Some(badge) = row.status.as_ref().and_then(configured_badge) {
+                        line.spans.push(Span::styled(
+                            format!(" · {badge}"),
+                            Style::default()
+                                .fg(theme::DIM)
+                                .add_modifier(Modifier::ITALIC),
+                        ));
+                    }
+                    lines.push(line);
+                }
+            }
+        }
+        Step::AddConfirm => {
+            let draft = &wizard.add;
+            lines.push(provider_note(&format!(
+                "write `{}` to {}",
+                draft.name,
+                crate::core::config::providers_path().display()
+            )));
+            lines.push(provider_note(&format!("endpoint {}", draft.base_url)));
+            let key = if draft.api_key.trim().is_empty() {
+                "no key"
+            } else {
+                "key set"
+            };
+            let models = match (draft.models.is_empty(), &draft.probed) {
+                (true, Some(probed)) => format!("all {} discovered", probed.len()),
+                (true, None) => "discover at startup".to_string(),
+                (false, _) => format!("{} declared", draft.models.len()),
+            };
+            lines.push(provider_note(&format!("{key} · {models}")));
+            if let Some(error) = &draft.probe_error {
+                lines.push(Line::from(Span::styled(
+                    format!("probe failed: {error}"),
+                    Style::default().fg(theme::WARNING),
+                )));
+            }
+            if let Some(status) = &wizard.status {
+                lines.push(Line::from(Span::styled(
+                    status.clone(),
+                    Style::default().fg(theme::ERROR),
+                )));
+            }
+        }
+        _ => {
+            // Text and busy steps: the prompt, plus whatever the wizard has to
+            // say, with the typed value in the composer below.
+            let field = wizard.field();
+            let prompt = match field {
+                Some(field) => field.prompt(wizard.chosen.as_ref().map(|target| &target.provider)),
+                None => String::new(),
+            };
+            let mut spans = vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    prompt,
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if let Some(field) = field
+                && field.is_secret()
+            {
+                // Echo length only: the secret must not appear on screen.
+                let masked: String = std::iter::repeat_n('•', input.chars().count()).collect();
+                spans.push(Span::styled(
+                    format!("  {masked}"),
+                    Style::default().fg(theme::DIM),
+                ));
+            }
+            lines.push(Line::from(spans));
+            if let Some(status) = &wizard.status {
+                lines.push(Line::from(Span::styled(
+                    format!("  {status}"),
+                    Style::default().fg(theme::WARNING),
+                )));
+            }
+        }
+    }
+    lines
+}
+
+fn configured_badge(status: &cst_plugin_api::auth::AuthStatus) -> Option<String> {
+    use cst_plugin_api::auth::AuthStatus;
+    match status {
+        AuthStatus::Unsupported => None,
+        AuthStatus::SignedOut => Some("not signed in".to_string()),
+        AuthStatus::SignedIn { account } => Some(match account {
+            Some(account) => format!("signed in ({account})"),
+            None => "signed in".to_string(),
+        }),
+        AuthStatus::Expired => Some("sign-in expired".to_string()),
+    }
+}
+
+fn action_label(action: crate::tui::provider_wizard::Action) -> String {
+    use crate::tui::provider_wizard::Action;
+    match action {
+        Action::AddOpenAi => "Add an OpenAI-compatible provider".to_string(),
+        Action::SignIn => "Sign in to a plugin provider".to_string(),
+        Action::Configured => "Show configured providers".to_string(),
+        Action::Close => "Close".to_string(),
+    }
+}
+
+fn action_description(action: crate::tui::provider_wizard::Action) -> String {
+    use crate::tui::provider_wizard::Action;
+    match action {
+        Action::AddOpenAi => "base URL + API key".to_string(),
+        Action::SignIn => "credentials handled by the plugin".to_string(),
+        Action::Configured => "read-only list".to_string(),
+        Action::Close => String::new(),
+    }
+}
+
+/// One wizard row in the same shape as the other pickers: marker, number,
+/// label, description.
+fn provider_option_line(
+    index: usize,
+    label: String,
+    description: String,
+    selected: bool,
+) -> Line<'static> {
+    let marker = if selected { "▸ " } else { "  " };
+    let (marker_style, number_style, text_style) = if selected {
+        (
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    } else {
+        (
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+        )
+    };
+    let mut spans = vec![
+        Span::styled(marker, marker_style),
+        Span::styled(format!("{} · ", index + 1), number_style),
+        Span::styled(crate::tui::session::truncated(&label, 40), text_style),
+    ];
+    if !description.is_empty() {
+        spans.push(Span::styled(
+            format!("  {description}"),
+            Style::default().fg(theme::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn provider_note(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(theme::DIM),
+    ))
 }
 
 /// One command row: marker, aligned command name, summary, and aliases.
@@ -2643,6 +3432,7 @@ fn ansi_foreground(color: Color) -> String {
 mod tests {
     use super::*;
     use crate::core::config::ModelInfo;
+    use crate::plugins::Plugin;
     use crate::core::config::ProviderInstance;
     use crate::core::providers::ProviderRegistry;
     use ratatui::backend::TestBackend;
@@ -2659,6 +3449,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2675,14 +3466,48 @@ mod tests {
         )
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
             notice_tx,
             notice_rx,
+            provider_tx,
+            provider_tasks,
             "test/one".to_string(),
             TuiMode::Fullscreen,
-            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
+            Vec::new(),
+            vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
+            0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
+        )
+    }
+
+    /// An app whose plugin host is `plugins` — used by the `/provider` tests,
+    /// which need a plugin that contributes a sign-in entry.
+    fn test_app_with_plugins(plugins: Arc<PluginHost>, pool: Arc<ModelPool>) -> App {
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            Some(&Selection::new("test", "one")),
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            provider_tx,
+            provider_tasks,
+            "test/one".to_string(),
+            TuiMode::Fullscreen,
+            plugins,
             Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
@@ -2706,14 +3531,17 @@ mod tests {
         )
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
             notice_tx,
             notice_rx,
+            provider_tx,
+            provider_tasks,
             "test/one".to_string(),
             TuiMode::Fullscreen,
-            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
@@ -2736,6 +3564,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: true,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2752,14 +3581,17 @@ mod tests {
         )
         .expect("partial selection resolves (gated at send, not spawn)");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
             notice_tx,
             notice_rx,
+            provider_tx,
+            provider_tasks,
             "openai/m1".to_string(),
             TuiMode::Fullscreen,
-            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
             vec![SessionView::initial("openai/m1", TuiMode::Fullscreen)],
             0,
@@ -2785,6 +3617,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2801,14 +3634,17 @@ mod tests {
         )
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
             notice_tx,
             notice_rx,
+            provider_tx,
+            provider_tasks,
             "test/one".to_string(),
             TuiMode::Fullscreen,
-            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
@@ -2833,6 +3669,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: false,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2849,14 +3686,17 @@ mod tests {
         )
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
             notice_tx,
             notice_rx,
+            provider_tx,
+            provider_tasks,
             "test/one".to_string(),
             TuiMode::Fullscreen,
-            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
             vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
             0,
@@ -2906,6 +3746,7 @@ mod tests {
             headers: Default::default(),
             body_overrides: Default::default(),
             wire: None,
+            options: Default::default(),
             requires_api_key: true,
         };
         let registry = ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
@@ -2918,14 +3759,17 @@ mod tests {
         )
         .expect("empty route spawns");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
             notice_tx,
             notice_rx,
+            provider_tx,
+            provider_tasks,
             "no model".to_string(),
             TuiMode::Fullscreen,
-            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
             vec![SessionView::initial("no model", TuiMode::Fullscreen)],
             0,
@@ -2948,14 +3792,17 @@ mod tests {
         )
         .expect("empty route spawns");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
             notice_tx,
             notice_rx,
+            provider_tx,
+            provider_tasks,
             "no model".to_string(),
             TuiMode::Fullscreen,
-            Arc::new(PluginHost::builtin().expect("builtin plugins")),
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
             vec![SessionView::initial("no model", TuiMode::Fullscreen)],
             0,
@@ -3918,9 +4765,10 @@ mod tests {
         let mut app = test_app();
 
         app.composer.set_text("/".to_string());
-        assert_eq!(            app.command_matches().len(),
-            16,
-            "twelve commands plus four aliases"
+        assert_eq!(
+            app.command_matches().len(),
+            17,
+            "thirteen commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -3966,9 +4814,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 15);
+        assert_eq!(app.command_selection, 16);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 14);
+        assert_eq!(app.command_selection, 15);
     }
 
     #[tokio::test]
@@ -4176,5 +5024,237 @@ mod tests {
         assert_eq!(ansi_foreground(Color::Indexed(123)), "38;5;123");
         assert_eq!(ansi_foreground(Color::Rgb(1, 2, 3)), "38;2;1;2;3");
     }
-}
 
+    // -----------------------------------------------------------------------
+    // `/provider` wizard, wired through the app
+    // -----------------------------------------------------------------------
+
+    /// A plugin that contributes one sign-in entry and nothing else — the
+    /// smallest thing the wizard can recognise as "a provider I can sign in to".
+    struct SignInPlugin;
+
+    const FAKE_PAT: cst_plugin_api::AuthMethod = cst_plugin_api::AuthMethod {
+        id: "pat",
+        label: "Paste a token",
+        kind: cst_plugin_api::AuthMethodKind::SecretPrompt,
+    };
+    static FAKE_METHODS: [cst_plugin_api::AuthMethod; 1] = [FAKE_PAT];
+    static FAKE_AUTHS: [cst_plugin_api::AuthProvider; 1] = [cst_plugin_api::AuthProvider {
+        id: "fake",
+        protocol: "test",
+        label: "Fake",
+        default_base_url: Some("https://fake.example/"),
+        methods: &FAKE_METHODS,
+    }];
+
+    impl Plugin for SignInPlugin {
+        fn id(&self) -> &'static str {
+            "fake-sign-in"
+        }
+
+        fn auth_providers(&self) -> &'static [cst_plugin_api::AuthProvider] {
+            &FAKE_AUTHS
+        }
+
+        fn auth_status(&self, _instance: &str) -> cst_plugin_api::AuthStatus {
+            cst_plugin_api::AuthStatus::SignedOut
+        }
+    }
+
+    static SIGN_IN_PLUGIN: SignInPlugin = SignInPlugin;
+
+    static SIGN_IN_PLUGINS: &[&dyn Plugin] = &[&SIGN_IN_PLUGIN];
+
+    fn test_host_with_sign_in() -> Arc<PluginHost> {
+        Arc::new(PluginHost::new(SIGN_IN_PLUGINS).expect("plugin host"))
+    }
+
+    #[tokio::test]
+    async fn provider_command_opens_the_wizard_and_hides_the_command_strip() {
+        let mut app = test_app();
+        app.composer.set_text("/provider".to_string());
+        app.on_enter();
+
+        let wizard = app.provider_wizard.as_ref().expect("wizard open");
+        assert_eq!(wizard.step, crate::tui::provider_wizard::Step::Action);
+        assert!(app.composer.is_empty());
+        // The wizard owns the strip: the slash menu must not render over it.
+        app.composer.set_text("/".to_string());
+        assert!(app.command_matches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_wizard_targets_pair_instances_with_plugin_protocols() {
+        let app = test_app_with_plugins(test_host_with_sign_in(), test_pool());
+        // The pool's `test` instance uses the protocol the fake plugin serves.
+        let targets = app.sign_in_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].instance, "test");
+        assert!(targets[0].configured);
+        assert_eq!(targets[0].provider.label, "Fake");
+        assert_eq!(targets[0].status, cst_plugin_api::AuthStatus::SignedOut);
+    }
+
+    #[tokio::test]
+    async fn provider_wizard_offers_a_route_for_an_unconfigured_protocol() {
+        // A plugin whose protocol no instance uses yet gets a create-on-login
+        // row instead.
+        struct Other;
+        static AUTHS: [cst_plugin_api::AuthProvider; 1] = [cst_plugin_api::AuthProvider {
+            id: "other",
+            protocol: "not-configured",
+            label: "Other",
+            default_base_url: None,
+            methods: &FAKE_METHODS,
+        }];
+        impl Plugin for Other {
+            fn id(&self) -> &'static str {
+                "other"
+            }
+            fn auth_providers(&self) -> &'static [cst_plugin_api::AuthProvider] {
+                &AUTHS
+            }
+        }
+        static OTHER: Other = Other;
+        static OTHERS: &[&dyn Plugin] = &[&OTHER];
+        let host = Arc::new(PluginHost::new(OTHERS).expect("host"));
+        let app = test_app_with_plugins(host, test_pool());
+
+        let targets = app.sign_in_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].instance, "other");
+        assert!(!targets[0].configured, "success creates the instance");
+    }
+
+    #[tokio::test]
+    async fn provider_wizard_typed_steps_advance_without_submitting_a_turn() {
+        let mut app = test_app();
+        app.composer.set_text("/provider".to_string());
+        app.on_enter();
+
+        // Row 0 = add an OpenAI-compatible provider.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.provider_wizard.as_ref().expect("open").step,
+            crate::tui::provider_wizard::Step::AddName
+        );
+
+        // Typing goes to the composer, and Enter advances instead of sending.
+        for ch in "gateway".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.composer.text(), "gateway");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.provider_wizard.as_ref().expect("open").step,
+            crate::tui::provider_wizard::Step::AddBaseUrl
+        );
+        assert!(app.composer.is_empty(), "the field is consumed");
+        assert!(!app.busy, "no turn was submitted");
+
+        // Esc walks back rather than closing outright.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.provider_wizard.as_ref().expect("still open").step,
+            crate::tui::provider_wizard::Step::AddName
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            app.provider_wizard.is_none(),
+            "Esc from the first step closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_wizard_reports_a_duplicate_route_name() {
+        let mut app = test_app();
+        app.open_provider_wizard();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for ch in "test".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let wizard = app.provider_wizard.as_ref().expect("open");
+        assert_eq!(
+            wizard.step,
+            crate::tui::provider_wizard::Step::AddName,
+            "the step stays put"
+        );
+        assert!(
+            wizard
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("already configured")),
+            "the duplicate is explained: {:?}",
+            wizard.status
+        );
+    }
+
+    /// The write-back path: a confirmed draft reaches both the file and the
+    /// live pool, and the rewrite keeps the providers it did not touch.
+    #[tokio::test]
+    async fn provider_wizard_writes_and_installs_a_new_endpoint() {
+        let dir = std::env::temp_dir().join(format!("codest-provider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // SAFETY: this test owns CODEST_HOME for its duration; the provider
+        // tests in other modules use their own temporary paths and never read
+        // this variable.
+        unsafe { std::env::set_var("CODEST_HOME", &dir) };
+
+        let pool = test_pool();
+        let session = AgentSession::spawn_with_pool(
+            pool.clone(),
+            Some(&Selection::new("test", "one")),
+            DEFAULT_SYSTEM_PROMPT,
+            SessionBootstrap::default(),
+        )
+        .expect("initial selection resolves");
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            session,
+            pool,
+            notice_tx,
+            notice_rx,
+            provider_tx,
+            provider_tasks,
+            "test/one".to_string(),
+            TuiMode::Fullscreen,
+            Arc::new(PluginHost::shipped().expect("shipped plugins")),
+            Vec::new(),
+            vec![SessionView::initial("test/one", TuiMode::Fullscreen)],
+            0,
+            SessionBootstrap::empty_profiles(),
+            None,
+            None,
+        );
+        app.provider_wizard = Some(crate::tui::provider_wizard::Wizard {
+            step: crate::tui::provider_wizard::Step::AddConfirm,
+            add: crate::tui::provider_wizard::AddDraft {
+                name: "local".to_string(),
+                base_url: "http://127.0.0.1:8080/v1".to_string(),
+                ..Default::default()
+            },
+            ..crate::tui::provider_wizard::Wizard::new(Vec::new())
+        });
+        app.confirm_provider_step();
+
+        assert!(
+            app.provider_wizard.is_none(),
+            "the wizard closes on success"
+        );
+        assert!(
+            app.pool.registry().instance("local").is_some(),
+            "the pool sees the new provider immediately"
+        );
+        let saved = crate::core::config::load_providers(&crate::core::config::providers_path())
+            .expect("read back");
+        assert!(saved.iter().any(|instance| instance.name == "local"));
+        // The pre-existing provider survived the rewrite.
+        assert!(saved.iter().any(|instance| instance.name == "test"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::remove_var("CODEST_HOME") };
+    }
+}
