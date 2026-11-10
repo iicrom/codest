@@ -33,6 +33,7 @@ cargo run -- --api-key test --base-url http://127.0.0.1:8080/v1 --model test-mod
 cargo test                    # 单元测试离线运行，使用进程内假模型，不访问网络
 python3 scripts/pty_smoke.py  # 伪终端冒烟测试：自动拉起测试服务，fullscreen / inline 都会跑
 python3 scripts/tool_smoke.py # 工具冒烟测试：真实执行 bash / read 并验证 /tools 开关
+python3 scripts/markdown_smoke.py # Markdown 渲染可视检查：标题/列表/表格/代码块/引用
 ```
 
 连接一个 OpenAI 兼容的流式接口（`CST_BASE_URL`/`CST_API_KEY` 需成对提供，只给其一时 codest 会在发送时提示补全）。无论是否指定 `--model`，codest 都会对该端点做模型发现（尽力而为）：`/model` 菜单补全端点的模型列表，窗口长度等元数据（footer 的上下文显示）也从发现结果带入：
@@ -208,6 +209,33 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 
 `fullscreen` 会开启鼠标上报（滚轮滚动 transcript；`Alt`+滚轮一次 15 行）。需要终端原生选区时按住 `Shift` 拖拽。`inline` 不开启鼠标上报，保留终端原生 scrollback 和选区。
 
+## 回答的 Markdown 渲染
+
+助手回答按 Markdown 渲染（用户输入、通知、错误和思考内容仍是纯文本）。解析用 `pulldown-cmark`，与 codex 的 `tui/src/markdown_render.rs` 同一套事件流，但只保留聊天里真正用得到的那一层：
+
+| 语法 | 渲染 |
+| --- | --- |
+| `#`–`######` 标题 | 逐级变静：H1 强调色加粗下划线 → H2 强调色加粗 → H3 加粗 → H4 加粗斜体 → H5/H6 灰色 |
+| 段落 / 软换行 | 按终端宽度换行；空行分段，软换行不断段 |
+| `-` / `1.` 列表、嵌套 | 标记用强调色，续行悬挂在标记右侧；每层缩进一个标记宽 |
+| `> 引用` | `▎` 竖条，可嵌套 |
+| `---` | `───` 分隔线 |
+| 围栏 / 缩进代码块 | `│` 竖条 + 原样保留空行（不做语法高亮） |
+| 表格 | 按内容对齐成列，表头加粗，下面一条 `─` 分隔；超宽时优先压缩最宽的列，每列最少 3 列宽 |
+| `**粗**`、`*斜*`、`~~删除~~`、`` `代码` `` | 对应样式；行内代码用强调色 |
+| `[文字](url)` | 文字带下划线强调色，地址以暗色跟在括号里（autolink 不重复） |
+| `- [x]` / `- [ ]` | 渲染为 `[x]` / `[ ]` 复选框 |
+| 图片 | `🖼` 加 alt 文本和地址 |
+
+流式输出的关键点是"哪些行已经不会再变"：终端 scrollback 写进去就无法改写，因此只有已定型的行会落到 scrollback，正在生长的最后一个顶层块留在底部 pane 里反复重绘（未闭合的 `**`、半张表格、还没收尾的代码围栏都会改变已输出的行）。`fullscreen` 因为每帧整屏重绘，始终按最新内容渲染。
+
+跑一遍可视检查（起一个只回答 Markdown 的本机服务，两种 TUI 模式各跑一轮）：
+
+```bash
+cargo build
+python3 scripts/markdown_smoke.py
+```
+
 ## 操作
 
 | 按键 | 行为 |
@@ -357,6 +385,7 @@ skills、workspace instructions 等上下文不需要专门的机制：作为普
 | `codex-rs/tui/src/app.rs` | `src/tui/app.rs` | 终端事件循环、渲染、输入处理 |
 | `codex-rs/tui/src/bottom_pane/textarea.rs` | `src/tui/composer.rs` | 多行输入、光标、换行映射 |
 | `codex-rs/tui/src/history_cell*` | `src/tui/chat.rs` | 用户 / 助手 / 错误 / 提示 / 中断单元格 |
+| `codex-rs/tui/src/markdown_render.rs` | `src/tui/markdown.rs` | Markdown → ratatui 行（无语法高亮 / 表格 key-value 降级 / mermaid） |
 | codex 的 wrapping | `src/tui/wrap.rs` | Unicode 宽度感知换行与光标定位 |
 
 codex 的 TUI 超过 10 万行、`core` 也有大量工具/沙箱/会话基础设施，且与 app-server 深度耦合，无法原样裁剪。这里提取的是**可独立编译的架构骨架**，而不是逐文件复制。
@@ -407,13 +436,15 @@ codest/
         ├── session.rs       # 每会话视图状态（SessionView）
         ├── chat.rs          # 历史单元格
         ├── composer.rs      # 输入编辑器
+        ├── markdown.rs      # 助手回答的 Markdown 渲染（pulldown-cmark）
         ├── theme.rs         # 颜色
         └── wrap.rs          # 换行与光标映射
 ```
 
 ## 已知边界
 
-- 只支持纯文本对话，没有工具调用、文件读写、审批、MCP、图片。
+- 只支持纯文本对话，没有图片输入、审批、MCP。
+- Markdown 渲染是精简版：没有代码块语法高亮、OSC 8 超链接、表格的 key/value 降级、mermaid 和数学公式；图片只显示 alt 文本和地址。
 - 插件是编译期静态链接的：新增/修改插件需要改代码并重新编译，不支持运行时加载 `.so` 或脚本插件；插件与主程序同权限，没有沙箱隔离。
 - 插件钩子在 TUI 线程同步执行，不能做阻塞 I/O。
 - 会话按 rollout 保存在 `~/.codest/sessions/<工作区哈希>/`（`CODEST_HOME` 可覆盖），跨次启动可用 `--continue` / `--resume` 恢复；没有并发写锁（同时开多个 codest 写同一工作区没有保护）、没有归档/删除/搜索，也没有跨工作区的会话迁移。
@@ -431,7 +462,7 @@ codest/
 2. 为 `Conversation` 增加 token 预算与压缩（消费 `ModelInfo::context_window` 与 `TurnUsage`）。
 3. `/effort` 写回 `config.toml` 作为全局默认。
 4. `/provider` 菜单里删除 provider（`ModelPool::remove_instance()` 已就绪，尚未接菜单）；以及保留注释的 `toml_edit` 写回。
-5. Markdown / 代码高亮渲染（codex 使用 `pulldown-cmark` + `syntect`）。
+5. ~~Markdown 渲染~~ 已实现（见"回答的 Markdown 渲染"）：`pulldown-cmark` 事件流 → ratatui 行。剩余项是代码块语法高亮（codex 另用 `syntect`）、表格的 key/value 降级和超链接（OSC 8）。
 6. `fullscreen` 下的应用内鼠标拖选与 OSC 52 复制（对齐 pi/cht）。
 7. 用 `inventory`/`linkme` 做分布式静态注册，保持 `Plugin` 契约不变（`cst-plugin-api` 拆分后只影响宿主侧收集方式）。
 8. ~~统一本地插件安装方式~~ 已实现：`codest plugin install|uninstall|list|build`（本地路径 / git / crates.io，生成仓库外的 wrapper crate，不脏 git）。剩余项是等 `cst-plugin-api` 发布后去掉 `[patch.crates-io]`，以及可选的插件签名与版本约束求解。

@@ -97,6 +97,12 @@ use crate::tui::wrap::display_width;
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 const MAX_COMPOSER_ROWS: usize = 8;
+/// Rows the inline pane devotes to the still-streaming message tail. Fixed
+/// while a turn runs: a pane that grew row by row would scroll its own
+/// already-drawn tail into the terminal's scrollback, which is exactly the
+/// output [`take_inline_pending`] later commits for real — the duplicate
+/// lines that produced.
+const MAX_LIVE_TAIL_ROWS: usize = 4;
 const MAX_COMMAND_MENU_ROWS: usize = 6;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
@@ -367,7 +373,7 @@ fn setup_terminal(mode: TuiMode) -> Result<Tui> {
         TuiMode::Inline => {
             execute!(stdout, EnableBracketedPaste)?;
             let (columns, rows) = crossterm::terminal::size()?;
-            let height = inline_pane_height(rows, 1, false, 0);
+            let height = inline_pane_height(rows, 1, 0, 0);
             // Reserve the bottom rows for the pane: scrolling once keeps the
             // shell's existing output intact above us.
             execute!(
@@ -438,13 +444,24 @@ fn finish_terminal(terminal: &mut Option<Tui>, app: &App, mode: TuiMode) {
     );
 }
 
-/// Height of the inline bottom pane: optional live assistant tail, optional
+/// Height of the inline bottom pane: the live assistant tail, optional
 /// command menu, composer block (top border + visible rows), and the footer.
-fn inline_pane_height(rows: u16, composer_rows: usize, has_live: bool, menu_rows: usize) -> u16 {
+///
+/// `live_rows` is the number of rows the unsettled part of the streaming
+/// message needs. Markdown blocks such as a partially streamed table or code
+/// fence span several rows, so the tail cannot be pinned to one line.
+fn inline_pane_height(rows: u16, composer_rows: usize, live_rows: usize, menu_rows: usize) -> u16 {
     let composer = composer_rows.clamp(1, MAX_COMPOSER_ROWS) as u16 + 1;
-    let live = u16::from(has_live);
     let menu = menu_rows as u16;
+    let live = live_rows as u16;
     (composer + live + menu + 1).min(rows.max(1))
+}
+
+/// How many rows of the streaming tail the inline pane may show, given the
+/// terminal height and the fixed composer/menu/footer rows.
+fn inline_live_rows(rows: u16, composer_rows: usize, menu_rows: usize) -> usize {
+    let fixed = composer_rows.clamp(1, MAX_COMPOSER_ROWS) + 1 + menu_rows + 1;
+    (rows as usize).saturating_sub(fixed).max(1)
 }
 
 /// A result from background `/provider` work, delivered to the event loop.
@@ -638,7 +655,7 @@ impl App {
         initial_effort: Option<String>,
     ) -> Self {
         let (inline_columns, inline_rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let inline_height = inline_pane_height(inline_rows, 1, false, 0);
+        let inline_height = inline_pane_height(inline_rows, 1, 0, 0);
         let inline_top = inline_rows.saturating_sub(inline_height);
 
         let route = Selection::parse(&model_label).ok();
@@ -828,14 +845,30 @@ impl App {
         let composer_width = width.saturating_sub(2).max(1);
         let composer_rows = self.composer.visual_rows(composer_width);
         let desired_rows = composer_rows.len().clamp(1, MAX_COMPOSER_ROWS);
-        let has_live = self.view().live.is_some();
         let menu = self.menu_lines(MAX_COMMAND_MENU_ROWS);
         let menu_rows = menu.len();
-        let pane_height = inline_pane_height(rows, desired_rows, has_live, menu_rows);
-        let live_height = u16::from(has_live);
+        // The unsettled tail of the streaming message, or — while the model is
+        // still reasoning and no content has started — a thinking line. The
+        // whole tail lives here because scrollback takes only settled lines.
+        // Its height is capped so the pane keeps a stable size while a turn
+        // streams; growth would scroll the tail into scrollback.
+        let live_rows = if self.view().live.is_some()
+            || self
+                .view()
+                .live_thinking
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+        {
+            inline_live_rows(rows, desired_rows, menu_rows).min(MAX_LIVE_TAIL_ROWS)
+        } else {
+            0
+        };
+        let live = self.inline_live_tail(width, live_rows);
+        let pane_height = inline_pane_height(rows, desired_rows, live_rows, menu_rows);
         let composer_height = desired_rows as u16 + 1;
-        let menu_height =
-            (menu_rows as u16).min(pane_height.saturating_sub(live_height + composer_height + 1));
+        let menu_height = (menu_rows as u16).min(
+            pane_height.saturating_sub(live_rows as u16 + composer_height + 1),
+        );
         let new_top = rows.saturating_sub(pane_height);
 
         let resized = rows != self.inline_rows || size.width != self.inline_columns;
@@ -884,40 +917,47 @@ impl App {
         self.inline_rows = rows;
         self.inline_columns = size.width;
 
-        // The bottom live line: the assistant tail, or — while the model is
-        // still reasoning and no content has started — a thinking line
-        // instead of an empty assistant line. The full thinking block lands
-        // in history when content starts or the turn ends.
-        let thinking_only = self.view().live.as_ref().is_some_and(String::is_empty)
-            && self
-                .view()
+        tui.draw(|frame| {
+            self.render_inline_pane(frame, &live, &menu, menu_height, &composer_rows);
+        })?;
+        Ok(())
+    }
+
+    /// The rows of the streaming message that cannot go to scrollback yet.
+    ///
+    /// Whatever markdown has settled is printed by [`take_inline_pending`];
+    /// only the mutable tail stays here, capped at `max_rows` so a long
+    /// unfinished block cannot push the composer off screen. The tail is
+    /// bottom-anchored: the newest text is what the reader is watching.
+    fn inline_live_tail(&self, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+        let view = self.view();
+        // While reasoning with nothing visible yet, show the thinking tail.
+        let thinking_only = view.live.as_ref().is_some_and(String::is_empty)
+            && view
                 .live_thinking
                 .as_ref()
                 .is_some_and(|text| !text.is_empty());
-        let live_tail = if thinking_only {
+        let rows = if thinking_only {
             if self.show_thinking {
-                self.view()
-                    .live_thinking
+                view.live_thinking
                     .as_ref()
-                    .and_then(|text| chat::thinking_lines(text, width, self.busy).pop())
+                    .map(|text| chat::thinking_lines(text, width, self.busy))
             } else {
-                Some(Line::from(Span::styled(
+                Some(vec![Line::from(Span::styled(
                     "✻ thinking…",
                     Style::default().fg(theme::DIM),
-                )))
+                ))])
             }
         } else {
-            self.view().live.as_ref().map(|text| {
-                chat::assistant_lines(text, width, self.busy)
-                    .pop()
-                    .unwrap_or_else(|| Line::from(""))
+            view.live.as_ref().map(|live| {
+                let (lines, settled) = chat::assistant_lines_tracked(live, width, self.busy);
+                lines[settled.min(lines.len())..].to_vec()
             })
         };
-
-        tui.draw(|frame| {
-            self.render_inline_pane(frame, live_tail, &menu, menu_height, &composer_rows);
-        })?;
-        Ok(())
+        let mut rows = rows.unwrap_or_default();
+        let start = rows.len().saturating_sub(max_rows);
+        rows.drain(..start);
+        rows
     }
 
     /// Collect transcript lines that have not reached the terminal scrollback
@@ -948,14 +988,14 @@ impl App {
             view.printed_cells += 1;
         }
 
-        // Stable lines of the in-flight assistant message. The last wrapped
-        // line stays in the pane so it can keep growing without reprinting.
+        // Lines of the in-flight assistant message that markdown has already
+        // settled. Scrollback cannot be rewritten, so only the final prefix
+        // goes out; the mutable tail keeps re-rendering in the pane.
         if let Some(live) = &view.live {
-            let lines = chat::assistant_lines(live, width, false);
-            let stable = lines.len().saturating_sub(1);
-            if stable > view.live_committed {
-                pending.extend(lines[view.live_committed..stable].iter().cloned());
-                view.live_committed = stable;
+            let (lines, settled) = chat::assistant_lines_tracked(live, width, false);
+            if settled > view.live_committed {
+                pending.extend(lines[view.live_committed..settled].iter().cloned());
+                view.live_committed = settled;
             }
         }
 
@@ -2711,7 +2751,7 @@ impl App {
     fn render_inline_pane(
         &self,
         frame: &mut Frame,
-        live_tail: Option<Line<'static>>,
+        live_tail: &[Line<'static>],
         menu: &[Line<'static>],
         menu_height: u16,
         composer_rows: &[String],
@@ -2723,7 +2763,7 @@ impl App {
 
         let composer_width = (area.width as usize).saturating_sub(2).max(1);
         let visible_composer_rows = composer_rows.len().clamp(1, MAX_COMPOSER_ROWS);
-        let live_height = u16::from(live_tail.is_some());
+        let live_height = live_tail.len() as u16;
         let composer_height = visible_composer_rows as u16 + 1;
         let chunks = Layout::vertical([
             Constraint::Length(live_height),
@@ -2733,8 +2773,11 @@ impl App {
         ])
         .split(area);
 
-        if let Some(line) = live_tail {
-            frame.render_widget(Paragraph::new(Text::from(vec![line])), chunks[0]);
+        if !live_tail.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Text::from(live_tail.to_vec())),
+                chunks[0],
+            );
         }
         self.render_menu(frame, chunks[1], menu);
         self.render_composer(
@@ -5274,24 +5317,38 @@ mod tests {
 
     #[test]
     fn inline_pane_height_counts_live_and_footer() {
-        assert_eq!(inline_pane_height(24, 1, false, 0), 3);
-        assert_eq!(inline_pane_height(24, 1, true, 0), 4);
-        assert_eq!(inline_pane_height(24, 3, true, 0), 6);
-        assert_eq!(inline_pane_height(24, 1, false, 3), 6);
+        // No live rows -> composer (1 + border) + footer.
+        assert_eq!(inline_pane_height(24, 1, 0, 0), 3);
+        // The tail grows the pane by exactly its rows.
+        assert_eq!(inline_pane_height(24, 1, 1, 0), 4);
+        assert_eq!(inline_pane_height(24, 1, 4, 0), 7);
+        assert_eq!(inline_pane_height(24, 3, 1, 0), 6);
+        assert_eq!(inline_pane_height(24, 1, 0, 3), 6);
+    }
+
+    #[test]
+    fn inline_live_rows_leaves_room_for_the_fixed_rows() {
+        // 24 rows - (composer 1 + border 1 + footer 1) = 21 spare rows.
+        assert_eq!(inline_live_rows(24, 1, 0), 21);
+        // The menu takes from the same budget.
+        assert_eq!(inline_live_rows(24, 1, 5), 16);
+        // Never collapses to zero, even in a tiny terminal.
+        assert_eq!(inline_live_rows(3, 1, 0), 1);
     }
 
     #[test]
     fn inline_pane_height_caps_composer_rows() {
-        assert_eq!(            inline_pane_height(40, 20, false, 0),
+        assert_eq!(
+            inline_pane_height(40, 20, 0, 0),
             MAX_COMPOSER_ROWS as u16 + 2
         );
     }
 
     #[test]
     fn inline_pane_height_never_exceeds_terminal() {
-        assert_eq!(inline_pane_height(2, 8, true, 0), 2);
-        assert_eq!(inline_pane_height(0, 1, false, 0), 1);
-        assert_eq!(inline_pane_height(3, 1, false, 6), 3);
+        assert_eq!(inline_pane_height(2, 8, 4, 0), 2);
+        assert_eq!(inline_pane_height(0, 1, 0, 0), 1);
+        assert_eq!(inline_pane_height(3, 1, 0, 6), 3);
     }
 
     #[test]

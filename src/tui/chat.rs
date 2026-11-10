@@ -229,15 +229,46 @@ fn report_entry_lines(entry: &ReportEntry, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// Render the streaming assistant message. While `streaming`, a block cursor
+/// Render an assistant message as markdown. While `streaming`, a block cursor
 /// is appended to the last line so the transcript visibly keeps up.
+///
+/// The first row carries the `•` gutter and every later row is indented under
+/// the message text, so headings, lists, quote bars, tables, and code fences
+/// keep their own markers inside the transcript's indent.
 pub fn assistant_lines(text: &str, width: usize, streaming: bool) -> Vec<Line<'static>> {
-    let mut lines = prefixed("• ", theme::ASSISTANT, true, text, Style::default(), width);
+    assistant_lines_tracked(text, width, streaming).0
+}
+
+/// [`assistant_lines`] plus the number of leading lines that will not change
+/// when more of the message streams in. Inline mode prints exactly that prefix
+/// to the terminal's scrollback, which cannot be rewritten afterwards.
+pub fn assistant_lines_tracked(
+    text: &str,
+    width: usize,
+    streaming: bool,
+) -> (Vec<Line<'static>>, usize) {
+    let width = width.max(4);
+    const GUTTER: usize = 2;
+    let (mut lines, settled) =
+        crate::tui::markdown::render_tracked(text, width.saturating_sub(GUTTER).max(1));
+    for (index, line) in lines.iter_mut().enumerate() {
+        let pad = if index == 0 {
+            Span::styled(
+                "• ",
+                Style::default()
+                    .fg(theme::ASSISTANT)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("  ")
+        };
+        line.spans.insert(0, pad);
+    }
     if streaming && let Some(last) = lines.last_mut() {
         last.spans
             .push(Span::styled("▌", Style::default().fg(theme::ACCENT)));
     }
-    lines
+    (lines, settled)
 }
 
 /// Render the thinking block: a dim `✻ thinking` header over the dim body.
@@ -345,6 +376,32 @@ mod tests {
     fn assistant_cell_wraps_and_marks_streaming() {
         let lines = assistant_lines("hello world", 8, true);
         assert_eq!(plain(&lines), vec!["• hello", "  world▌"]);
+    }
+
+    #[test]
+    fn assistant_cell_renders_markdown_under_the_gutter() {
+        let lines = assistant_lines("# Title\n\n- one\n- two", 40, false);
+        assert_eq!(plain(&lines), vec!["• Title", "  ", "  • one", "  • two"]);
+        // The `•` gutter is accent-bold; list markers keep their own style.
+        let first = &lines[0].spans[0];
+        assert_eq!(first.style.fg, Some(theme::ASSISTANT));
+        assert!(first.style.add_modifier.contains(Modifier::BOLD));
+
+        // A fenced block keeps its lines, indented under the message.
+        let lines = assistant_lines("```\na\n```", 40, false);
+        assert_eq!(plain(&lines), vec!["• │ a"]);
+    }
+
+    #[test]
+    fn assistant_cell_reports_its_settled_prefix() {
+        // The last block is still growing, so only the heading is settled.
+        let (lines, settled) = assistant_lines_tracked("# done\n\nstill typing", 40, true);
+        assert_eq!(plain(&lines), vec!["• done", "  ", "  still typing▌"]);
+        assert_eq!(settled, 1);
+
+        // A trailing blank line closes the message: everything is settled.
+        let (lines, settled) = assistant_lines_tracked("done\n\n", 40, false);
+        assert_eq!(settled, lines.len());
     }
 
     #[test]

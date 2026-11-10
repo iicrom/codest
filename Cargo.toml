@@ -30,6 +30,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 cst-plugin-api = { path = "crates/cst-plugin-api", version = "0.1.0" }
 futures-util = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
