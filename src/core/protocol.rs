@@ -50,6 +50,25 @@ pub enum Op {
     /// are ignored (a replayed set may name tools this run never declared).
     /// Applied between turns, like `SwitchModel`.
     SetToolsEnabled { enabled: Vec<String> },
+    /// Return the active conversation as [`EventMsg::ConversationSnapshot`]
+    /// (the `/context` viewer's read path — the worker is the only owner of
+    /// the transcript, so the front-end asks rather than mirrors it).
+    InspectConversation,
+    /// Remove the transcript messages at `indices` (transcript positions —
+    /// the system prompt is not addressable). The front-end expands tool-call
+    /// rounds up front, so one op carries the whole cascade; the worker still
+    /// validates the result satisfies the tool_calls↔tool wire constraints
+    /// and rejects the op otherwise. Answered with a
+    /// `ConversationSnapshot`, or an `Error`.
+    DeleteMessages { indices: Vec<usize> },
+    /// Replace the content of the transcript message at `index`. Roles and
+    /// tool fields are untouched, so edits can never break the wire shape.
+    /// Answered with a `ConversationSnapshot`, or an `Error`.
+    EditMessage { index: usize, content: String },
+    /// Undo the most recent delete/edit (`/context` checkpoints). Each
+    /// mutation records its inverse; this pops and applies it. Answered with
+    /// a `ConversationSnapshot`, or an `Error` when nothing is reversible.
+    UndoContextEdit,
 }
 
 /// Events emitted by the agent.
@@ -106,6 +125,12 @@ pub enum EventMsg {
     /// switch or creation, because the set is per session and the
     /// front-end's mirror needs to resync.
     ToolsSwitched { enabled: Vec<String> },
+    /// The active conversation, as asked by `Op::InspectConversation` and
+    /// re-sent as the confirmation of every context mutation
+    /// (`DeleteMessages` / `EditMessage` / `UndoContextEdit`) so the
+    /// `/context` viewer refreshes atomically from the worker's own state.
+    /// System prompt first, then the transcript.
+    ConversationSnapshot { messages: Vec<Message> },
     /// The worker has stopped.
     ShutdownComplete,
 }

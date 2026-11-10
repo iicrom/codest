@@ -206,6 +206,28 @@ pub enum RolloutItem {
     ToolsSwitched {
         enabled: Vec<String>,
     },
+    /// Transcript messages were deleted by the `/context` viewer
+    /// (`Op::DeleteMessages`). `indices` are the transcript positions at
+    /// deletion time, `removed` the messages that stood there (same length,
+    /// ascending order) — the payload is the delete's own inverse, so replay
+    /// can both apply it and rebuild the checkpoint stack an undo needs.
+    ContextDeleted {
+        indices: Vec<usize>,
+        removed: Vec<Message>,
+    },
+    /// A transcript message's content was replaced by the `/context` viewer
+    /// (`Op::EditMessage`). `previous` is the replaced text — again the
+    /// inverse, for replay and undo.
+    ContextEdited {
+        index: usize,
+        content: String,
+        previous: String,
+    },
+    /// The most recent `ContextDeleted`/`ContextEdited` was undone
+    /// (`Op::UndoContextEdit`). Replay pops the checkpoint stack the earlier
+    /// markers rebuilt and applies the same inverse, so undoing survives a
+    /// restart.
+    ContextRestored,
 }
 
 /// One JSONL line: a timestamp plus the payload's fields flattened in.
@@ -244,6 +266,10 @@ pub struct LoadedSession {
     /// from the last [`RolloutItem::ToolsSwitched`] item; `None` when the
     /// session never customized it (every declared tool enabled).
     pub tools: Option<Vec<String>>,
+    /// The `/context` checkpoint stack rebuilt from the `ContextDeleted` /
+    /// `ContextEdited` / `ContextRestored` markers, newest last — what lets
+    /// an undo work after a restart.
+    pub undo: Vec<crate::core::conversation::UndoEntry>,
 }
 
 /// Creates rollout files for new sessions.
@@ -367,6 +393,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     let content = std::fs::read_to_string(path)?;
     let mut meta = None;
     let mut messages = Vec::new();
+    let mut undo = Vec::new();
     let mut name = None;
     let mut model = None;
     let mut profile = None;
@@ -409,7 +436,9 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
             RolloutItem::Cleared => {
                 messages.clear();
-                // The dropped turns' usage no longer describes the context.
+                // The dropped turns' usage no longer describes the context,
+                // and the live `/clear` drops the checkpoints with it.
+                undo.clear();
                 last_usage = None;
                 total_input = 0;
                 total_output = 0;
@@ -439,6 +468,51 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 // the last switch is the one a resumed session restarts with.
                 tools = Some(enabled);
             }
+            // `/context` edits replay as the mutations they were, each also
+            // rebuilding its checkpoint. A corrupt marker (index out of
+            // range, mismatched delete payload) is skipped whole: applying
+            // half a mutation would desync both the transcript and the stack.
+            RolloutItem::ContextDeleted { indices, removed } => {
+                if indices.len() != removed.len() {
+                    continue;
+                }
+                let mut pairs: Vec<(usize, Message)> =
+                    indices.iter().copied().zip(removed).collect();
+                pairs.sort_by_key(|(index, _)| *index);
+                if pairs.iter().any(|(index, _)| *index >= messages.len()) {
+                    continue;
+                }
+                for (index, _) in pairs.iter().rev() {
+                    messages.remove(*index);
+                }
+                undo.push(crate::core::conversation::UndoEntry::Deleted { removed: pairs });
+            }
+            RolloutItem::ContextEdited {
+                index,
+                content,
+                previous,
+            } => {
+                let Some(message) = messages.get_mut(index) else {
+                    continue;
+                };
+                undo.push(crate::core::conversation::UndoEntry::Edited { index, previous });
+                message.content = content;
+            }
+            RolloutItem::ContextRestored => {
+                match undo.pop() {
+                    Some(crate::core::conversation::UndoEntry::Deleted { removed }) => {
+                        for (index, message) in removed {
+                            messages.insert(index, message);
+                        }
+                    }
+                    Some(crate::core::conversation::UndoEntry::Edited { index, previous }) => {
+                        if let Some(message) = messages.get_mut(index) {
+                            message.content = previous;
+                        }
+                    }
+                    None => {}
+                }
+            }
         }
     }
 
@@ -452,6 +526,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
         meta,
         path: path.to_path_buf(),
         messages,
+        undo,
         name,
         model,
         last_usage,
@@ -478,6 +553,7 @@ pub fn load_workspace_sessions(dir: &Path) -> io::Result<Vec<LoadedSession>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::conversation::Conversation;
     use crate::core::protocol::Role;
 
     fn tempdir(name: &str) -> PathBuf {
@@ -565,6 +641,144 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].content, "second");
         assert_eq!(loaded.name, None);
+    }
+
+    /// The `/context` markers replay as the mutations they recorded and
+    /// rebuild the checkpoint stack: the loaded session carries both the
+    /// edited transcript and an undo that still works.
+    #[test]
+    fn context_edits_replay_and_rebuild_the_checkpoint_stack() {
+        use crate::core::conversation::UndoEntry;
+
+        let dir = tempdir("context-edit");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        for text in ["one", "two", "three"] {
+            rollout
+                .append(&RolloutItem::UserMessage {
+                    message: text.to_string(),
+                })
+                .expect("append");
+        }
+        rollout
+            .append(&RolloutItem::ContextDeleted {
+                indices: vec![0, 2],
+                removed: vec![
+                    Message::user("one"),
+                    Message::user("three"),
+                ],
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ContextEdited {
+                index: 0,
+                content: "two (edited)".to_string(),
+                previous: "two".to_string(),
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two (edited)"]
+        );
+        assert_eq!(loaded.undo.len(), 2);
+
+        // The stack pops in LIFO order, exactly like the live conversation's.
+        let mut conversation = Conversation::replayed(
+            loaded.meta.system_prompt.clone(),
+            loaded.messages.clone(),
+            loaded.undo.clone(),
+        );
+        assert!(conversation.undo_last_edit());
+        assert_eq!(conversation.messages()[0].content, "two");
+        assert!(conversation.undo_last_edit());
+        assert_eq!(
+            conversation
+                .messages()
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three"]
+        );
+        assert_eq!(
+            loaded.undo.first(),
+            Some(&UndoEntry::Deleted {
+                removed: vec![(0, Message::user("one")), (2, Message::user("three"))]
+            })
+        );
+    }
+
+    /// `ContextRestored` replays the same inverse the live undo applied, and
+    /// a `Cleared` drops the checkpoints being rebuilt just like the live
+    /// `/clear` drops them.
+    #[test]
+    fn context_restored_replays_and_clear_drops_the_stack() {
+        let dir = tempdir("context-undo");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "hello".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ContextDeleted {
+                indices: vec![0],
+                removed: vec![Message::user("hello")],
+            })
+            .expect("append");
+        rollout.append(&RolloutItem::ContextRestored).expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "hello");
+        assert!(loaded.undo.is_empty(), "the restore consumed its checkpoint");
+
+        rollout.append(&RolloutItem::Cleared).expect("append");
+        rollout
+            .append(&RolloutItem::ContextEdited {
+                index: 9,
+                content: "orphan".to_string(),
+                previous: "gone".to_string(),
+            })
+            .expect("append");
+        let loaded = load_session(&rollout.path).expect("load");
+        assert!(loaded.messages.is_empty());
+        assert!(loaded.undo.is_empty(), "a clear drops the rebuilt stack");
+    }
+
+    /// A corrupt delete marker (index past the transcript) is skipped whole.
+    #[test]
+    fn corrupt_context_delete_markers_are_skipped() {
+        let dir = tempdir("context-corrupt");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "hello".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ContextDeleted {
+                indices: vec![5],
+                removed: vec![Message::user("ghost")],
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ContextDeleted {
+                indices: vec![0],
+                removed: vec![],
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(loaded.undo.is_empty());
     }
 
     #[test]

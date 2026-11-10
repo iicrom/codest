@@ -12,13 +12,18 @@
 //!   [`openai_compat`] is the only shipped implementation (HTTP + SSE).
 //! * [`session`] is the worker task that owns every recorded conversation and
 //!   turns submissions into events. The TUI only ever sees
-//!   [`session::AgentSession`]; [`sessions`] holds the built-in `/new` and
-//!   `/sessions` command specs, whose behavior is implemented by front-ends.
+//!   [`session::AgentSession`]; [`sessions`] and [`context`] hold the
+//!   built-in `/new`, `/sessions`, and `/context` command specs, whose
+//!   behavior is implemented by front-ends.
 //! * [`rollout`] persists sessions as JSONL under
 //!   `~/.codest/sessions/<workspace-hash>/` (codex's rollout format,
 //!   distilled): a metadata line plus one line per conversation change.
+//! * [`context_store`] is the (unwired) storage contract for archiving
+//!   context entries to local files — the future "index" externalization.
 
 pub mod commands;
+pub mod context;
+pub mod context_store;
 pub mod config;
 pub mod conversation;
 pub mod echo_model;
@@ -54,6 +59,7 @@ pub use reasoning::{DEFAULT_EFFORT_LEVELS, EFFORT_COMMAND, REASONING_COMMANDS, T
 pub use rollout::{LoadedSession, RolloutItem, RolloutWriter, SessionMeta};
 pub use session::{AgentSession, SessionBootstrap};
 pub use sessions::SESSION_COMMANDS;
+pub use context::CONTEXT_COMMANDS;
 pub use tokens::{context_percent, format_context_usage, format_tokens};
 pub use tools_switch::TOOLS_COMMANDS;
 pub use tools::{MAX_TOOL_ROUNDS, ToolCall, ToolExecutor, ToolSpec};

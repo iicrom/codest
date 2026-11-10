@@ -102,7 +102,7 @@ dsh 的 profile 是一个目录：`package.json` 声明有序 **bundles** 列表
 [profiles.code]
 default = "glm/glm-5.3"        # 初始 selection
 effort = "high"                # 初始 /effort；"off" = 不下发 effort 字段
-tools = ["prompt_debug"]       # 启用这些插件声明的工具（按插件 id）；
+tools = ["bash"]               # 启用这些插件声明的工具（按插件 id）；
                                # 其余插件的工具不下发；缺省 = 全部；空表 = 无工具
 
 [profiles.code.prompt]

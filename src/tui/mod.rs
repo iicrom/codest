@@ -8,6 +8,7 @@
 pub mod app;
 pub mod chat;
 pub mod composer;
+pub mod context_view;
 pub mod highlight;
 pub mod markdown;
 pub mod provider_wizard;

@@ -326,6 +326,36 @@ impl AgentSession {
         self.submit(Op::SetToolsEnabled { enabled })
     }
 
+    /// Read the active conversation (`/context` viewer). The result arrives
+    /// as [`EventMsg::ConversationSnapshot`] — system prompt first, then the
+    /// transcript.
+    pub fn inspect_conversation(&self) -> String {
+        self.submit(Op::InspectConversation)
+    }
+
+    /// Delete transcript messages (`/context` viewer). `indices` are
+    /// transcript positions (the system prompt is not addressable); the
+    /// caller expands tool-call rounds. The result arrives as a
+    /// [`EventMsg::ConversationSnapshot`] or an error event.
+    pub fn delete_messages(&self, indices: Vec<usize>) -> String {
+        self.submit(Op::DeleteMessages { indices })
+    }
+
+    /// Replace a transcript message's content (`/context` viewer). The result
+    /// arrives as a [`EventMsg::ConversationSnapshot`] or an error event.
+    pub fn edit_message(&self, index: usize, content: impl Into<String>) -> String {
+        self.submit(Op::EditMessage {
+            index,
+            content: content.into(),
+        })
+    }
+
+    /// Undo the most recent `/context` delete or edit. The result arrives as
+    /// a [`EventMsg::ConversationSnapshot`] or an error event.
+    pub fn undo_context_edit(&self) -> String {
+        self.submit(Op::UndoContextEdit)
+    }
+
     /// Await the next event. `None` means the worker has stopped and the
     /// channel is closed.
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -546,10 +576,13 @@ async fn run_worker(
     let mut session_tools: Vec<BTreeSet<String>> = Vec::new();
 
     for loaded in &bootstrap.loaded {
-        let mut conversation = Conversation::new(loaded.meta.system_prompt.clone());
-        for message in &loaded.messages {
-            conversation.push_message(message.clone());
-        }
+        // The replay includes the `/context` checkpoint stack, so an undo
+        // keeps working across a restart.
+        let conversation = Conversation::replayed(
+            loaded.meta.system_prompt.clone(),
+            loaded.messages.clone(),
+            loaded.undo.clone(),
+        );
         let slot = match writer.as_ref() {
             Some(writer) => match writer.open_existing(&loaded.path) {
                 Ok(file) => RolloutSlot {
@@ -899,6 +932,93 @@ async fn run_worker(
                     },
                 );
                 let _ = tx.send(Event::new(submission.id, EventMsg::ToolsSwitched { enabled }));
+            }
+            Op::InspectConversation => {
+                let _ = tx.send(Event::new(
+                    submission.id,
+                    EventMsg::ConversationSnapshot {
+                        messages: sessions[current].snapshot(),
+                    },
+                ));
+            }
+            Op::DeleteMessages { indices } => {
+                let conversation = &mut sessions[current];
+                match conversation.delete_at(&indices) {
+                    Ok(removed) => {
+                        // The `/context` viewer expands tool-call rounds
+                        // before submitting, so a rejected shape means a
+                        // stale or hand-built index set: undo the delete and
+                        // answer with why.
+                        if let Err(message) =
+                            Conversation::validate_tool_structure(conversation.messages())
+                        {
+                            conversation.undo_last_edit();
+                            let _ = tx.send(Event::new(
+                                submission.id,
+                                EventMsg::Error { message },
+                            ));
+                        } else {
+                            let (indices, removed): (Vec<usize>, Vec<Message>) =
+                                removed.into_iter().unzip();
+                            rollouts.append(
+                                current,
+                                RolloutItem::ContextDeleted { indices, removed },
+                            );
+                            let _ = tx.send(Event::new(
+                                submission.id,
+                                EventMsg::ConversationSnapshot {
+                                    messages: conversation.snapshot(),
+                                },
+                            ));
+                        }
+                    }
+                    Err(message) => {
+                        let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
+                    }
+                }
+            }
+            Op::EditMessage { index, content } => {
+                let conversation = &mut sessions[current];
+                match conversation.edit_content(index, content.clone()) {
+                    Ok(previous) => {
+                        rollouts.append(
+                            current,
+                            RolloutItem::ContextEdited {
+                                index,
+                                content,
+                                previous,
+                            },
+                        );
+                        let _ = tx.send(Event::new(
+                            submission.id,
+                            EventMsg::ConversationSnapshot {
+                                messages: conversation.snapshot(),
+                            },
+                        ));
+                    }
+                    Err(message) => {
+                        let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
+                    }
+                }
+            }
+            Op::UndoContextEdit => {
+                let conversation = &mut sessions[current];
+                if conversation.undo_last_edit() {
+                    rollouts.append(current, RolloutItem::ContextRestored);
+                    let _ = tx.send(Event::new(
+                        submission.id,
+                        EventMsg::ConversationSnapshot {
+                            messages: conversation.snapshot(),
+                        },
+                    ));
+                } else {
+                    let _ = tx.send(Event::new(
+                        submission.id,
+                        EventMsg::Error {
+                            message: "nothing left to restore".to_string(),
+                        },
+                    ));
+                }
             }
             Op::Shutdown => {
                 let _ = tx.send(Event::new(submission.id, EventMsg::ShutdownComplete));
@@ -2420,6 +2540,7 @@ mod tests {
             total_input: 0,
             total_output: 0,
             messages: vec![Message::user("hello"), Message::assistant("hi")],
+            undo: Vec::new(),
             name: None,
             profile: None,
             tools: None,
@@ -2736,5 +2857,226 @@ mod tests {
         drop(options);
         let seen = seen.lock().expect("lock");
         assert_eq!(seen.len(), 3);
+    }
+
+    /// Collect events until one satisfies `done`, inclusive — the op-level
+    /// sibling of [`collect_turn`].
+    async fn collect_until(
+        session: &mut AgentSession,
+        done: impl Fn(&EventMsg) -> bool,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().await {
+            let finished = done(&event.msg);
+            events.push(event);
+            if finished {
+                break;
+            }
+        }
+        events
+    }
+
+    /// Message count of the active conversation, via `InspectConversation`.
+    async fn snapshot_len(session: &mut AgentSession) -> usize {
+        session.inspect_conversation();
+        let events = collect_until(session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. })
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one snapshot, got {events:?}");
+        };
+        match &event.msg {
+            EventMsg::ConversationSnapshot { messages } => messages.len(),
+            _ => unreachable!("filtered above"),
+        }
+    }
+
+    /// One turn against the echo model leaves a two-message transcript:
+    /// the user text and `You said: "…"`.
+    async fn transcript_of_two() -> AgentSession {
+        let mut session = AgentSession::spawn(Arc::new(EchoModelClient::new(Duration::ZERO)));
+        session.submit_user_turn("hello");
+        collect_turn(&mut session).await;
+        session
+    }
+
+    #[tokio::test]
+    async fn inspect_returns_the_whole_conversation() {
+        let mut session = transcript_of_two().await;
+
+        session.inspect_conversation();
+        let events = collect_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. })
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected exactly one snapshot, got {events:?}");
+        };
+        let EventMsg::ConversationSnapshot { messages } = &event.msg else {
+            unreachable!("filtered above");
+        };
+        // System prompt first, then the transcript — exactly what a model
+        // request would carry.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].content, "hello");
+        assert_eq!(messages[2].role, Role::Assistant);
+    }
+
+    #[tokio::test]
+    async fn delete_messages_confirms_with_a_snapshot_and_replays() {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-context-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let client = Arc::new(EchoModelClient::new(Duration::ZERO));
+        let mut session = AgentSession::spawn_with_bootstrap(
+            client,
+            "be brief",
+            SessionBootstrap {
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                ..SessionBootstrap::default()
+            },
+        );
+        session.submit_user_turn("hello");
+        collect_turn(&mut session).await;
+
+        // Delete the assistant reply.
+        session.delete_messages(vec![1]);
+        let events = collect_until(&mut session, |msg| {
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one confirmation, got {events:?}");
+        };
+        let EventMsg::ConversationSnapshot { messages } = &event.msg else {
+            panic!("expected a snapshot, got {:?}", event.msg);
+        };
+        assert_eq!(messages.len(), 2, "system + the surviving user message");
+        assert_eq!(messages[1].content, "hello");
+
+        // A second undo source: an out-of-range index answers with an error.
+        session.delete_messages(vec![9]);
+        let events = collect_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        assert!(matches!(&event.msg, EventMsg::Error { .. }));
+
+        session.shutdown();
+        drop(session);
+        // The rollout replays to the edited transcript, checkpoint intact.
+        let mut paths = crate::core::rollout::list_workspace_sessions(&dir).expect("list");
+        let loaded = crate::core::rollout::load_session(&paths.remove(0)).expect("load");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "hello");
+        assert_eq!(loaded.undo.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_message_replaces_content_and_replays() {
+        let mut session = transcript_of_two().await;
+
+        session.edit_message(0, "hello (fixed)");
+        let events = collect_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        let EventMsg::ConversationSnapshot { messages } = &event.msg else {
+            panic!("expected a snapshot, got {:?}", event.msg);
+        };
+        assert_eq!(messages[1].content, "hello (fixed)");
+        assert_eq!(messages[1].role, Role::User);
+
+        session.undo_context_edit();
+        let events = collect_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        let EventMsg::ConversationSnapshot { messages } = &event.msg else {
+            panic!("expected a snapshot, got {:?}", event.msg);
+        };
+        assert_eq!(messages[1].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn undo_without_checkpoints_errors_and_keeps_the_transcript() {
+        let mut session = transcript_of_two().await;
+
+        session.undo_context_edit();
+        let events = collect_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        let EventMsg::Error { message } = &event.msg else {
+            panic!("expected an error, got {:?}", event.msg);
+        };
+        assert!(message.contains("nothing left"), "{message}");
+    }
+
+    /// Deleting only the assistant half of a tool round breaks the
+    /// tool_calls↔tool wire shape: the op is rejected and the transcript is
+    /// untouched. (The viewer expands the cascade, so this guards a stale
+    /// index set.)
+    #[tokio::test]
+    async fn delete_rejects_a_shape_breaking_cascade() {
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
+            vec![StreamItem::Delta("done".to_string())],
+        ]);
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+        session.submit_user_turn("hi");
+        collect_turn(&mut session).await;
+        // Transcript: user, assistant(tool_calls), tool result, assistant.
+        assert_eq!(snapshot_len(&mut session).await, 5, "system + 4 messages");
+
+        session.delete_messages(vec![1]);
+        let events = collect_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        let EventMsg::Error { message } = &event.msg else {
+            panic!("expected a rejection, got {:?}", event.msg);
+        };
+        // The orphaned tool result is what the validator trips on first.
+        assert!(message.contains("tool result"), "{message}");
+
+        // The transcript is intact: the rejected delete rolled back.
+        assert_eq!(snapshot_len(&mut session).await, 5);
     }
 }

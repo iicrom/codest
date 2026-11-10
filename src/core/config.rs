@@ -475,7 +475,7 @@ effort_filed = "reasoning"
 [profiles.code]
 default = "glm/glm-5.3"
 effort = "high"
-tools = ["prompt_debug"]
+tools = ["bash"]
 
 [profiles.code.prompt]
 append = "你是资深 Rust 工程师…"
@@ -489,7 +489,7 @@ append = "你是资深 Rust 工程师…"
         let code = &profiles["code"];
         assert_eq!(code.default_selection(), Some("glm/glm-5.3"));
         assert_eq!(code.effort.as_deref(), Some("high"));
-        assert_eq!(code.tools.as_deref(), Some(&["prompt_debug".to_string()][..]));
+        assert_eq!(code.tools.as_deref(), Some(&["bash".to_string()][..]));
         assert_eq!(code.prompt.append.as_deref(), Some("你是资深 Rust 工程师…"));
 
         // A bare profile is all defaults; `tools` absent means keep them all.

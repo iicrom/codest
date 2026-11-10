@@ -514,6 +514,10 @@ struct App {
     effort_menu: Option<EffortMenu>,
     /// Open `/tools` picker over the declared tools.
     tools_menu: Option<ToolsMenu>,
+    /// Open `/context` viewer (`Some` while it owns the input): the whole
+    /// frame shows the conversation as the model sees it, with delete /
+    /// edit / undo. `None` in normal chat.
+    context_view: Option<crate::tui::context_view::ContextView>,
     /// Open `/provider` wizard (`Some` while it owns the input).
     provider_wizard: Option<crate::tui::provider_wizard::Wizard>,
     /// Results from background wizard work (model probes, sign-ins).
@@ -695,6 +699,7 @@ impl App {
             model_menu: None,
             effort_menu: None,
             tools_menu: None,
+            context_view: None,
             provider_wizard: None,
             provider_tx,
             provider_tasks,
@@ -839,6 +844,17 @@ impl App {
             return Ok(());
         };
         let size = tui.size()?;
+
+        // The `/context` viewer takes the whole pane while open; closing it
+        // restores the normal pane, scrollback untouched.
+        if self.context_view.is_some() {
+            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+            tui.draw(|frame| {
+                let view = self.context_view.as_ref().expect("checked above");
+                view.render(frame, area);
+            })?;
+            return Ok(());
+        }
         let width = size.width as usize;
         let rows = size.height;
 
@@ -1036,6 +1052,21 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // The `/context` viewer owns the whole keyboard while it is open —
+        // fully modal, like the provider wizard but stricter: nothing leaks
+        // to the composer or the menus underneath.
+        if self.context_view.is_some() {
+            if let Some(action) = self
+                .context_view
+                .as_mut()
+                .expect("checked above")
+                .handle_key(key)
+            {
+                self.apply_context_action(action);
+            }
+            return;
+        }
 
         // The `/provider` wizard owns the keyboard while it is open: its text
         // steps type into the composer, its pickers take ↑↓, and Enter/Esc mean
@@ -1421,6 +1452,9 @@ impl App {
                 }
                 return self.set_tool_enabled(&invocation.args);
             }
+            // `/context` has two faces: the classic prompt report while the
+            // session has no messages, the context viewer once it does.
+            "context" => return self.open_context_view(),
             _ => {}
         }
         let effects = self
@@ -2250,6 +2284,53 @@ impl App {
         self.tools_menu = Some(ToolsMenu { items, selected: 0 });
     }
 
+    /// `/context`: the classic prompt report while the conversation is
+    /// empty, the interactive viewer once messages exist. The gate reads the
+    /// view's transcript cells (an approximation of the worker's context —
+    /// close enough to pick a face, and the viewer's own snapshot is the
+    /// authority once open).
+    fn open_context_view(&mut self) {
+        let has_transcript = self.view().history.iter().any(|cell| {
+            matches!(
+                cell,
+                HistoryCell::User(_)
+                    | HistoryCell::Assistant(_)
+                    | HistoryCell::ToolCall { .. }
+            )
+        });
+        if !has_transcript {
+            let block = crate::tui::context_view::build_context_report(&self.plugin_info());
+            // A report is read from its top, like every plugin report.
+            let view = self.view_mut();
+            view.history.push(HistoryCell::Report(block));
+            view.park_on_last_report = true;
+            return;
+        }
+        self.command_menu_dismissed = true;
+        self.context_view = Some(crate::tui::context_view::ContextView::new());
+        // The snapshot comes back as a `ConversationSnapshot` event and the
+        // viewer renders "loading…" until then.
+        self.session.inspect_conversation();
+    }
+
+    /// Carry out one viewer action: every mutation is an op away — the
+    /// worker is the only owner of the transcript.
+    fn apply_context_action(&mut self, action: crate::tui::context_view::ContextAction) {
+        use crate::tui::context_view::ContextAction as Action;
+        match action {
+            Action::Close => self.context_view = None,
+            Action::Delete { indices } => {
+                self.session.delete_messages(indices);
+            }
+            Action::Edit { index, content } => {
+                self.session.edit_message(index, content);
+            }
+            Action::Undo => {
+                self.session.undo_context_edit();
+            }
+        }
+    }
+
     fn move_tools_selection(&mut self, delta: isize) {
         let Some(menu) = self.tools_menu.as_mut() else {
             return;
@@ -2586,6 +2667,12 @@ impl App {
                 self.view_mut().history.push(HistoryCell::Interrupted);
             }
             EventMsg::Error { message } => {
+                // A rejected context op reports inside the viewer, where the
+                // action that failed is still on screen.
+                if let Some(view) = self.context_view.as_mut() {
+                    view.set_error(message);
+                    return;
+                }
                 self.finalize_live();
                 self.view_mut().history.push(HistoryCell::Error(message));
             }
@@ -2601,15 +2688,28 @@ impl App {
                 // The TUI already reset its transcript synchronously when
                 // `/clear` ran; this confirms the core also dropped the
                 // context and lets plugins observe the reset.
+                self.context_view = None;
                 let effects = self.plugins.conversation_cleared(self.plugin_info());
                 self.apply_effects(effects);
             }
-            EventMsg::SessionStarted { .. }
-            | EventMsg::SessionSwitched { .. }
-            | EventMsg::SessionRenamed { .. } => {
-                // `/new`, the session picker, and `/rename` already applied
-                // their view changes synchronously; these events confirm the
-                // core (and the rollout file) did the same.
+            EventMsg::SessionStarted { .. } | EventMsg::SessionSwitched { .. } => {
+                // `/new` and the session picker already applied their view
+                // changes synchronously; these events confirm the core (and
+                // the rollout file) did the same. A viewer open across the
+                // switch would show the wrong session's context.
+                self.context_view = None;
+            }
+            EventMsg::SessionRenamed { .. } => {
+                // `/rename` already applied its view change synchronously;
+                // this event confirms the core (and the rollout) did too.
+            }
+            EventMsg::ConversationSnapshot { messages } => {
+                // The `/context` viewer's read path: the worker's own
+                // transcript, whether from `InspectConversation` or as the
+                // confirmation of a delete / edit / undo.
+                if let Some(view) = self.context_view.as_mut() {
+                    view.apply_snapshot(messages);
+                }
             }
             EventMsg::ShutdownComplete => {
                 self.quit = true;
@@ -2713,6 +2813,12 @@ impl App {
     fn render_fullscreen(&mut self, frame: &mut Frame) {
         let area = frame.area();
         if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        // The `/context` viewer takes the whole frame while open.
+        if let Some(view) = self.context_view.as_ref() {
+            view.render(frame, area);
             return;
         }
         let width = area.width as usize;
@@ -4248,6 +4354,7 @@ mod tests {
                 total_input: last_usage.map_or(0, |(input, _)| input),
                 total_output: last_usage.map_or(0, |(_, output)| output),
                 messages,
+                undo: Vec::new(),
                 name,
                 profile: None,
                 tools: None,
@@ -4326,6 +4433,7 @@ mod tests {
             total_input: 0,
             total_output: 0,
             messages: Vec::new(),
+            undo: Vec::new(),
             name: None,
             profile: None,
             tools: None,
@@ -4365,9 +4473,9 @@ mod tests {
         // Wide enough that the alias hints are not clipped.
         let lines = render_lines(&mut app, 110, 20);
         let rendered = lines.join("\n");
-        // Sixteen names (twelve commands plus four aliases) share a six-row
-        // window; the first page shows /help with its aliases and the first
-        // commands, aliases labeled with the command they point at.
+        // Eighteen names (fourteen commands plus four aliases) share a
+        // six-row window; the first page shows /help with its aliases and the
+        // first commands, aliases labeled with the command they point at.
         assert!(rendered.contains("▸ /help"), "{rendered}");
         assert!(rendered.contains("/h "), "{rendered}");
         assert!(rendered.contains("/clear"), "{rendered}");
@@ -4388,7 +4496,8 @@ mod tests {
 
         // Moving the selection pages the window onto the tail; the longest
         // command name still gets a separating space before its summary.
-        for _ in 0..11 {
+        // (Ten presses put the selection on the /resume alias.)
+        for _ in 0..10 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let lines = render_lines(&mut app, 110, 20);
@@ -4918,6 +5027,182 @@ mod tests {
             "{:?}",
             app.view().history
         );
+    }
+
+    /// An app whose view mirrors one completed user turn (the worker keeps
+    /// running for real; its events just sit unread in the channel).
+    fn app_with_transcript() -> App {
+        let mut app = test_app();
+        app.composer.set_text("hello".to_string());
+        app.try_submit();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnComplete,
+        ));
+        app
+    }
+
+    /// Collect from the real worker until a `ConversationSnapshot` arrives —
+    /// the confirmation every context op answers with.
+    async fn next_snapshot(app: &mut App) -> EventMsg {
+        loop {
+            let event = app.session.next_event().await.expect("worker event");
+            if let EventMsg::ConversationSnapshot { .. } = &event.msg {
+                return event.msg;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn context_prints_the_report_before_the_first_message() {
+        let mut app = test_app();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+
+        assert!(app.context_view.is_none(), "no viewer without messages");
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Report(block)) if block.title == "context"),
+            "{:?}",
+            app.view().history.last()
+        );
+        assert!(app.view().park_on_last_report);
+    }
+
+    #[tokio::test]
+    async fn context_opens_the_viewer_once_messages_exist() {
+        let mut app = app_with_transcript();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+
+        assert!(app.context_view.is_some(), "messages exist, so the viewer");
+        // The worker answers the inspect op with the real transcript.
+        let snapshot = next_snapshot(&mut app).await;
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+        assert_eq!(
+            app.context_view.as_ref().unwrap().entries_len(),
+            Some(3),
+            "system + user + the echo model's reply"
+        );
+
+        // Rendering shows the viewer, not the chat frame: the banner and the
+        // normal footer hints are gone, replaced by the viewer's own.
+        let lines = render_lines(&mut app, 80, 24);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Context"), "{rendered}");
+        assert!(rendered.contains("u undo"), "{rendered}");
+        assert!(!rendered.contains("distilled from codex"), "{rendered}");
+        assert!(!rendered.contains("Ctrl+C twice"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn delete_in_the_viewer_round_trips_through_the_worker() {
+        let mut app = app_with_transcript();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+        let snapshot = next_snapshot(&mut app).await;
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+
+        // Select the user entry and confirm the delete.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        let snapshot = next_snapshot(&mut app).await;
+        let EventMsg::ConversationSnapshot { messages } = &snapshot else {
+            panic!("expected a snapshot, got {snapshot:?}");
+        };
+        assert_eq!(messages.len(), 2, "system + the surviving assistant");
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+        assert_eq!(app.context_view.as_ref().unwrap().entries_len(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn edit_in_the_viewer_round_trips_through_the_worker() {
+        let mut app = app_with_transcript();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+        let snapshot = next_snapshot(&mut app).await;
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let snapshot = next_snapshot(&mut app).await;
+        let EventMsg::ConversationSnapshot { messages } = &snapshot else {
+            panic!("expected a snapshot, got {snapshot:?}");
+        };
+        assert_eq!(messages[1].content, "hello!", "the edit landed");
+        assert_eq!(messages[1].role, crate::core::Role::User);
+    }
+
+    #[tokio::test]
+    async fn undo_in_the_viewer_restores_a_deleted_entry() {
+        let mut app = app_with_transcript();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+        let snapshot = next_snapshot(&mut app).await;
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let snapshot = next_snapshot(&mut app).await;
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        let snapshot = next_snapshot(&mut app).await;
+        let EventMsg::ConversationSnapshot { messages } = &snapshot else {
+            panic!("expected a snapshot, got {snapshot:?}");
+        };
+        assert_eq!(messages.len(), 3, "the user message came back");
+        assert_eq!(messages[1].content, "hello");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_op_reports_inside_the_viewer() {
+        let mut app = app_with_transcript();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+        let snapshot = next_snapshot(&mut app).await;
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+
+        let cells_before = app.view().history.len();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-c",
+            EventMsg::Error {
+                message: "a tool result has no tool-call message before it".to_string(),
+            },
+        ));
+        assert!(
+            app.context_view.as_ref().unwrap().has_error(),
+            "the viewer shows the rejection"
+        );
+        assert_eq!(
+            app.view().history.len(),
+            cells_before,
+            "no chat error cell while the viewer is open"
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_and_clear_close_the_viewer() {
+        let mut app = app_with_transcript();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+        assert!(app.context_view.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.context_view.is_none());
+
+        // Reopen, then a `/clear` confirmation closes it too: the context it
+        // showed is gone.
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+        assert!(app.context_view.is_some());
+        app.handle_agent_event(crate::core::Event::new("sub-c", EventMsg::ConversationCleared));
+        assert!(app.context_view.is_none());
     }
 
     #[tokio::test]

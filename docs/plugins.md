@@ -374,11 +374,22 @@ ConversationCleared
 | `clear` | `/clear` | 请求清空 transcript 和上下文 |
 | `quit` | `/quit` (`/exit`) | 请求退出 |
 | `status` | `/status` | 展示 backend、模式、transcript 大小、命令数、插件列表 |
-| `prompt_debug` | `/context` | 展示组装后的 prompt（逐段出处）、请求配置、工具列表和 token 用量 |
 
-这四个插件覆盖了三种典型形态：只读命令（`help`/`status`）、请求宿主动作
-（`clear`/`quit`）、以及不需要命令的纯钩子插件（文档示例）。`prompt_debug`
-是只读报告类插件的参照：只读 `PluginContext`，输出一个 `Report` 块。
+这些插件覆盖了三种典型形态：只读命令（`help`/`status`）、请求宿主动作
+（`clear`/`quit`）、以及不需要命令的纯钩子插件（文档示例）。
+
+`/context` 曾由 `prompt_debug` 插件承担，现在是前端自带命令
+（`core::context` + `tui::context_view`），有两种形态：
+
+- 会话还没有 transcript 消息时，输出原有的静态报告：组装后的 prompt
+  （逐段出处）、请求配置、工具列表和 token 用量；
+- 会话中则打开全屏上下文查看器：逐条列出 system + transcript，支持
+  删除（整轮 tool 调用级联）、编辑（非 system 条目的 content）和撤销
+  （checkpoint 逐步还原，重启后经 rollout 重放仍可撤销）。所有修改都
+  是 op（`DeleteMessages` / `EditMessage` / `UndoContextEdit`），worker
+  校验 tool_calls↔tool 结构后落盘并回 `ConversationSnapshot`。插入功能
+  预留（core 已有 `insert_at` 原语）但未接 UI；上下文外置（把一段内容
+  存到本地、上下文只留简述+索引地址）的存储契约在 `core::context_store`。
 
 ## 8. 新增一个插件
 

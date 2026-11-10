@@ -76,6 +76,7 @@ static SHIPPED_COMMAND_GROUPS: &[&[CommandSpec]] = &[
     crate::core::reasoning::REASONING_COMMANDS,
     crate::core::config::PROFILE_COMMANDS,
     crate::core::tools_switch::TOOLS_COMMANDS,
+    crate::core::context::CONTEXT_COMMANDS,
 ];
 
 /// Owns the static plugin list and the command table they contribute.
@@ -868,8 +869,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "clear", "quit", "status", "context", "new", "rename", "sessions",
-                "model", "provider", "effort", "thinking", "profile", "tools"
+                "help", "clear", "quit", "status", "new", "rename", "sessions",
+                "model", "provider", "effort", "thinking", "profile", "tools", "context"
             ]
         );
     }
