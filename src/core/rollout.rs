@@ -200,6 +200,12 @@ pub enum RolloutItem {
     ProfileSwitched {
         name: String,
     },
+    /// The session's enabled-tool set was replaced (`Op::SetToolsEnabled`,
+    /// `/tools`). The last item wins on replay; a session without one had
+    /// every declared tool enabled.
+    ToolsSwitched {
+        enabled: Vec<String>,
+    },
 }
 
 /// One JSONL line: a timestamp plus the payload's fields flattened in.
@@ -234,6 +240,10 @@ pub struct LoadedSession {
     /// The profile last active in this session, replayed from the meta line
     /// and [`RolloutItem::ProfileSwitched`] items.
     pub profile: Option<String>,
+    /// The enabled-tool set the session last ran with (`/tools`), replayed
+    /// from the last [`RolloutItem::ToolsSwitched`] item; `None` when the
+    /// session never customized it (every declared tool enabled).
+    pub tools: Option<Vec<String>>,
 }
 
 /// Creates rollout files for new sessions.
@@ -360,6 +370,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     let mut name = None;
     let mut model = None;
     let mut profile = None;
+    let mut tools = None;
     let mut last_usage = None;
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
@@ -423,6 +434,11 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             RolloutItem::ProfileSwitched { name } => {
                 profile = Some(name);
             }
+            RolloutItem::ToolsSwitched { enabled } => {
+                // The session's own tool configuration, like the model above:
+                // the last switch is the one a resumed session restarts with.
+                tools = Some(enabled);
+            }
         }
     }
 
@@ -442,6 +458,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
         total_input,
         total_output,
         profile,
+        tools,
     })
 }
 
@@ -642,6 +659,42 @@ mod tests {
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.profile.as_deref(), Some("code"));
         assert_eq!(loaded.messages.len(), 1, "metadata, not conversation");
+    }
+
+    #[test]
+    fn tools_switched_round_trips_and_replays_the_last_set() {
+        let dir = tempdir("tools");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        // No switch yet: the session never customized its tools.
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.tools, None);
+
+        // The last switch in file order is the one a resume restores.
+        rollout
+            .append(&RolloutItem::ToolsSwitched {
+                enabled: vec!["read".to_string(), "edit".to_string()],
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "hello".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ToolsSwitched {
+                enabled: vec!["read".to_string()],
+            })
+            .expect("append");
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(
+            loaded.tools,
+            Some(vec!["read".to_string()]),
+            "last switch wins"
+        );
+        assert_eq!(loaded.messages.len(), 1, "metadata, not conversation");
+        let raw = std::fs::read_to_string(&rollout.path).expect("read");
+        assert!(raw.contains(r#""type":"tools_switched""#), "{raw}");
     }
 
     #[test]

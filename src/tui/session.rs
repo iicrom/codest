@@ -29,6 +29,11 @@ pub struct SessionView {
     pub follow: bool,
     pub scroll: usize,
     pub max_scroll: usize,
+    /// Set when a report was just appended: the next render parks the
+    /// viewport on the report's first line, so a long `/context` dump is read
+    /// from its top instead of its tail. The row count is only known once the
+    /// cell renders at the current width, hence the deferral.
+    pub park_on_last_report: bool,
     /// Inline mode: how many history cells have been flushed to scrollback.
     pub printed_cells: usize,
     /// Inline mode: how many wrapped lines of `live` already went to scrollback.
@@ -138,6 +143,7 @@ impl SessionView {
             follow: true,
             scroll: 0,
             max_scroll: 0,
+            park_on_last_report: false,
             printed_cells: 0,
             live_committed: 0,
             inline_final_text: None,

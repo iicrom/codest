@@ -32,6 +32,7 @@ cargo run -- --api-key test --base-url http://127.0.0.1:8080/v1 --model test-mod
 
 cargo test                    # 单元测试离线运行，使用进程内假模型，不访问网络
 python3 scripts/pty_smoke.py  # 伪终端冒烟测试：自动拉起测试服务，fullscreen / inline 都会跑
+python3 scripts/tool_smoke.py # 工具冒烟测试：真实执行 bash / read 并验证 /tools 开关
 ```
 
 连接一个 OpenAI 兼容的流式接口（`CST_BASE_URL`/`CST_API_KEY` 需成对提供，只给其一时 codest 会在发送时提示补全）。无论是否指定 `--model`，codest 都会对该端点做模型发现（尽力而为）：`/model` 菜单补全端点的模型列表，窗口长度等元数据（footer 的上下文显示）也从发现结果带入：
@@ -236,7 +237,7 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 | `/clear` | — | 清空会话上下文和屏幕上的 transcript |
 | `/quit` | `/exit` | 退出 codest |
 | `/status` | — | 显示 backend、模式、transcript 大小和已加载插件 |
-| `/context` | — | 显示组装后的系统提示词（逐段标注出处：base / 各插件）、请求配置（endpoint、effort、`body_overrides`）、插件声明的工具列表和 token 用量 |
+| `/context` | — | 显示提供给模型的内容：**工具及启用状态**（`Tools (n/m enabled)`，逐个标注 `enabled`/`disabled`/`read-only`）、组装后的系统提示词（逐段标注出处：base / 各插件）、请求配置（endpoint、effort、`body_overrides`）和 token 用量。输出较长，打开时会停在报告开头，`PgDn`/滚轮继续 |
 | `/new` | — | 归档当前对话，开启一个新的空会话 |
 | `/rename <name>` | — | 重命名当前会话；默认名取该会话第一句用户输入 |
 | `/sessions` | `/resume` | 打开会话列表菜单，切换并继续以前的会话 |
@@ -244,6 +245,7 @@ CST_TUI_MODE=inline codest   # 也可以用环境变量
 | `/provider` | — | 打开 provider 向导：新增 OpenAI 兼容端点、登录插件贡献的 provider、查看已配置列表（见"`/provider`"） |
 | `/effort [level]` | — | 查看或设置模型推理等级：无参数打开 `↑`/`↓` 选择菜单，`/effort <level>` 直接设置，`off` 清除；随请求以 `reasoning_effort` 字段发送。等级表来自模型的 `reasoning` 声明或 models API 的 `default_level`（选中模型时自动采纳为初始值） |
 | `/thinking` | — | 切换模型思考过程（thinking 输出）的折叠/展开 |
+| `/tools [name] [on\|off]` | — | 查看或设置本会话启用的工具：无参数打开勾选菜单（`空格` 切换、`Enter` 应用、`Esc` 关闭），`/tools <name>` 直接翻转单个工具，`on`/`off` 固定方向。禁用的工具不再声明给模型，模型误调用也会被拒绝。开关按会话记录，恢复会话时一并还原（见"工具调用"） |
 
 输入 `/` 就会在输入框上方弹出候选列表，继续输入会按指令名或别名前缀实时过滤（不区分大小写）：
 
@@ -308,13 +310,30 @@ codest 的指令和生命周期扩展都来自**编译期链接**的插件，不
 
 本体实现了 openai-completions 的完整工具链路，具体工具由插件添加：
 
-1. 插件用 `Plugin::tools()` 声明 `ToolSpec`（名称、描述、JSON Schema 参数）；
+1. 插件用 `Plugin::tools()` 声明 `ToolSpec`（名称、描述、JSON Schema 参数，
+   以及 `read_only` 标记——纯查看类工具的提示，供 `/tools` 展示与未来的
+   只读 profile 使用）；
 2. 请求自动带上 `tools` 字段；模型流式返回 `tool_calls` 后，worker 按 name
    派发到声明该工具的插件的 `run_tool()`；
 3. 执行结果（或 `error: …` 失败文本）作为 `role: "tool"` 消息回传，回合继续
    （上限 8 轮，`Esc` 可中断）；每次调用在 transcript 上渲染为一个 `⚙` 单元，
    会话持久化与恢复都覆盖工具消息；
 4. 用 `/context` 可以随时查看当前提供了哪些工具。
+
+内置两个工具插件（`src/plugins/builtin/tools/`）：
+
+- **bash**（id `bash`）：单次 shell 执行，`$SHELL -c`，默认 300s 超时（可传
+  `timeout`，上限 600s），超时杀死整个进程组；输出合并 stderr、带退出码脚注，
+  按尾截断（最后 2000 行 / 50 KB，参考 pi）。
+- **fs**（id `fs`）：`read`（行号窗口，`offset`/`limit` 续读，二进制探测）、
+  `write`（整文件写入，自动建父目录）、`edit`（精确字符串替换，要求唯一匹配或
+  `replace_all`，保留 BOM 与 CRLF，语义与 dsh 一致）。三者共享工作目录解析与
+  截断策略；`read` 带 `read_only` 标记。
+
+所有工具都支持**会话级开关**（`/tools`）：禁用的工具从模型请求的 `tools`
+字段里移除（省 token 也防幻觉调用），模型误调用会在执行期被拒绝；开关随
+rollout 记录并在恢复会话时还原。这也是未来 readonly / normal profile 的
+落点：profile 按插件 id 粗筛（装配期），`/tools` 按工具名细调（会话期）。
 
 skills、workspace instructions 等上下文不需要专门的机制：作为普通插件的
 `system_prompt()` 片段注入即可，`/context` 会逐段标注出处。
@@ -352,8 +371,9 @@ codest/
 │   ├── plugins.md           # 静态插件系统设计
 │   └── multi-provider.md    # 多 Provider 框架设计
 ├── scripts/
-│   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务
-│   └── pty_smoke.py          # 离线端到端冒烟测试（pty）
+│   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务（--tool / --tool-arguments 可触发内置工具）
+│   ├── pty_smoke.py          # 离线端到端冒烟测试（pty）
+│   └── tool_smoke.py         # 内置工具与 /tools 的端到端冒烟测试
 └── src/
     ├── main.rs              # codest 主入口
     ├── bin/cst.rs           # cst 别名入口

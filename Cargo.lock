@@ -298,6 +298,7 @@ dependencies = [
  "crossterm",
  "cst-plugin-api",
  "futures-util",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

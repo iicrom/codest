@@ -539,6 +539,7 @@ mod tests {
                 name: "ping",
                 description: "reply with pong",
                 parameters_json: r#"{ "type": "object" }"#,
+                read_only: true,
             }],
         };
         let body = client.request_body(&[Message::user("hi")], &options);

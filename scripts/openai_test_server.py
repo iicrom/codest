@@ -102,6 +102,9 @@ def reasoning_for(body: dict[str, Any]) -> str:
 
 TOOL_TRIGGER = "@tool"
 TOOL_NAME = "ping"
+# The `ping`-shaped argument object the default call streams in fragments;
+# `--tool-arguments` replaces it for tools with a different schema.
+TOOL_ARGUMENTS = '{"note":"called by the test server"}'
 
 
 def conversation_has_tool_round(messages: Any) -> bool:
@@ -353,17 +356,26 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
 
+        # The arguments stream in two fragments to exercise reassembly. The
+        # default `ping`-shaped object keeps the historical behaviour; a
+        # `--tool`/`--tool-arguments` pair lets the same server drive a real
+        # built-in tool (`bash`, `read`, …) with its own schema.
+        arguments = getattr(self.server, "tool_arguments", TOOL_ARGUMENTS)
+        split = arguments.index(":") + 1 if ":" in arguments else len(arguments)
         call_chunks: list[list[dict[str, Any]]] = [
             [
                 {
                     "index": 0,
                     "id": "call-test-1",
                     "type": "function",
-                    "function": {"name": TOOL_NAME, "arguments": ""},
+                    "function": {
+                        "name": getattr(self.server, "tool_name", TOOL_NAME),
+                        "arguments": "",
+                    },
                 }
             ],
-            [{"index": 0, "function": {"arguments": '{"note":'}}],
-            [{"index": 0, "function": {'arguments': '"called by the test server"}'}}],
+            [{"index": 0, "function": {"arguments": arguments[:split]}}],
+            [{"index": 0, "function": {"arguments": arguments[split:]}}],
         ]
         try:
             for calls in call_chunks:
@@ -434,11 +446,15 @@ class TestServer(ThreadingHTTPServer):
         delay: float,
         default_model: str,
         quiet: bool,
+        tool_name: str = TOOL_NAME,
+        tool_arguments: str = TOOL_ARGUMENTS,
     ) -> None:
         super().__init__(address, ChatHandler)
         self.delay = delay
         self.default_model = default_model
         self.quiet = quiet
+        self.tool_name = tool_name
+        self.tool_arguments = tool_arguments
 
 
 def main() -> int:
@@ -459,6 +475,16 @@ def main() -> int:
         "--model", default="test-model", help="model name used when the request omits one"
     )
     parser.add_argument("--quiet", action="store_true", help="do not log requests")
+    parser.add_argument(
+        "--tool",
+        default=TOOL_NAME,
+        help=f"tool name the `@tool` trigger calls (default: {TOOL_NAME})",
+    )
+    parser.add_argument(
+        "--tool-arguments",
+        default=TOOL_ARGUMENTS,
+        help='JSON arguments for the triggered call (default: the ping-shaped object)',
+    )
     args = parser.parse_args()
 
     server = TestServer(
@@ -466,6 +492,8 @@ def main() -> int:
         delay=max(0.0, args.delay),
         default_model=args.model,
         quiet=args.quiet,
+        tool_name=args.tool,
+        tool_arguments=args.tool_arguments,
     )
     host, port = server.server_address[:2]
     print(f"codest test server listening on http://{host}:{port}/v1", flush=True)

@@ -42,6 +42,14 @@ pub enum Op {
     /// values (tools, system prompt) are set at startup and are not touched.
     /// Applied between turns, like `SwitchModel`; unknown names error.
     SwitchProfile { name: String },
+    /// Replace the active session's enabled-tool set (`/tools`): the whole
+    /// set, not a delta, so one op carries a menu's multi-toggle result.
+    /// Enabled tools are declared to the model on the following turns and
+    /// are the only ones the executor will run; disabled ones are withheld
+    /// from the declaration and rejected at execution time. Unknown names
+    /// are ignored (a replayed set may name tools this run never declared).
+    /// Applied between turns, like `SwitchModel`.
+    SetToolsEnabled { enabled: Vec<String> },
 }
 
 /// Events emitted by the agent.
@@ -93,6 +101,11 @@ pub enum EventMsg {
     /// The named profile is now active (`Op::SwitchProfile`). Its selection
     /// and effort changes ride along as their own events.
     ProfileSwitched { name: String },
+    /// The enabled-tool set for the active session is now `enabled`
+    /// (`Op::SetToolsEnabled`, `/tools`). Also emitted after a session
+    /// switch or creation, because the set is per session and the
+    /// front-end's mirror needs to resync.
+    ToolsSwitched { enabled: Vec<String> },
     /// The worker has stopped.
     ShutdownComplete,
 }

@@ -600,19 +600,37 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
                 break
             if not pump(master, output, 0.2):
                 break
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            if b"ready" in bytes(output[turn_start:]):
+        # `/context` needs an idle agent. The turn's `ready` footer does not
+        # survive the render of a full-screen repaint, so wait on the output
+        # rate instead: the spinner's fixed per-tick repaint is far smaller
+        # than a live stream.
+        previous = -1
+        for _ in range(80):
+            before = len(output)
+            if not pump(master, output, 0.4):
                 break
-            if not pump(master, output, 0.3):
+            growth = len(output) - before
+            if growth <= 256 and 0 <= previous <= 256:
                 break
+            previous = growth
         turn_end = len(output)
-        # `/context` needs an idle agent; the turn is done by now.
+        # `/context` needs an idle agent; the turn is done by now. The report
+        # is printed into a transcript that is already taller than the
+        # 24-row grid, so the visible frame shows only its tail. Assertions
+        # therefore read the *rendered transcript text* (via `screen_turn`
+        # plus the report's own stream) rather than assuming what fits.
         os.write(master, b"/context")
         pump(master, output, 0.3)
         os.write(master, b"\r")
-        pump(master, output, 0.8)
+        pump(master, output, 1.2)
+        # The report parks the viewport on its first line (the useful part),
+        # so its tail — Request, Usage — is one PgDn away. Scroll once and
+        # capture that frame too, the way a reader would.
         before_quit = len(output)
+        for _ in range(2):
+            os.write(master, b"\x1b[6~")  # PgDn
+            pump(master, output, 0.2)
+        report_tail_end = len(output)
         for _ in range(3):
             if process.poll() is not None:
                 break
@@ -638,6 +656,16 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
     screen_turn = render(output[:turn_end].decode("utf-8", "replace"))
     raw_before_quit = output[:before_quit].decode("utf-8", "replace")
     screen = render(raw_before_quit)
+    # The report is taller than the grid and parks on its first line, so the
+    # frame right after `/context` shows its head and the frame after PgDn its
+    # tail. Fullscreen repaints only the visible window and inline prints to
+    # the terminal's scrollback, so the assertions read the plain text of the
+    # whole capture (escape sequences and cursor moves stripped) plus the
+    # scrolled frame — the closest a pty test gets to scrolling back.
+    plain = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07", "", raw_before_quit)
+    report_tail = render(output[:report_tail_end].decode("utf-8", "replace"))
+    report_screen = raw_before_quit + "\n" + plain + "\n" + report_tail
+
     print(f"--- {mode} screen (tool cell) ---")
     print(screen_tool)
     print(f"--- {mode} screen (tool round) ---")
@@ -650,10 +678,12 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         "tool call rendered": '⚙ ping {"note":"called by the test server"}' in screen_tool,
         "unknown tool surfaced": "unknown tool `ping`" in screen_turn,
         "round trip reply": "tool-calling round trip of the test server" in screen_turn,
-        "context report title": "▪ context" in screen,
-        "context shows sections": "base  You are codest" in screen,
-        "context shows request": "/chat/completions" in screen,
-        "context shows tools": "Tools (0)" in screen,
+        # The report is taller than the grid, so these read the transcript
+        # text (`report_screen`), not the visible frame.
+        "context report title": "▪ context" in report_screen,
+        "context shows sections": "System prompt" in report_screen,
+        "context shows request": "/chat/completions" in report_screen,
+        "context shows tools": "Tools (" in report_screen,
         "clean exit": process.poll() is not None or process.returncode == 0,
     }
     checks["rollout records tool round"] = (

@@ -5,6 +5,7 @@
 //! A `CancellationToken` is installed for the in-flight turn so `interrupt`
 //! works without racing the submission queue.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -316,6 +317,15 @@ impl AgentSession {
         self.submit(Op::SetReasoningEffort { effort })
     }
 
+    /// Replace the active session's enabled-tool set (`/tools`): the whole
+    /// set, not a delta. Enabled tools are declared to the model from the
+    /// next turn on and are the only ones executed; unknown names are
+    /// dropped. The result arrives as [`EventMsg::ToolsSwitched`]; ops are
+    /// FIFO, so it never lands mid-turn.
+    pub fn set_tools_enabled(&self, enabled: Vec<String>) -> String {
+        self.submit(Op::SetToolsEnabled { enabled })
+    }
+
     /// Await the next event. `None` means the worker has stopped and the
     /// channel is closed.
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -488,6 +498,24 @@ impl Rollouts {
     }
 }
 
+/// Every declared tool enabled: the starting tool set of a session that has
+/// never customized it with `/tools`.
+fn default_enabled(tools: &[ToolSpec]) -> BTreeSet<String> {
+    tools.iter().map(|spec| spec.name.to_string()).collect()
+}
+
+/// The tools actually declared to the model: the enabled subset of the
+/// declared specs, in registration order. Disabled tools are withheld so the
+/// model neither sees them nor (in the common case) calls them; the executor
+/// gate is the backstop for a call the model hallucinated anyway.
+fn declared_tools(tools: &[ToolSpec], enabled: &BTreeSet<String>) -> Vec<ToolSpec> {
+    tools
+        .iter()
+        .filter(|spec| enabled.contains(spec.name))
+        .copied()
+        .collect()
+}
+
 async fn run_worker(
     backend: ModelBackend,
     system_prompt: String,
@@ -513,6 +541,9 @@ async fn run_worker(
     // when the session becomes active again (startup adoption happens in the
     // front-end; this covers switching between sessions mid-run).
     let mut session_models: Vec<Option<String>> = Vec::new();
+    // The tool set each session last ran with (`/tools`). Per session, like
+    // the model: switching restores the session's own set.
+    let mut session_tools: Vec<BTreeSet<String>> = Vec::new();
 
     for loaded in &bootstrap.loaded {
         let mut conversation = Conversation::new(loaded.meta.system_prompt.clone());
@@ -533,9 +564,22 @@ async fn run_worker(
             },
             None => RolloutSlot::inactive(),
         };
+        // A recorded session restores the tool set it last ran with; `None`
+        // means it never customized one, so every declared tool starts
+        // enabled. Names this run does not declare are dropped — a plugin
+        // that is absent today cannot be called either way.
+        let enabled = match &loaded.tools {
+            Some(saved) => saved
+                .iter()
+                .filter(|name| tools.iter().any(|spec| spec.name == name.as_str()))
+                .cloned()
+                .collect(),
+            None => default_enabled(&tools),
+        };
         sessions.push(conversation);
         slots.push(slot);
         session_models.push(loaded.model.clone());
+        session_tools.push(enabled);
     }
 
     // Plain startup opens one fresh session on top of the restored ones; the
@@ -544,6 +588,7 @@ async fn run_worker(
         sessions.push(Conversation::new(system_prompt.clone()));
         slots.push(RolloutSlot::inactive());
         session_models.push(None);
+        session_tools.push(default_enabled(&tools));
     }
 
     let mut rollouts = Rollouts {
@@ -580,9 +625,11 @@ async fn run_worker(
                 client: backend.client().clone(),
                 options: TurnOptions {
                     effort: effort.clone(),
-                    tools: tools.clone(),
+                    tools: declared_tools(&tools, &session_tools[current]),
                 },
                 executor: executor.clone(),
+                declared: tools.clone(),
+                enabled: session_tools[current].clone(),
             };
             run_turn(
                 &mut turn,
@@ -627,7 +674,7 @@ async fn run_worker(
                     sessions[current].snapshot(),
                     TurnOptions {
                         effort: effort.clone(),
-                        tools: tools.clone(),
+                        tools: declared_tools(&tools, &session_tools[current]),
                     },
                     cancel.clone(),
                 );
@@ -658,8 +705,22 @@ async fn run_worker(
             }
             Op::NewSession => {
                 sessions.push(Conversation::new(system_prompt.clone()));
+                let previous = current;
                 current = sessions.len() - 1;
                 rollouts.push_slot();
+                session_tools.push(default_enabled(&tools));
+                // A fresh session starts with every tool enabled. The
+                // front-end's mirror still shows the previous session's set,
+                // so resync it only when that differs — sent before the
+                // confirmation so `SessionStarted` stays the op's last event.
+                if session_tools[previous] != session_tools[current] {
+                    let _ = tx.send(Event::new(
+                        submission.id.clone(),
+                        EventMsg::ToolsSwitched {
+                            enabled: session_tools[current].iter().cloned().collect(),
+                        },
+                    ));
+                }
                 let _ = tx.send(Event::new(
                     submission.id,
                     EventMsg::SessionStarted { session: current },
@@ -667,6 +728,7 @@ async fn run_worker(
             }
             Op::SwitchSession { session } => {
                 if session < sessions.len() {
+                    let previous = current;
                     current = session;
                     // A recorded session remembers the model it last used:
                     // becoming active again restores it, so the footer and
@@ -688,6 +750,18 @@ async fn run_worker(
                         )
                     {
                         session_models[current] = Some(parsed.as_str().to_string());
+                    }
+                    // The tool set is per session; the front-end's mirror
+                    // still shows the session just left. Resync only when the
+                    // set actually differs, and before the confirmation so
+                    // `SessionSwitched` stays the op's last event.
+                    if session_tools[previous] != session_tools[current] {
+                        let _ = tx.send(Event::new(
+                            submission.id.clone(),
+                            EventMsg::ToolsSwitched {
+                                enabled: session_tools[current].iter().cloned().collect(),
+                            },
+                        ));
                     }
                     let _ = tx.send(Event::new(
                         submission.id,
@@ -808,6 +882,24 @@ async fn run_worker(
                     EventMsg::ProfileSwitched { name },
                 ));
             }
+            Op::SetToolsEnabled { enabled: requested } => {
+                // Only declared tools can be enabled: unknown names are
+                // dropped, so a replayed set cannot resurrect tools this run
+                // never declared. An empty set is legitimate (chat-only).
+                let applied: BTreeSet<String> = requested
+                    .into_iter()
+                    .filter(|name| tools.iter().any(|spec| spec.name == name.as_str()))
+                    .collect();
+                session_tools[current] = applied;
+                let enabled: Vec<String> = session_tools[current].iter().cloned().collect();
+                rollouts.append(
+                    current,
+                    RolloutItem::ToolsSwitched {
+                        enabled: enabled.clone(),
+                    },
+                );
+                let _ = tx.send(Event::new(submission.id, EventMsg::ToolsSwitched { enabled }));
+            }
             Op::Shutdown => {
                 let _ = tx.send(Event::new(submission.id, EventMsg::ShutdownComplete));
                 break;
@@ -817,13 +909,21 @@ async fn run_worker(
 }
 
 /// Everything a turn's rounds need beyond the stream itself: the client for
-/// subsequent rounds, the per-turn options (effort + tools), and the plugin
-/// executor for tool calls. Built fresh per turn; the backend cannot switch
-/// mid-turn.
+/// subsequent rounds, the per-turn options (effort + tools), the plugin
+/// executor for tool calls, and the tools this turn enabled. Built fresh per
+/// turn; the backend cannot switch mid-turn.
 struct TurnContext {
     client: Arc<dyn ModelClient>,
     options: TurnOptions,
     executor: Option<Arc<dyn ToolExecutor>>,
+    /// Every tool the plugins declared this run, whatever the session's
+    /// `/tools` set says — the gate's dictionary.
+    declared: Vec<ToolSpec>,
+    /// The enabled subset at turn start. A call for anything outside it is
+    /// rejected without executing: the model was not shown it, so reaching
+    /// here means a hallucinated name (or a race with `/tools` mid-turn —
+    /// the snapshot wins, ops are FIFO anyway).
+    enabled: BTreeSet<String>,
 }
 
 async fn run_turn(
@@ -980,25 +1080,39 @@ async fn execute_tool_call(
     deps: &TurnContext,
     call: ToolCall,
 ) -> bool {
-    let outcome = match deps.executor.clone() {
-        // The executor is synchronous plugin code: run it on the blocking
-        // pool so a slow tool cannot stall the worker, and let an interrupt
-        // win over a still-running call.
-        Some(executor) => {
-            let owned = call.clone();
-            tokio::select! {
-                biased;
-                _ = turn.cancel.cancelled() => return false,
-                outcome = tokio::task::spawn_blocking(move || executor.execute(&owned)) => {
-                    outcome
-                        .unwrap_or_else(|error| Err(format!("tool `{}` task failed: {error}", call.name)))
+    let outcome = if !deps.enabled.contains(&call.name) {
+        // Two distinct cases, answered differently: a tool nobody declares
+        // (a hallucinated name) versus one this session switched off.
+        // Neither executes; the model gets something it can act on.
+        if deps.declared.iter().any(|spec| spec.name == call.name) {
+            Err(format!(
+                "tool `{}` is disabled in this session (re-enable it with /tools)",
+                call.name
+            ))
+        } else {
+            Err(format!("unknown tool `{}`", call.name))
+        }
+    } else {
+        match deps.executor.clone() {
+            // The executor is synchronous plugin code: run it on the blocking
+            // pool so a slow tool cannot stall the worker, and let an
+            // interrupt win over a still-running call.
+            Some(executor) => {
+                let owned = call.clone();
+                tokio::select! {
+                    biased;
+                    _ = turn.cancel.cancelled() => return false,
+                    outcome = tokio::task::spawn_blocking(move || executor.execute(&owned)) => {
+                        outcome
+                            .unwrap_or_else(|error| Err(format!("tool `{}` task failed: {error}", call.name)))
+                    }
                 }
             }
+            None => Err(format!(
+                "tool `{}` is not available: no tool executor is configured",
+                call.name
+            )),
         }
-        None => Err(format!(
-            "tool `{}` is not available: no tool executor is configured",
-            call.name
-        )),
     };
     let (result, error) = match outcome {
         Ok(output) => (output, None),
@@ -1337,6 +1451,7 @@ mod tests {
         name: "ping",
         description: "reply with pong",
         parameters_json: "",
+        read_only: true,
     };
 
     fn tool_call(id: &str, name: &str) -> ToolCall {
@@ -1422,10 +1537,56 @@ mod tests {
     #[tokio::test]
     async fn tool_failures_are_fed_back_and_the_turn_continues() {
         let client = ScriptedClient::new(vec![
-            vec![StreamItem::ToolCalls(vec![tool_call("c1", "missing")])],
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
             vec![StreamItem::Delta("recovered".to_string())],
         ]);
         let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(FailExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        let events = collect_turn(&mut session).await;
+
+        // The tool is enabled and declared, so the failure comes from the
+        // executor itself rather than the availability gate.
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::AgentToolCall { name, error: Some(error), .. }
+                if name == "ping" && error == "nope: ping"
+        )));
+
+        // The model sees the failure as the tool message content.
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen[1][3].content, "error: nope: ping");
+    }
+
+    /// Declares `ping` but always fails it — the executor-level failure the
+    /// turn loop must feed back rather than abort on.
+    struct FailExecutor;
+
+    impl ToolExecutor for FailExecutor {
+        fn execute(&self, call: &ToolCall) -> Result<String, String> {
+            Err(format!("nope: {}", call.name))
+        }
+    }
+
+    #[tokio::test]
+    async fn set_tools_enabled_withholds_declarations_and_rejects_calls() {
+        let client = ScriptedClient::new(vec![
+            // The model calls `ping` anyway — it must come back as an error
+            // result, not an execution.
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
+            vec![StreamItem::Delta("done".to_string())],
+        ]);
+        let seen = client.snapshots();
+        let options = client.turn_options();
         let mut session = AgentSession::spawn_with_bootstrap(
             Arc::new(client),
             "be brief",
@@ -1436,18 +1597,35 @@ mod tests {
             },
         );
 
+        // Unknown names are dropped; an empty set is legitimate (chat-only).
+        session.set_tools_enabled(vec!["nonexistent".to_string()]);
+        session.set_tools_enabled(Vec::new());
         session.submit_user_turn("hi");
         let events = collect_turn(&mut session).await;
 
+        // The switch confirms with the applied (validated) set.
+        let switches: Vec<Vec<String>> = events
+            .iter()
+            .filter_map(|event| match &event.msg {
+                EventMsg::ToolsSwitched { enabled } => Some(enabled.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(switches, [Vec::<String>::new(), Vec::<String>::new()]);
+
+        // The disabled tool is not declared to the model on the wire…
+        let options = options.lock().expect("lock");
+        assert!(options[0].tools.is_empty());
+        drop(options);
+
+        // …and a hallucinated call for it is rejected without executing.
         assert!(events.iter().any(|event| matches!(
             &event.msg,
             EventMsg::AgentToolCall { name, error: Some(error), .. }
-                if name == "missing" && error == "nope: missing"
+                if name == "ping" && error.contains("disabled")
         )));
-
-        // The model sees the failure as the tool message content.
         let seen = seen.lock().expect("lock");
-        assert_eq!(seen[1][3].content, "error: nope: missing");
+        assert!(seen[1][3].content.contains("disabled"));
     }
 
     /// Blocks inside `execute` until released, announcing that it entered —
@@ -1475,7 +1653,7 @@ mod tests {
         let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let client = ScriptedClient::new(vec![vec![StreamItem::ToolCalls(vec![tool_call(
-            "c1", "gate",
+            "c1", "ping",
         )])]]);
         let seen = client.snapshots();
         let mut session = AgentSession::spawn_with_bootstrap(
@@ -2244,6 +2422,7 @@ mod tests {
             messages: vec![Message::user("hello"), Message::assistant("hi")],
             name: None,
             profile: None,
+            tools: None,
         };
 
         // Plain startup: the fresh session runs on the configured test/one.

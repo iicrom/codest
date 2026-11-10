@@ -75,6 +75,7 @@ static SHIPPED_COMMAND_GROUPS: &[&[CommandSpec]] = &[
     crate::core::providers::PROVIDER_COMMANDS,
     crate::core::reasoning::REASONING_COMMANDS,
     crate::core::config::PROFILE_COMMANDS,
+    crate::core::tools_switch::TOOLS_COMMANDS,
 ];
 
 /// Owns the static plugin list and the command table they contribute.
@@ -443,6 +444,7 @@ mod tests {
         name: "ping",
         description: "reply with pong",
         parameters_json: r#"{ "type": "object" }"#,
+        read_only: true,
     };
 
     struct Echo;
@@ -558,6 +560,7 @@ mod tests {
                 overrides: &[],
             },
             tools: &NO_TOOLS,
+            enabled_tools: &[],
             message_count: 1,
         }
     }
@@ -866,7 +869,7 @@ mod tests {
             names,
             vec![
                 "help", "clear", "quit", "status", "context", "new", "rename", "sessions",
-                "model", "provider", "effort", "thinking", "profile"
+                "model", "provider", "effort", "thinking", "profile", "tools"
             ]
         );
     }

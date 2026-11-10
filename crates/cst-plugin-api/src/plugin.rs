@@ -230,6 +230,10 @@ pub struct PluginInfo<'a> {
     pub request: RequestFacts<'a>,
     /// Tools the plugins declared, in registration order.
     pub tools: &'a [ToolSpec],
+    /// The subset of [`Self::tools`] enabled in the active session (the
+    /// `/tools` switch). Equal to every declared name until a session
+    /// narrows it; empty is a legitimate chat-only session.
+    pub enabled_tools: &'a [String],
     /// Approximate message count of the active session's conversation: the
     /// system prompt plus one entry per user/assistant/tool transcript cell.
     pub message_count: usize,
@@ -314,6 +318,12 @@ impl<'a> PluginContext<'a> {
     /// Tools the plugins declared, in registration order.
     pub fn tools(&self) -> &[ToolSpec] {
         self.info.tools
+    }
+
+    /// The subset of [`Self::tools`] enabled in the active session
+    /// (`/tools`); every declared tool until a session narrows the set.
+    pub fn enabled_tools(&self) -> &[String] {
+        self.info.enabled_tools
     }
 
     /// Approximate message count of the active session's conversation.

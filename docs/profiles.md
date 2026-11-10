@@ -257,17 +257,27 @@ effort_field = "none"                          # 端点拒绝未知请求字段
    `execute_tool_call` 用 `spawn_blocking` 执行并以中断优先的 `select`
    等待；`PluginEffect::Task`（启动/命令 effect 的任务化）不在本次范围，
    等真实插件需要阻塞 I/O 时再做。
-4. **`ToolSpec` 去 `'static` 化**：仅当 MCP/运行时装载成为需求；
+4. ~~**会话级工具开关 + 首批内置工具**~~：已实现。`/tools`（`Op::
+   SetToolsEnabled`）按工具名细调当前会话的启用集：禁用的工具不再声明给
+   模型（省 token、防幻觉调用），执行期门禁兜底拒绝误调用；开关随 rollout
+   记录（`tools_switched`）并按会话恢复。同时落地 `ToolSpec.read_only`
+   标记与内置 `bash` / `fs`（`read`/`write`/`edit`）插件。这是 readonly /
+   normal profile 的会话侧落点：profile 按插件 id 粗筛（装配期，§4.1），
+   `/tools` 按工具名细调（会话期），未来 profile 可以再叠加"只启用
+   `read_only=true` 工具"的种子集。
+5. **`ToolSpec` 去 `'static'` 化**：仅当 MCP/运行时装载成为需求；
    `Arc<[ToolSpec]>` + owned executor，内存代价可控。
-5. **渲染扩展 / 分布式注册**：维持 `docs/plugins.md` §11 原顺序，不因
+6. **渲染扩展 / 分布式注册**：维持 `docs/plugins.md` §11 原顺序，不因
    本文提前。
 
 ## 9. 边界与非目标
 
 - profile 切换**不重载**工具集与 system prompt（装配期决定）；需要
-  "换脑子"的会话用 `/new` + 新 profile 重启。
+  "换脑子"的会话用 `/new` + 新 profile 重启。工具的运行时调整走
+  `/tools`（§8.4，会话级、按工具名），两者互补。
 - profile 是 run 作用域：会话间切换不还原各自的 profile 名
-  （`LoadedSession.profile` 数据已就位，等有显示面时再接）。
+  （`LoadedSession.profile` 数据已就位，等有显示面时再接）；工具集
+  **是**按会话还原的（`LoadedSession.tools`，恢复会话时随之生效）。
 - quirk 字段不做 per-model 级覆盖（实例级已够；模型级等真实需求）。
 - 不引入任何脚本引擎、不引入 wasm 运行时（§7）。
 - 不做 profile 的 HMR / 交互式编辑器（手改 `profiles.toml`，同

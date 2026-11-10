@@ -65,6 +65,35 @@ impl Plugin for PromptDebug {
     ) -> Result<(), PluginError> {
         let mut groups: Vec<ReportGroup> = Vec::new();
 
+        // Tools first: `/tools` is the one thing the report is routinely
+        // consulted for, and the system prompt below can be long enough to
+        // push everything else off screen.
+        let tools = ctx.tools();
+        let enabled_count = tools
+            .iter()
+            .filter(|tool| ctx.enabled_tools().iter().any(|name| name == tool.name))
+            .count();
+        groups.push(ReportGroup {
+            heading: format!("Tools ({enabled_count}/{} enabled)", tools.len()),
+            entries: match tools.is_empty() {
+                true => vec![ReportEntry::new("", "none registered")],
+                false => tools
+                    .iter()
+                    .map(|tool| {
+                        let mut line = if ctx.enabled_tools().iter().any(|name| name == tool.name) {
+                            "enabled".to_string()
+                        } else {
+                            "disabled".to_string()
+                        };
+                        if tool.read_only {
+                            line.push_str(" · read-only");
+                        }
+                        ReportEntry::new(tool.name, line)
+                    })
+                    .collect(),
+            },
+        });
+
         // System prompt: the base prompt plus each plugin's fragment,
         // attributed so it is clear who contributes what.
         let sections = ctx.system_sections();
@@ -119,19 +148,6 @@ impl Plugin for PromptDebug {
             entries: request_entries,
         });
 
-        // Tools: every tool the plugins offered to the model this session.
-        let tools = ctx.tools();
-        groups.push(ReportGroup {
-            heading: format!("Tools ({})", tools.len()),
-            entries: match tools.is_empty() {
-                true => vec![ReportEntry::new("", "none registered")],
-                false => tools
-                    .iter()
-                    .map(|tool| ReportEntry::new(tool.name, tool.description))
-                    .collect(),
-            },
-        });
-
         // Usage: the measured context size, as in the footer.
         let context = match ctx.last_usage().map(|(input, output)| input.saturating_add(output)) {
             Some(tokens) => {
@@ -182,9 +198,14 @@ mod tests {
             name: "ping",
             description: "reply with pong",
             parameters_json: "",
+            read_only: true,
         }]
     });
     static CONTEXT_PLUGINS: &[&dyn Plugin] = &[&PROMPT_DEBUG];
+
+    /// `ping` enabled — the ordinary state a fresh session starts in.
+    static ENABLED_PING: LazyLock<Vec<String>> =
+        LazyLock::new(|| vec!["ping".to_string()]);
 
     fn info<'a>(host: &'a PluginHost, sections: &'a [(String, String)]) -> PluginInfo<'a> {
         PluginInfo {
@@ -205,6 +226,7 @@ mod tests {
                 overrides: &OVERRIDES,
             },
             tools: &TEST_TOOLS,
+            enabled_tools: &ENABLED_PING,
             message_count: 3,
         }
     }
@@ -274,12 +296,29 @@ mod tests {
         assert!(!request.entries.iter().any(|entry| entry.label == "body_overrides"));
 
         let tools = group(&block, "Tools");
-        assert_eq!(tools.heading, "Tools (1)");
-        assert_eq!(entry(tools, "ping"), "reply with pong");
+        assert_eq!(tools.heading, "Tools (1/1 enabled)");
+        // Compact rows: the state (and the read-only marker) replaces the
+        // long description so the whole set fits on screen.
+        assert_eq!(entry(tools, "ping"), "enabled · read-only");
 
         let usage = group(&block, "Usage");
         assert!(entry(usage, "context").starts_with("9.3k/200.0k"));
         assert_eq!(entry(usage, "tokens"), "session in 16.2k / out 2.4k");
+    }
+
+    /// `/tools` narrowing the set is visible in the report: the tool stays
+    /// listed, marked disabled, so `/context` explains what the model sees.
+    #[test]
+    fn report_marks_tools_disabled_by_the_session_switch() {
+        static NOTHING_ENABLED: [String; 0] = [];
+        let host = empty_host();
+        let mut narrowed = info(&host, &[]);
+        narrowed.enabled_tools = &NOTHING_ENABLED;
+        let block = dispatch(narrowed);
+
+        let tools = group(&block, "Tools");
+        assert_eq!(tools.heading, "Tools (0/1 enabled)");
+        assert_eq!(entry(tools, "ping"), "disabled · read-only");
     }
 
     #[test]
@@ -306,7 +345,7 @@ mod tests {
         assert_eq!(entry(request, "body_overrides"), "none");
 
         let tools = group(&block, "Tools");
-        assert_eq!(tools.heading, "Tools (0)");
+        assert_eq!(tools.heading, "Tools (0/0 enabled)");
         assert_eq!(tools.entries[0].text, "none registered");
     }
 

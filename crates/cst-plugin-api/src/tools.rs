@@ -30,6 +30,12 @@ pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub parameters_json: &'static str,
+    /// The call only inspects state and never mutates it (`read`, `ls`,
+    /// `grep`). A purely advisory classification: profiles and the `/tools`
+    /// switch use it to decide what a read-only mode may enable, and the UI
+    /// shows it as a marker. Nothing enforces it — a tool that lies about
+    /// `read_only` simply gets enabled by read-only profiles.
+    pub read_only: bool,
 }
 
 impl ToolSpec {
@@ -168,6 +174,7 @@ mod tests {
             name: "ping",
             description: "reply with pong",
             parameters_json: r#"{ "type": "object", "properties": { "n": { "type": "integer" } } }"#,
+            read_only: true,
         };
         let function = spec.function_json()["function"].clone();
         assert_eq!(function["name"], "ping");

@@ -239,6 +239,21 @@ pub async fn run(
         active_profile,
         initial_effort,
     );
+    // The tool set is per session, and the worker restores the adopted
+    // session's set silently (no op ran, so no event comes back). Mirror it:
+    // a saved set names only what that session left enabled, and names this
+    // run does not declare are dropped; a session without one starts with
+    // everything enabled (already the case in the App).
+    if !fresh
+        && let Some(saved) = loaded.last().and_then(|session| session.tools.as_ref())
+    {
+        app.enabled_tools = saved
+            .iter()
+            .filter(|name| app.tools.iter().any(|spec| spec.name == name.as_str()))
+            .cloned()
+            .collect();
+        app.enabled_tools_vec = app.enabled_tools.iter().cloned().collect();
+    }
     if restore == RestoreMode::Picker {
         app.open_session_menu();
     }
@@ -480,6 +495,8 @@ struct App {
     model_menu: Option<ModelMenu>,
     /// Open `/effort` picker over the reasoning effort levels.
     effort_menu: Option<EffortMenu>,
+    /// Open `/tools` picker over the declared tools.
+    tools_menu: Option<ToolsMenu>,
     /// Open `/provider` wizard (`Some` while it owns the input).
     provider_wizard: Option<crate::tui::provider_wizard::Wizard>,
     /// Results from background wizard work (model probes, sign-ins).
@@ -505,6 +522,15 @@ struct App {
     request_facts: RequestFacts,
     /// Tools the plugins declared; static for the whole run.
     tools: Vec<ToolSpec>,
+    /// The active session's enabled tools (`/tools`), mirroring the worker.
+    /// Updated optimistically on a toggle and authoritatively on
+    /// `ToolsSwitched` (which also resyncs after session switches: the set
+    /// is per session).
+    enabled_tools: std::collections::BTreeSet<String>,
+    /// [`Self::enabled_tools`] as a flat slice for [`PluginInfo`], rebuilt
+    /// whenever the set changes (the struct is `Copy`, so it cannot borrow a
+    /// lazily-built `Vec`).
+    enabled_tools_vec: Vec<String>,
     /// Whether thinking output renders expanded. Global across sessions;
     /// `/thinking` toggles it, and committed Thinking cells re-fold with it.
     show_thinking: bool,
@@ -551,6 +577,22 @@ struct EffortMenu {
 struct EffortMenuItem {
     level: Option<String>,
     current: bool,
+}
+
+/// State of the open `/tools` picker.
+struct ToolsMenu {
+    items: Vec<ToolsMenuItem>,
+    selected: usize,
+}
+
+/// One row of the `/tools` picker: a declared tool and its checkbox. Space
+/// toggles the entry; Enter applies the whole set as one op.
+struct ToolsMenuItem {
+    name: String,
+    /// The tool only inspects state (`read`) — advisory, shown as a marker
+    /// and later used by read-only profiles.
+    read_only: bool,
+    enabled: bool,
 }
 
 /// Per-request wire facts for `/context`, derived from the active route's
@@ -615,6 +657,11 @@ impl App {
             });
 
         let tools = plugins.tools();
+        let enabled_tools: std::collections::BTreeSet<String> = tools
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        let enabled_tools_vec: Vec<String> = enabled_tools.iter().cloned().collect();
         let mut app = Self {
             session,
             plugins,
@@ -630,6 +677,7 @@ impl App {
             session_menu: None,
             model_menu: None,
             effort_menu: None,
+            tools_menu: None,
             provider_wizard: None,
             provider_tx,
             provider_tasks,
@@ -641,6 +689,8 @@ impl App {
             system_sections,
             request_facts: RequestFacts::default(),
             tools,
+            enabled_tools,
+            enabled_tools_vec,
             show_thinking: true,
             composer: Composer::new(),
             command_selection: 0,
@@ -877,6 +927,9 @@ impl App {
     fn take_inline_pending(&mut self, width: usize) -> Vec<Line<'static>> {
         let thinking_expanded = self.show_thinking;
         let view = self.view_mut();
+        // Inline mode has no viewport to park: the history goes to the
+        // terminal's own scrollback, where a report is readable in full.
+        view.park_on_last_report = false;
         let mut pending: Vec<Line<'static>> = Vec::new();
 
         // Remaining lines of an assistant message that just finished.
@@ -1056,6 +1109,21 @@ impl App {
                 _ => {}
             }
         }
+        // The `/tools` picker also takes Space to flip the highlighted
+        // checkbox; Enter applies the whole set as one op.
+        if self.tools_menu.is_some() {
+            match key.code {
+                KeyCode::Up => return self.move_tools_selection(-1),
+                KeyCode::Down => return self.move_tools_selection(1),
+                KeyCode::Char(' ') if !ctrl && !alt && !shift => return self.toggle_tools_entry(),
+                KeyCode::Enter if !ctrl && !alt && !shift => return self.confirm_tools_selection(),
+                KeyCode::Esc => {
+                    self.tools_menu = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
 
         match key.code {
             KeyCode::Char('c') if ctrl => self.on_ctrl_c(),
@@ -1165,6 +1233,7 @@ impl App {
             || self.session_menu.is_some()
             || self.model_menu.is_some()
             || self.effort_menu.is_some()
+            || self.tools_menu.is_some()
             || self.provider_wizard.is_some()
         {
             return Vec::new();
@@ -1303,6 +1372,14 @@ impl App {
                     return self.list_profiles();
                 }
                 return self.request_profile_switch(&invocation.args);
+            }
+            // `/tools` with no argument opens the checkbox picker; with a
+            // tool name it flips that tool directly (`on`/`off` pin it).
+            "tools" => {
+                if invocation.args.is_empty() {
+                    return self.open_tools_menu();
+                }
+                return self.set_tool_enabled(&invocation.args);
             }
             _ => {}
         }
@@ -2110,6 +2187,132 @@ impl App {
         self.apply_effort(item.level.clone());
     }
 
+    /// `/tools` with no argument: open the checkbox picker over the declared
+    /// tools, checked for the ones currently enabled. Space toggles; Enter
+    /// applies the whole set as one op.
+    fn open_tools_menu(&mut self) {
+        if self.tools.is_empty() {
+            self.view_mut().history.push(HistoryCell::Notice(
+                "no tools are declared (no loaded plugin contributes any)".to_string(),
+            ));
+            return;
+        }
+        let items = self
+            .tools
+            .iter()
+            .map(|spec| ToolsMenuItem {
+                name: spec.name.to_string(),
+                read_only: spec.read_only,
+                enabled: self.enabled_tools.contains(spec.name),
+            })
+            .collect();
+        self.command_menu_dismissed = true;
+        self.tools_menu = Some(ToolsMenu { items, selected: 0 });
+    }
+
+    fn move_tools_selection(&mut self, delta: isize) {
+        let Some(menu) = self.tools_menu.as_mut() else {
+            return;
+        };
+        let len = menu.items.len();
+        menu.selected = if delta < 0 {
+            (menu.selected + len - 1) % len
+        } else {
+            (menu.selected + 1) % len
+        };
+    }
+
+    /// Flip the highlighted checkbox. Nothing is sent until Enter applies
+    /// the set, so Esc discards the fiddling for free.
+    fn toggle_tools_entry(&mut self) {
+        if let Some(menu) = self.tools_menu.as_mut()
+            && let Some(item) = menu.items.get_mut(menu.selected)
+        {
+            item.enabled = !item.enabled;
+        }
+    }
+
+    /// Apply the picker: the checked names become the session's enabled set.
+    fn confirm_tools_selection(&mut self) {
+        let Some(menu) = self.tools_menu.take() else {
+            return;
+        };
+        let enabled: Vec<String> = menu
+            .items
+            .into_iter()
+            .filter(|item| item.enabled)
+            .map(|item| item.name)
+            .collect();
+        self.apply_tools(enabled);
+    }
+
+    /// `/tools <name> [on|off]`: flip one tool directly, or pin it with the
+    /// optional direction argument. Unknown tools and directions error.
+    fn set_tool_enabled(&mut self, args: &str) {
+        let mut parts = args.split_whitespace();
+        let Some(name) = parts.next() else {
+            return;
+        };
+        let Some(spec) = self.tools.iter().find(|spec| spec.name == name) else {
+            let available = if self.tools.is_empty() {
+                "none".to_string()
+            } else {
+                self.tools
+                    .iter()
+                    .map(|spec| spec.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            self.view_mut().history.push(HistoryCell::Error(format!(
+                "no tool `{name}` is declared (available: {available})"
+            )));
+            return;
+        };
+        let direction = parts.next();
+        let enabled = match direction {
+            None => !self.enabled_tools.contains(spec.name),
+            Some("on") | Some("enable") => true,
+            Some("off") | Some("disable") => false,
+            Some(other) => {
+                self.view_mut().history.push(HistoryCell::Error(format!(
+                    "expected `on` or `off`, got `{other}` (try /tools {name} off)"
+                )));
+                return;
+            }
+        };
+        let mut set = self.enabled_tools.clone();
+        if enabled {
+            if !set.insert(spec.name.to_string()) {
+                return; // already enabled; nothing to apply
+            }
+        } else if !set.remove(spec.name) {
+            return; // already disabled
+        }
+        self.apply_tools(set.into_iter().collect());
+    }
+
+    /// Apply an enabled-set change: update the mirror optimistically, tell
+    /// the core, and record a notice. The core's `ToolsSwitched` event is
+    /// the authoritative confirmation (mirroring `/effort`).
+    fn apply_tools(&mut self, enabled: Vec<String>) {
+        let notice = if enabled.is_empty() {
+            "all tools disabled".to_string()
+        } else {
+            format!("tools enabled: {}", enabled.join(", "))
+        };
+        let view = self.view_mut();
+        view.history.push(HistoryCell::Notice(notice));
+        self.set_enabled_tools(enabled.clone());
+        self.session.set_tools_enabled(enabled);
+    }
+
+    /// Store the enabled set and its flattened mirror together, so
+    /// [`PluginInfo`] can never observe a stale slice.
+    fn set_enabled_tools(&mut self, enabled: impl IntoIterator<Item = String>) {
+        self.enabled_tools = enabled.into_iter().collect();
+        self.enabled_tools_vec = self.enabled_tools.iter().cloned().collect();
+    }
+
     /// `/thinking`: fold or unfold the model's thinking output. A global
     /// display flag — committed Thinking cells in every session re-render
     /// with it on the next frame.
@@ -2174,6 +2377,7 @@ impl App {
                 overrides: &self.request_facts.overrides,
             },
             tools: &self.tools,
+            enabled_tools: self.enabled_tools_vec.as_slice(),
             message_count: 1
                 + view
                     .history
@@ -2202,7 +2406,13 @@ impl App {
                     self.view_mut().history.push(HistoryCell::Error(text));
                 }
                 PluginEffect::Report(block) => {
+                    // A report (the `/context` dump, typically) is read from
+                    // its top. Mark it so the next render parks the viewport
+                    // on its first line: the row count is only known once
+                    // the cell renders at the current width, so it cannot be
+                    // computed here.
                     self.view_mut().history.push(HistoryCell::Report(block));
+                    self.view_mut().park_on_last_report = true;
                 }
                 PluginEffect::ClearConversation => {
                     self.clear_transcript();
@@ -2303,6 +2513,13 @@ impl App {
                 // selection and effort changes ride along as their own
                 // events, handled above.
                 self.active_profile = Some(name);
+            }
+            EventMsg::ToolsSwitched { enabled } => {
+                // `/tools` already updated optimistically; the core confirms
+                // with the validated set. Session switches and creations
+                // send the same event with the session's own set, so the
+                // mirror resyncs here too.
+                self.set_enabled_tools(enabled);
             }
             EventMsg::AgentMessage { message } => {
                 self.view_mut().live = Some(message);
@@ -2543,6 +2760,8 @@ impl App {
             menu.items.len().min(MAX_COMMAND_MENU_ROWS)
         } else if let Some(menu) = self.effort_menu.as_ref() {
             menu.items.len().min(MAX_COMMAND_MENU_ROWS)
+        } else if let Some(menu) = self.tools_menu.as_ref() {
+            menu.items.len().min(MAX_COMMAND_MENU_ROWS)
         } else if self.session_menu.is_some() {
             self.views.len().min(MAX_COMMAND_MENU_ROWS)
         } else {
@@ -2578,6 +2797,12 @@ impl App {
                         index == menu.selected,
                     )
                 })
+                .collect();
+        }
+        if let Some(menu) = self.tools_menu.as_ref() {
+            let window = command_menu_window(menu.items.len(), menu.selected, height);
+            return window
+                .map(|index| tools_menu_line(&menu.items[index], index == menu.selected))
                 .collect();
         }
         if let Some(selected) = self.session_menu {
@@ -2630,7 +2855,13 @@ impl App {
         let mut lines: Vec<Line<'static>> = Vec::new();
         lines.push(Line::from(""));
 
+        // Where the last report cell starts, for the park-on-report scroll
+        // below (the row count is only known here, at this width).
+        let mut last_report_start = None;
         for (index, cell) in view.history.iter().enumerate() {
+            if matches!(cell, HistoryCell::Report(_)) {
+                last_report_start = Some(lines.len());
+            }
             lines.extend(cell.lines(width, thinking_expanded));
             let has_more = index + 1 < view.history.len() || view.live.is_some();
             if has_more {
@@ -2661,7 +2892,16 @@ impl App {
         let height = area.height as usize;
         view.max_scroll = lines.len().saturating_sub(height);
 
-        if view.follow {
+        if view.park_on_last_report {
+            // A report was just appended: show its first line. Doing it here
+            // (not in the effect handler) is what makes the row count and the
+            // viewport height available.
+            view.park_on_last_report = false;
+            if let Some(start) = last_report_start {
+                view.follow = false;
+                view.scroll = start.min(view.max_scroll);
+            }
+        } else if view.follow {
             view.scroll = view.max_scroll;
         } else {
             view.scroll = view.scroll.min(view.max_scroll);
@@ -3322,6 +3562,47 @@ fn effort_menu_line(number: usize, item: &EffortMenuItem, selected: bool) -> Lin
     Line::from(spans)
 }
 
+/// One row of the `/tools` picker: checkbox, tool name, and a read-only
+/// marker on the tools that only inspect state.
+fn tools_menu_line(item: &ToolsMenuItem, selected: bool) -> Line<'static> {
+    let marker = if selected { "▸ " } else { "  " };
+    let (marker_style, text_style) = if selected {
+        (
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+            Style::default(),
+        )
+    } else {
+        (
+            Style::default().fg(theme::DIM),
+            Style::default().fg(theme::DIM),
+        )
+    };
+
+    let checkbox = if item.enabled { "[x] " } else { "[ ] " };
+    let checkbox_style = if item.enabled {
+        Style::default().fg(theme::ACCENT)
+    } else {
+        Style::default().fg(theme::DIM)
+    };
+
+    let mut spans = vec![
+        Span::styled(marker, marker_style),
+        Span::styled(checkbox, checkbox_style),
+        Span::styled(item.name.clone(), text_style),
+    ];
+    if item.read_only {
+        spans.push(Span::styled(
+            " · read-only",
+            Style::default()
+                .fg(theme::DIM)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// The inline pane always spans the terminal width and is pinned to the bottom.
 fn inline_rect(columns: u16, rows: u16, height: u16) -> Rect {
     let height = height.min(rows.max(1));
@@ -3926,6 +4207,7 @@ mod tests {
                 messages,
                 name,
                 profile: None,
+                tools: None,
             }
         };
 
@@ -4003,6 +4285,7 @@ mod tests {
             messages: Vec::new(),
             name: None,
             profile: None,
+            tools: None,
         };
         let saved = vec![saved_session(Some("test/two"))];
 
@@ -4767,8 +5050,8 @@ mod tests {
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            17,
-            "thirteen commands plus four aliases"
+            18,
+            "fourteen commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -4814,9 +5097,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 16);
+        assert_eq!(app.command_selection, 17);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 15);
+        assert_eq!(app.command_selection, 16);
     }
 
     #[tokio::test]
