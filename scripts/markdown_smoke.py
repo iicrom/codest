@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pty_smoke import free_port, pump  # noqa: E402
 import pty_smoke  # noqa: E402
 
-ROWS, COLS = 44, 110
+ROWS, COLS = 58, 110
 # `render` builds its grid from the module's own dimensions; this script uses
 # a taller terminal so the whole sample message fits on one screen.
 pty_smoke.ROWS, pty_smoke.COLS = ROWS, COLS
@@ -62,8 +62,16 @@ hanging indent is visible
 
 ```rust
 fn main() {
-    println!("fenced code");
+    // a comment, a string, and a number
+    let greeting = "fenced code";
+    let answer = 42;
+    let long_call = compute_something(greeting, answer, "a long argument list");
 }
+```
+
+```python
+def greet(name):
+    return f"hello {name}"
 ```
 
 | column a | column b |
@@ -167,7 +175,15 @@ def run(binary: str, mode: str, port: int) -> str:
         os.write(master, b"show me markdown")
         pump(master, output, 0.4)
         os.write(master, b"\r")
-        pump(master, output, 4.0)
+        # Poll for the reply's last line instead of sleeping a fixed time: the
+        # sample is large enough that a fixed window races the paint and makes
+        # the checks flaky on slower builds.
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            pump(master, output, 0.25)
+            if "an open task" in render(output.decode("utf-8", "replace")):
+                break
+        pump(master, output, 0.4)
         # First Ctrl+C clears the composer, the next two quit; the process can
         # exit before the last one lands, which closes the pty.
         for _ in range(3):
@@ -214,11 +230,15 @@ def main() -> int:
             "quote bar": "▎ A quote" in screens["fullscreen"],
             "rule": "───" in screens["fullscreen"],
             "code fence": "fn main() {" in screens["fullscreen"],
+            "code label": "│ rust" in screens["fullscreen"],
+            "second code label": "│ python" in screens["fullscreen"],
+            "code body": "let answer = 42;" in screens["fullscreen"],
             "table header": "column a" in screens["fullscreen"],
             "table divider": "────" in screens["fullscreen"],
             "task checkbox": "[x] a finished task" in screens["fullscreen"],
             "no raw markers": "**bold**" not in screens["fullscreen"],
             "inline mode renders markdown": "Markdown smoke test" in screens["inline"],
+            "inline code label": "│ rust" in screens["inline"],
             "inline no raw markers": "**bold**" not in screens["inline"],
         }
         print("--- checks ---")

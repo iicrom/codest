@@ -21,6 +21,8 @@
 //! literal asterisks into bold text, an unfinished table flips from a
 //! paragraph to aligned columns).
 
+use std::sync::Arc;
+
 use pulldown_cmark::Alignment;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::Event;
@@ -34,10 +36,12 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
+use crate::tui::highlight;
 use crate::tui::theme;
 use crate::tui::wrap::char_width;
 use crate::tui::wrap::display_width;
 use crate::tui::wrap::wrap_chars;
+use crate::tui::wrap::wrap_chars_hard;
 
 /// Render `source` into lines at most `width` columns wide.
 ///
@@ -131,6 +135,31 @@ struct Link {
     is_image: bool,
 }
 
+/// A fenced block being collected: the body arrives one `Event::Text` at a
+/// time, and the language is only known from the opening fence.
+struct CodeBlock {
+    lang: Option<String>,
+    text: String,
+}
+
+/// The fence's info string reduced to a language token.
+///
+/// pulldown-cmark hands back everything after the backticks (`rust`, but also
+/// `rust,ignore` or `rust title="x"`), so take the first word and drop the
+/// punctuation people append to it.
+fn normalize_lang(info: &str) -> Option<String> {
+    let word = info.split_whitespace().next()?;
+    let token = word
+        .split([',', '{', '.'])
+        .next()
+        .unwrap_or(word)
+        .trim_matches(['`', '"', '\'']);
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_ascii_lowercase())
+}
+
 struct Table {
     alignments: Vec<Alignment>,
     header: Vec<Vec<Span<'static>>>,
@@ -181,7 +210,7 @@ struct Writer {
     /// A block just ended; the next block is preceded by one blank line.
     blank_pending: bool,
     /// Fenced code being collected, one `Event::Text` per source line.
-    code: Option<String>,
+    code: Option<CodeBlock>,
     /// Open lists: `Some(next_number)` for ordered, `None` for bullets.
     lists: Vec<Option<u64>>,
     /// Per open list item, the prefix length just before its marker was
@@ -253,9 +282,16 @@ impl Writer {
             }
             Tag::CodeBlock(kind) => {
                 self.start_block();
-                // Indented blocks are fenced-with-spaces; both render the same.
-                let _ = matches!(kind, CodeBlockKind::Indented);
-                self.code = Some(String::new());
+                // Indented blocks carry no language: they render the same
+                // minus the label.
+                let lang = match kind {
+                    CodeBlockKind::Fenced(info) => normalize_lang(&info),
+                    CodeBlockKind::Indented => None,
+                };
+                self.code = Some(CodeBlock {
+                    lang,
+                    text: String::new(),
+                });
                 self.push_prefix(Span::styled("│ ", Style::default().fg(theme::SUBTLE)));
             }
             Tag::List(start) => {
@@ -421,7 +457,7 @@ impl Writer {
 
     fn text(&mut self, text: &str) {
         if let Some(code) = self.code.as_mut() {
-            code.push_str(text);
+            code.text.push_str(text);
             return;
         }
         let style = self.inline_style();
@@ -540,18 +576,65 @@ impl Writer {
     }
 
     fn end_code_block(&mut self) {
-        let code = self.code.take().unwrap_or_default();
+        let Some(block) = self.code.take() else {
+            self.blank_pending = true;
+            return;
+        };
         let prefix = self.prefix.clone();
-        // `lines()` drops the fence's trailing newline but keeps interior
-        // blank lines; leading blanks are kept as typed.
-        for line in code.lines() {
+
+        if let Some(lang) = &block.lang {
             self.push_wrapped(
                 &prefix,
-                vec![Span::styled(line.to_string(), Style::default())],
+                vec![Span::styled(lang.clone(), Style::default().fg(theme::DIM))],
             );
+        }
+
+        // `lines()` drops the fence's trailing newline but keeps interior
+        // blank lines; leading blanks are kept as typed.
+        let lines: Vec<&str> = block.text.lines().collect();
+        // One entry per line; an empty entry means the line stays unstyled,
+        // which is also the whole-block fallback for unknown languages.
+        let segments = match &block.lang {
+            Some(lang) => highlight::block(lang, &lines),
+            None => Arc::new(vec![Vec::new(); lines.len()]),
+        };
+
+        for (index, line) in lines.iter().enumerate() {
+            let spans = match segments.get(index) {
+                Some(segments) if !segments.is_empty() => segments
+                    .iter()
+                    .filter_map(|segment| {
+                        let text = line.get(segment.start..segment.end)?;
+                        Some(Span::styled(
+                            text.to_string(),
+                            highlight::style(segment.kind),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+                _ => vec![Span::raw(line.to_string())],
+            };
+            // Code is not reflowed: `push_wrapped` would break at spaces and
+            // drop them, changing what the snippet says.
+            self.push_code_line(&prefix, spans);
         }
         self.pop_prefix();
         self.blank_pending = true;
+    }
+
+    /// Emit one logical code line, hard-wrapped under the current gutter.
+    fn push_code_line(&mut self, prefix: &[Span<'static>], spans: Vec<Span<'static>>) {
+        let pad = spans_width(prefix);
+        let available = self.width.saturating_sub(pad).max(1);
+        for (index, row) in wrap_styled_hard(&spans, available).into_iter().enumerate() {
+            let mut line = Vec::with_capacity(row.len() + 1);
+            if index == 0 {
+                line.extend(prefix.iter().cloned());
+            } else if pad > 0 {
+                line.push(Span::raw(" ".repeat(pad)));
+            }
+            line.extend(row);
+            self.out.push(Line::from(line));
+        }
     }
 
     fn end_link(&mut self) {
@@ -716,12 +799,27 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
 /// Wrap styled spans at `width`, splitting only at character boundaries so
 /// each row keeps its own per-span styles.
 fn wrap_styled(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    wrap_styled_rows(spans, |chars| wrap_chars(chars, width))
+}
+
+/// Like [`wrap_styled`] but never reflows across a space: used for code, where
+/// a dropped break space would change the source.
+fn wrap_styled_hard(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    wrap_styled_rows(spans, |chars| wrap_chars_hard(chars, width))
+}
+
+/// Flatten styled spans to styled characters, let `split` choose the rows, and
+/// rebuild spans per row (re-merging neighbours that share a style).
+fn wrap_styled_rows(
+    spans: &[Span<'static>],
+    split: impl Fn(&[char]) -> Vec<(usize, usize)>,
+) -> Vec<Vec<Span<'static>>> {
     let chars: Vec<(char, Style)> = spans
         .iter()
         .flat_map(|span| span.content.chars().map(|c| (c, span.style)))
         .collect();
     let plain: Vec<char> = chars.iter().map(|(c, _)| *c).collect();
-    wrap_chars(&plain, width)
+    split(&plain)
         .into_iter()
         .map(|(start, end)| {
             let mut row: Vec<Span<'static>> = Vec::new();
@@ -862,6 +960,106 @@ mod tests {
     fn fenced_code_keeps_lines_and_gets_a_bar() {
         let lines = render("```\nlet x = 1;\n\nx\n```", 40);
         assert_eq!(plain(&lines), vec!["│ let x = 1;", "│ ", "│ x"]);
+    }
+
+    #[test]
+    fn a_fence_label_names_the_language() {
+        // The label is the fence's info string, on its own dim line.
+        let lines = render("```rust\nfn main() {}\n```", 40);
+        assert_eq!(plain(&lines), vec!["│ rust", "│ fn main() {}"]);
+        assert_eq!(lines[0].spans.last().unwrap().style.fg, Some(theme::DIM));
+
+        // Attributes and comma suffixes reduce to the bare language token.
+        assert_eq!(
+            plain(&render("```rust,ignore\nx\n```", 40))
+                .first()
+                .unwrap(),
+            "│ rust"
+        );
+        // An indented block has no language, so no label.
+        let indented = render("    plain\n", 40);
+        assert_eq!(plain(&indented), vec!["│ plain"]);
+    }
+
+    #[test]
+    fn fenced_code_is_highlighted_by_language() {
+        let lines = render("```rust\nlet x = 42; // note\n```", 40);
+        let body = lines.last().expect("code line");
+        let colored: Vec<_> = body
+            .spans
+            .iter()
+            .map(|span| span.style.fg)
+            .filter(|fg| *fg != Some(theme::SUBTLE))
+            .collect();
+        assert!(
+            colored.contains(&Some(theme::CODE_NUMBER)),
+            "expected the number to be colored: {body:?}"
+        );
+        assert!(
+            colored.contains(&Some(theme::CODE_COMMENT)),
+            "expected the comment to be colored: {body:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_fence_language_still_renders_plain() {
+        let lines = render("```nosuchlang\nlet x = 1;\n```", 40);
+        assert_eq!(plain(&lines), vec!["│ nosuchlang", "│ let x = 1;"]);
+        // Label plus body, both uncolored apart from the gutter and label.
+        let body = lines.last().unwrap();
+        let body_spans: Vec<_> = body.spans.iter().skip(1).collect();
+        assert!(
+            body_spans.iter().all(|span| span.style.fg.is_none()),
+            "unknown language must not color the body: {body:?}"
+        );
+    }
+
+    #[test]
+    fn highlighted_code_keeps_non_ascii_text() {
+        // Token spans come back as byte ranges; slicing one at a non-boundary
+        // would silently drop the run, which is invisible in ASCII samples.
+        let lines = render("```rust\nlet s = \"日本語 text\"; // 注释 🙂\n```", 60);
+        assert_eq!(plain(&lines)[0], "│ rust");
+        let body = &plain(&lines)[1];
+        assert!(body.contains("日本語"), "CJK dropped: {body}");
+        assert!(body.contains("注释"), "CJK comment dropped: {body}");
+        assert!(body.contains('🙂'), "emoji dropped: {body}");
+    }
+
+    #[test]
+    fn code_wraps_without_eating_spaces_or_indent() {
+        // Word wrapping would break at these spaces, drop one, and lose the
+        // four-space indent on the continuation row.
+        let source = "```rust\n    let value = compute(alpha, beta);\n```";
+        let lines = render(source, 20);
+        let body: Vec<String> = plain(&lines)[1..].to_vec();
+        assert!(body.len() > 1, "expected a wrapped line: {body:?}");
+        // The first row carries the bar; continuations are padded to the same
+        // width so they stay under the code block rather than at column 0.
+        assert!(
+            body[0].starts_with("│ "),
+            "first row lost its bar: {:?}",
+            body[0]
+        );
+        for row in &body[1..] {
+            assert!(
+                row.starts_with("  "),
+                "continuation lost its indent: {row:?}"
+            );
+        }
+        // Re-joining the rows reproduces the original source exactly: the hard
+        // wrap drops nothing, unlike the word wrap used for prose. The gutter
+        // is `│ ` on the first row and two spaces on the rest.
+        let joined: String = body
+            .iter()
+            .map(|row| {
+                row.strip_prefix("│ ")
+                    .or_else(|| row.strip_prefix("  "))
+                    .unwrap_or(row)
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(joined, "    let value = compute(alpha, beta);");
     }
 
     #[test]

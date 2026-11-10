@@ -13,3 +13,17 @@ pub const WARNING: Color = Color::Yellow;
 /// section markers without shouting.
 pub const SUBTLE: Color = Color::Gray;
 pub const DIM: Color = Color::DarkGray;
+
+// Code-block syntax highlighting. Semantic names rather than "the color of a
+// function": each kind is one palette entry, so restyling code means editing
+// this block and `highlight::style` keeps its shape.
+pub const CODE_KEYWORD: Color = Color::Magenta;
+pub const CODE_TYPE: Color = Color::Cyan;
+pub const CODE_FUNCTION: Color = Color::Blue;
+pub const CODE_STRING: Color = Color::Green;
+pub const CODE_NUMBER: Color = Color::Yellow;
+pub const CODE_CONSTANT: Color = Color::LightYellow;
+pub const CODE_ATTRIBUTE: Color = Color::LightMagenta;
+/// Dimmer than [`DIM`]'s peers on purpose: comments should recede behind the
+/// code they annotate without disappearing into the background.
+pub const CODE_COMMENT: Color = Color::DarkGray;

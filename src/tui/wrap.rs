@@ -109,6 +109,41 @@ pub fn wrap_chars(chars: &[char], width: usize) -> Vec<(usize, usize)> {
     rows
 }
 
+/// Split `chars` into visual rows for text that must not be reflowed.
+///
+/// Code is not prose: breaking at a space silently eats the space and pulls
+/// the continuation back to column 0, which changes what the code says. This
+/// breaks strictly at the column budget and drops nothing, so a wrapped line
+/// re-joins into the original. Newlines still end a row, as in [`wrap_chars`].
+pub fn wrap_chars_hard(chars: &[char], width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut line_start = 0usize;
+    let mut column = 0usize;
+
+    for (index, &c) in chars.iter().enumerate() {
+        if c == '\n' {
+            rows.push((line_start, index));
+            line_start = index + 1;
+            column = 0;
+            continue;
+        }
+
+        let w = char_width(c);
+        // `index > line_start` keeps a single wide glyph on its own row rather
+        // than emitting an empty row and then overflowing anyway.
+        if column > 0 && column + w > width && index > line_start {
+            rows.push((line_start, index));
+            line_start = index;
+            column = 0;
+        }
+        column += w;
+    }
+
+    rows.push((line_start, chars.len()));
+    rows
+}
+
 /// Wrap a string, returning the visible text of each row.
 pub fn wrap_str(text: &str, width: usize) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
@@ -164,6 +199,32 @@ mod tests {
             rows("the quick brown fox", 9),
             vec!["the quick", "brown fox"]
         );
+    }
+
+    #[test]
+    fn word_wrap_drops_the_break_space_but_hard_wrap_does_not() {
+        // The prose path eats the space it breaks on: "aaaa bbbb" re-joins as
+        // "aaaabbbb". That is fine for prose and wrong for code.
+        assert_eq!(rows("aaaa bbbb", 4).concat(), "aaaabbbb");
+
+        let chars: Vec<char> = "aaaa bbbb".chars().collect();
+        let hard: Vec<String> = wrap_chars_hard(&chars, 4)
+            .into_iter()
+            .map(|(start, end)| chars[start..end].iter().collect())
+            .collect();
+        assert_eq!(hard, vec!["aaaa", " bbb", "b"]);
+        // Nothing is lost: the hard rows re-join to the original.
+        assert_eq!(hard.concat(), "aaaa bbbb");
+    }
+
+    #[test]
+    fn hard_wrap_preserves_leading_indent_and_newlines() {
+        let chars: Vec<char> = "    ab\ncd".chars().collect();
+        let rows: Vec<String> = wrap_chars_hard(&chars, 8)
+            .into_iter()
+            .map(|(start, end)| chars[start..end].iter().collect())
+            .collect();
+        assert_eq!(rows, vec!["    ab", "cd"]);
     }
 
     #[test]

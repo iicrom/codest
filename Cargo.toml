@@ -39,10 +39,21 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Syntax highlighting for fenced code: `regex-fancy` is the pure-Rust engine,
+# so no oniguruma C toolchain is needed. `two-face` carries bat's syntax dump,
+# which covers languages syntect's own set lacks (TypeScript, TOML, Dockerfile).
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "regex-fancy",
+    "dump-load",
+] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 toml = "0.9"
+two-face = { version = "0.5", default-features = false, features = [
+    "syntect-fancy",
+] }
 unicode-width = "0.2"
 
 # Process-group kill for the `bash` tool's timeout watchdog (unix only).
