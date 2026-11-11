@@ -106,6 +106,9 @@ const MAX_LIVE_TAIL_ROWS: usize = 4;
 const MAX_COMMAND_MENU_ROWS: usize = 6;
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
+/// How long an ephemeral footer message (Ctrl+O's "cards expanded") stays
+/// visible. Long enough to read at a glance, gone before it can accumulate.
+const STATUS_TTL: Duration = Duration::from_millis(2_000);
 
 /// The profile side of startup: the whole `profiles.toml` table (for
 /// `/profile` listing and `Op::SwitchProfile` lookups) plus the name this
@@ -558,6 +561,11 @@ struct App {
     /// Ctrl+O's expand-everything: folded cards (thinking bodies, tool
     /// output previews) show their full content while it is set.
     verbose: bool,
+    /// A short-lived line for the footer, with the moment it expires. Toggles
+    /// like Ctrl+O report here instead of pushing a transcript notice: the
+    /// feedback is worth a glance, not a permanent row in the message stream
+    /// that survives scrolling and session restores.
+    status: Option<(String, Instant)>,
     /// When the current thinking stream began, for the settled card's
     /// duration chip. Set on the first visible delta of a stream.
     thinking_started: Option<Instant>,
@@ -721,6 +729,7 @@ impl App {
             enabled_tools_vec,
             show_thinking: false,
             verbose: false,
+            status: None,
             thinking_started: None,
             composer: Composer::new(),
             command_selection: 0,
@@ -1226,7 +1235,10 @@ impl App {
         match key.code {
             KeyCode::Char('c') if ctrl => self.on_ctrl_c(),
             // Ctrl+O (the cordis convention): expand every card — thinking
-            // bodies and full tool output — or fold them all back.
+            // bodies and full tool output — or fold them all back. The toggle
+            // reports in the footer rather than the transcript: it is a view
+            // switch, and a stream notice for it would outlive the keystroke
+            // in scrollback and in the restored session.
             KeyCode::Char('o') if ctrl => {
                 self.verbose = !self.verbose;
                 let notice = if self.verbose {
@@ -1234,8 +1246,7 @@ impl App {
                 } else {
                     "cards folded"
                 };
-                let view = self.view_mut();
-                view.history.push(HistoryCell::Notice(notice.to_string()));
+                self.flash(notice);
             }
             KeyCode::Char('d') if ctrl => {
                 if self.composer.is_empty() {
@@ -1284,6 +1295,22 @@ impl App {
         if self.busy {
             self.tick = self.tick.wrapping_add(1);
         }
+        // The footer message is time-boxed: the loop redraws on every tick, so
+        // dropping it here is all it takes for the hint row to come back.
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|(_, until)| Instant::now() >= *until)
+        {
+            self.status = None;
+        }
+    }
+
+    /// Show a short-lived footer message. Used for view toggles (Ctrl+O),
+    /// where the feedback matters for a second and a transcript row would
+    /// pollute the conversation for the rest of the session.
+    fn flash(&mut self, text: impl Into<String>) {
+        self.status = Some((text.into(), Instant::now() + STATUS_TTL));
     }
 
     fn on_ctrl_c(&mut self) {
@@ -3248,24 +3275,32 @@ impl App {
         } else {
             "ready".to_string()
         };
-        let hints = if let Some(wizard) = self.provider_wizard.as_ref() {
-            wizard.hint()
-        } else if self.session_menu.is_some() {
-            "↑↓ select · Enter switch · Esc close"
-        } else if self.model_menu.is_some() {
-            "↑↓ select · Enter switch · r refresh · Esc close"
-        } else if self.effort_menu.is_some() {
-            "↑↓ select · Enter switch · Esc close"
-        } else if self.command_menu_open() {
-            "↑↓ select · Tab complete · Enter run · Esc close"
-        } else if self.show_ctrl_c_hint() {
-            "Ctrl+C again to quit"
-        } else if self.busy {
-            "streaming…"
-        } else if self.mode == TuiMode::Fullscreen {
-            "Enter · / commands · Ctrl+J newline · wheel scroll"
-        } else {
-            "Enter · / commands · Ctrl+J newline · PgUp/PgDn scroll"
+        // A flashing message takes the hint slot: it is the one line that is
+        // always on screen, and it is transient, unlike a transcript notice.
+        let flashing = self.status.as_ref().map(|(text, _)| text.as_str());
+        let hints = match flashing {
+            Some(text) => text,
+            None => {
+                if let Some(wizard) = self.provider_wizard.as_ref() {
+                    wizard.hint()
+                } else if self.session_menu.is_some() {
+                    "↑↓ select · Enter switch · Esc close"
+                } else if self.model_menu.is_some() {
+                    "↑↓ select · Enter switch · r refresh · Esc close"
+                } else if self.effort_menu.is_some() {
+                    "↑↓ select · Enter switch · Esc close"
+                } else if self.command_menu_open() {
+                    "↑↓ select · Tab complete · Enter run · Esc close"
+                } else if self.show_ctrl_c_hint() {
+                    "Ctrl+C again to quit"
+                } else if self.busy {
+                    "streaming…"
+                } else if self.mode == TuiMode::Fullscreen {
+                    "Enter · / commands · Ctrl+J newline · wheel scroll"
+                } else {
+                    "Enter · / commands · Ctrl+J newline · PgUp/PgDn scroll"
+                }
+            }
         };
 
         let effort_label = self.effort.as_deref().unwrap_or(reasoning::EFFORT_OFF);
@@ -3317,12 +3352,16 @@ impl App {
             Style::default().fg(if self.busy { theme::ACCENT } else { theme::DIM }),
         ));
         frame.render_widget(Paragraph::new(Line::from(left)), parts[0]);
+        // The flash reads as feedback, not as a keybinding hint, so it is not
+        // dimmed like the hints it replaces.
+        let hint_style = if flashing.is_some() {
+            Style::default().fg(theme::ACCENT)
+        } else {
+            Style::default().fg(theme::DIM)
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                hints,
-                Style::default().fg(theme::DIM),
-            )))
-            .alignment(Alignment::Right),
+            Paragraph::new(Line::from(Span::styled(hints, hint_style)))
+                .alignment(Alignment::Right),
             parts[1],
         );
     }
@@ -4445,6 +4484,7 @@ mod tests {
                 total_input: last_usage.map_or(0, |(input, _)| input),
                 total_output: last_usage.map_or(0, |(_, output)| output),
                 messages,
+                thinking: Vec::new(),
                 undo: Vec::new(),
                 name,
                 profile: None,
@@ -4524,6 +4564,7 @@ mod tests {
             total_input: 0,
             total_output: 0,
             messages: Vec::new(),
+            thinking: Vec::new(),
             undo: Vec::new(),
             name: None,
             profile: None,
@@ -5101,15 +5142,52 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(app.verbose);
+        // A view toggle reports in the footer, never as a transcript row: the
+        // message stream must not grow a line per keystroke.
+        let lines = render_lines(&mut app, 80, 20);
+        let footer = lines.last().expect("footer row").clone();
+        assert!(footer.contains("cards expanded"), "{footer}");
         assert!(
-            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("expanded"))
+            !app.view()
+                .history
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("cards")))
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert!(!app.verbose);
+        let lines = render_lines(&mut app, 80, 20);
+        let footer = lines.last().expect("footer row").clone();
+        assert!(footer.contains("cards folded"), "{footer}");
         assert!(
-            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("folded"))
+            !app.view()
+                .history
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("cards")))
         );
+    }
+
+    #[tokio::test]
+    async fn the_ctrl_o_flash_expires_and_leaves_the_hint_row() {
+        let mut app = test_app();
+        let before = app.view().history.len();
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let lines = render_lines(&mut app, 80, 20);
+        assert!(lines.last().is_some_and(|row| row.contains("cards expanded")));
+
+        // Past the deadline the footer goes back to its hints, and the
+        // transcript gained nothing along the way.
+        app.status = app
+            .status
+            .take()
+            .map(|(text, _)| (text, Instant::now() - Duration::from_millis(1)));
+        app.on_tick();
+        assert!(app.status.is_none());
+        let lines = render_lines(&mut app, 120, 20);
+        let footer = lines.last().expect("footer row").clone();
+        assert!(!footer.contains("cards"), "{footer}");
+        assert!(footer.contains("Ctrl+J newline"), "{footer}");
+        assert_eq!(app.view().history.len(), before);
     }
 
     #[tokio::test]
