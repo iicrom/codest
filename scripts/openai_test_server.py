@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Minimal OpenAI-compatible chat-completions server for local testing.
 
-It implements just enough of `POST /chat/completions` for codest: it echoes the
-last user message back, either as a normal JSON response or as an SSE stream
-when the request sets `"stream": true`. No API key is required or checked, and
-no external network access is performed.
+It implements just enough of `POST /chat/completions` for codest: it answers
+with a help text, either as a normal JSON response or as an SSE stream when the
+request sets `"stream": true`. No API key is required or checked, and no
+external network access is performed.
 
 Usage:
     python3 scripts/openai_test_server.py --port 8080
@@ -13,12 +13,18 @@ Usage:
 
 Pass `--port 0` to bind an ephemeral port; the chosen URL is printed on stdout.
 
-Tool-calling round trip: when the last user message contains `@tool`, the next
-streamed response is a `tool_calls` delta (a `ping` call with fragmented
-arguments) instead of text. codest executes it — no tool is registered in the
-binary, so the result is the `error: unknown tool …` text — and feeds it back
-as a `role: "tool"` message. The following response then summarizes what the
-tool round reported, completing the loop end-to-end.
+Tool-calling round trip: a keyword in the last user message turns the next
+response into a `tool_calls` delta (fragmented arguments, the shape providers
+stream) instead of text. `@bash`, `@read`, `@write` and `@edit` call that
+built-in tool with the text after the keyword (`@bash ls -la` → `bash` with
+`{"command": "ls -la"}`); `@tool` calls whatever `--tool` / `--tool-arguments`
+configured, which by default is the unregistered `ping` — no tool by that name
+is in the binary, so its result is the `error: unknown tool …` text. codest
+executes the call and feeds the result back as a `role: "tool"` message; the
+following response summarizes the round.
+
+Every message without a keyword gets the help reply, which lists these
+keywords — so the server documents itself on the first turn.
 """
 
 from __future__ import annotations
@@ -28,8 +34,9 @@ import json
 import re
 import sys
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Callable
 
 TOKEN_RE = re.compile(r"\S+\s*|\s+")
 CHUNK_CHARS = 4
@@ -76,13 +83,45 @@ def last_user_text(messages: Any) -> str:
     return "(empty message)"
 
 
-def reply_for(messages: Any) -> str:
+def help_reply(messages: Any) -> str:
+    """The default answer: what this server is and which keywords call tools.
+
+    Anything the last user message does not turn into a tool call lands here —
+    no keyword at all, or a keyword whose tail did not parse — so a plain
+    `hello` is enough to learn the whole keyword table.
+    """
+    keywords = "\n".join(
+        f"- `{trigger.keyword}` — {trigger.summary}" for trigger in TRIGGERS
+    )
+    note = ""
+    match = find_trigger(last_user_text(messages))
+    if match is not None and match[0].build is not None:
+        note = (
+            f"\n\nThe `{match[0].keyword}` keyword was there, but the text after "
+            "it did not parse — its example above shows the shape."
+        )
     return (
+        "### codest test server\n\n"
         f'You said: "{last_user_text(messages)}"\n\n'
-        "This reply was streamed by scripts/openai_test_server.py over an "
-        "OpenAI-compatible /chat/completions endpoint. No external network or "
-        "API key was used.\n\n"
-        "The TUI rendered these deltas as they arrived."
+        "Nothing in that message turned into a tool call, so here is the help "
+        "instead. This server is `scripts/openai_test_server.py`, a minimal "
+        "OpenAI-compatible `/chat/completions` endpoint: it streams deltas over "
+        "SSE without an API key and without any external network access.\n\n"
+        "**Keywords that trigger a tool call**\n\n"
+        f"{keywords}"
+        f"{note}\n\n"
+        "The call streams in fragments, the way real providers send it. codest "
+        "reassembles it, runs the tool, and sends the result back as a "
+        "`role: \"tool\"` message; the reply to that second request summarizes "
+        "the round.\n\n"
+        "**Other endpoints**\n\n"
+        "- `GET /models` — OpenAI-shaped model list, feeding `fetch_models`\n"
+        "- `GET /health` — `{\"status\":\"ok\"}`\n\n"
+        "**Flags**\n\n"
+        "- `--port 0` picks an ephemeral port and prints the URL on stdout\n"
+        "- `--delay` spaces the streamed tokens; `--quiet` stops request logging\n"
+        "- `--model` names the fallback model; `--tool` / `--tool-arguments` "
+        "decide what `@tool` calls"
     )
 
 
@@ -100,46 +139,186 @@ def reasoning_for(body: dict[str, Any]) -> str:
     )
 
 
-TOOL_TRIGGER = "@tool"
 TOOL_NAME = "ping"
 # The `ping`-shaped argument object the default call streams in fragments;
 # `--tool-arguments` replaces it for tools with a different schema.
 TOOL_ARGUMENTS = '{"note":"called by the test server"}'
 
 
-def conversation_has_tool_round(messages: Any) -> bool:
-    """Whether the transcript already carries a tool round (calls or results)."""
+def first_word(rest: str) -> tuple[str, str]:
+    """Split `rest` into its first whitespace-delimited word and the remainder."""
+    head, _, tail = rest.partition(" ")
+    return head, tail.strip()
+
+
+def bash_arguments(rest: str) -> dict[str, Any]:
+    return {"command": rest or "echo hello from the test server"}
+
+
+def read_arguments(rest: str) -> dict[str, Any]:
+    path, _ = first_word(rest)
+    return {"path": path or "README.md", "limit": 40}
+
+
+def write_arguments(rest: str) -> dict[str, Any] | None:
+    """`@write <path> <content>`; `None` when the path is missing."""
+    path, content = first_word(rest)
+    if not path:
+        return None
+    return {"path": path, "content": content or "written by the test server"}
+
+
+def edit_arguments(rest: str) -> dict[str, Any] | None:
+    """`@edit <path> | <old> | <new>`; `None` when the shape does not parse."""
+    parts = [part.strip() for part in rest.split("|")]
+    if len(parts) != 3 or not all(parts):
+        return None
+    path, old_string, new_string = parts
+    return {
+        "path": path,
+        "old_string": old_string,
+        "new_string": new_string,
+        "replace_all": False,
+    }
+
+
+@dataclass(frozen=True)
+class Trigger:
+    """One keyword that turns the next response into a `tool_calls` round.
+
+    `tool: None` means "the server's configured pair" (`--tool` /
+    `--tool-arguments`); otherwise `build` derives the arguments from the text
+    after the keyword, and `None` from it (an unparsable tail) falls back to
+    the help reply.
+    """
+
+    keyword: str
+    tool: str | None
+    summary: str
+    build: Callable[[str], dict[str, Any] | None] | None = None
+
+
+# Order matters only if keywords could overlap; they do not. `@tool` first
+# keeps the historical trigger — and the smoke scripts — working unchanged.
+TRIGGERS: tuple[Trigger, ...] = (
+    Trigger(
+        keyword="@tool",
+        tool=None,
+        summary=(
+            "call the configured tool (`--tool` / `--tool-arguments`; `ping` by "
+            "default, which nothing implements)"
+        ),
+    ),
+    Trigger(
+        keyword="@bash",
+        tool="bash",
+        summary="run a shell command, e.g. `@bash ls -la`",
+        build=bash_arguments,
+    ),
+    Trigger(
+        keyword="@read",
+        tool="read",
+        summary="read a file with line numbers, e.g. `@read README.md`",
+        build=read_arguments,
+    ),
+    Trigger(
+        keyword="@write",
+        tool="write",
+        summary="write a file, e.g. `@write notes.txt hello`",
+        build=write_arguments,
+    ),
+    Trigger(
+        keyword="@edit",
+        tool="edit",
+        summary="replace exact text, e.g. `@edit notes.txt | hello | goodbye`",
+        build=edit_arguments,
+    ),
+)
+
+
+def find_trigger(text: str) -> tuple[Trigger, str] | None:
+    """The first keyword in `text`, with the text that follows it."""
+    for trigger in TRIGGERS:
+        at = text.find(trigger.keyword)
+        if at >= 0:
+            return trigger, text[at + len(trigger.keyword) :].strip()
+    return None
+
+
+def resolve_call(
+    text: str, configured_tool: str, configured_arguments: str
+) -> tuple[str, str] | None:
+    """The `tool_calls` round `text` asks for as `(tool, arguments_json)`.
+
+    The first keyword found wins and the text after it becomes the call's
+    argument, so one message can drive any built-in tool. `None` means "no
+    call": the caller answers with the help text instead.
+    """
+    match = find_trigger(text)
+    if match is None:
+        return None
+    trigger, rest = match
+    if trigger.build is None:
+        return configured_tool, configured_arguments
+    arguments = trigger.build(rest)
+    if arguments is None:
+        return None
+    return trigger.tool or configured_tool, json.dumps(arguments, ensure_ascii=False)
+
+
+def current_turn(messages: Any) -> list[dict[str, Any]]:
+    """The messages the request appended after its last user message.
+
+    Everything that decides the reply — whether a tool round is already in
+    flight for this turn, and which round to summarize — belongs to that turn.
+    Scanning the whole transcript instead would let one tool round answer
+    every later turn with its own summary.
+    """
     if not isinstance(messages, list):
-        return False
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") == "tool" or isinstance(message.get("tool_calls"), list):
-            return True
-    return False
+        return []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            return [item for item in messages[index + 1 :] if isinstance(item, dict)]
+    return [item for item in messages if isinstance(item, dict)]
+
+
+def turn_has_tool_round(messages: Any) -> bool:
+    """Whether this turn already ran a tool round (calls or results)."""
+    return any(
+        message.get("role") == "tool" or isinstance(message.get("tool_calls"), list)
+        for message in current_turn(messages)
+    )
 
 
 def last_tool_result(messages: Any) -> str:
-    """The content of the most recent `role: "tool"` message, for the summary."""
-    if isinstance(messages, list):
-        for message in reversed(messages):
-            if isinstance(message, dict) and message.get("role") == "tool":
-                content = message.get("content")
-                if isinstance(content, str):
-                    return content
-                return json.dumps(content, ensure_ascii=False)
+    """The content of this turn's most recent `role: "tool"` message."""
+    for message in reversed(current_turn(messages)):
+        if message.get("role") == "tool":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            return json.dumps(content, ensure_ascii=False)
     return "(no tool result)"
 
 
-def tool_requested(messages: Any) -> bool:
-    """The `@tool` trigger in the last user message asks for a call round."""
-    return TOOL_TRIGGER in last_user_text(messages)
+def called_tools(messages: Any) -> str:
+    """The tool names this turn's `tool_calls` asked for, backticked."""
+    names: list[str] = []
+    for message in current_turn(messages):
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") if isinstance(call, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+    return ", ".join(f"`{name}`" for name in names) or "a"
 
 
 def tool_call_reply(messages: Any) -> str:
     """The text answer that follows a completed tool round."""
     return (
-        "The previous round asked for the `ping` tool. codest executed it and\n"
+        f"The previous round asked for the {called_tools(messages)} tool. "
+        "codest executed it and\n"
         f"fed the result back: {last_tool_result(messages)}\n\n"
         "This completes the tool-calling round trip of the test server."
     )
@@ -225,7 +404,26 @@ class ChatHandler(BaseHTTPRequestHandler):
             pass
 
     def _send_completion(self, body: dict[str, Any]) -> None:
-        reply = reply_for(body.get("messages"))
+        """The non-streaming twin of `_send_stream`: same trigger, same reply."""
+        messages = body.get("messages")
+        call = self._call_for(messages)
+        if call is not None:
+            name, arguments = call
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-test-1",
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                ],
+            }
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": self._text_reply(messages)}
+            finish_reason = "stop"
         self._send_json(
             200,
             {
@@ -236,12 +434,38 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": reply},
-                        "finish_reason": "stop",
+                        "message": message,
+                        "finish_reason": finish_reason,
                     }
                 ],
                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             },
+        )
+
+    def _call_for(self, messages: Any) -> tuple[str, str] | None:
+        """The tool call this turn asks for, if any.
+
+        A turn that already carries a tool round never triggers another one:
+        the keyword stays in the user message on the follow-up request, and
+        without this guard the round would never end. The check is scoped to
+        the current turn, so a later message triggers its own call (or the
+        help reply) instead of re-answering the old round.
+        """
+        if turn_has_tool_round(messages):
+            return None
+        return resolve_call(
+            last_user_text(messages),
+            getattr(self.server, "tool_name", TOOL_NAME),
+            getattr(self.server, "tool_arguments", TOOL_ARGUMENTS),
+        )
+
+    @staticmethod
+    def _text_reply(messages: Any) -> str:
+        """The text answer: this turn's round summary, else the help."""
+        return (
+            tool_call_reply(messages)
+            if turn_has_tool_round(messages)
+            else help_reply(messages)
         )
 
     def _send_stream(self, body: dict[str, Any]) -> None:
@@ -250,16 +474,14 @@ class ChatHandler(BaseHTTPRequestHandler):
         delay = getattr(self.server, "delay", 0.0)
         messages = body.get("messages")
 
-        # Tool round trip: `@tool` asks for a call; a transcript that already
-        # carries one gets the summary instead (so the loop always terminates).
-        if tool_requested(messages) and not conversation_has_tool_round(messages):
-            self._send_tool_call_stream(body)
+        # Tool round trip: a keyword asks for a call; a turn that already ran
+        # one gets the summary instead (so the loop always terminates). No
+        # keyword → the help reply.
+        call = self._call_for(messages)
+        if call is not None:
+            self._send_tool_call_stream(body, call)
             return
-        reply = (
-            tool_call_reply(messages)
-            if conversation_has_tool_round(messages)
-            else reply_for(messages)
-        )
+        reply = self._text_reply(messages)
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -340,8 +562,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             # The client interrupted the turn or quit; that is not an error.
             return
 
-    def _send_tool_call_stream(self, body: dict[str, Any]) -> None:
-        """Stream one `tool_calls` round for the `@tool` trigger.
+    def _send_tool_call_stream(self, body: dict[str, Any], call: tuple[str, str]) -> None:
+        """Stream one `tool_calls` round for the keyword that asked for it.
 
         The call's arguments arrive in fragments across chunks (the shape
         real providers stream), so the client's reassembly is exercised too.
@@ -349,6 +571,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         model = self._model(body)
         created = int(time.time())
         delay = getattr(self.server, "delay", 0.0)
+        name, arguments = call
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -357,10 +580,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         # The arguments stream in two fragments to exercise reassembly. The
-        # default `ping`-shaped object keeps the historical behaviour; a
-        # `--tool`/`--tool-arguments` pair lets the same server drive a real
-        # built-in tool (`bash`, `read`, …) with its own schema.
-        arguments = getattr(self.server, "tool_arguments", TOOL_ARGUMENTS)
+        # trigger picked both the name and the argument object (`@tool` falls
+        # back to `--tool` / `--tool-arguments`).
         split = arguments.index(":") + 1 if ":" in arguments else len(arguments)
         call_chunks: list[list[dict[str, Any]]] = [
             [
@@ -368,10 +589,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "index": 0,
                     "id": "call-test-1",
                     "type": "function",
-                    "function": {
-                        "name": getattr(self.server, "tool_name", TOOL_NAME),
-                        "arguments": "",
-                    },
+                    "function": {"name": name, "arguments": ""},
                 }
             ],
             [{"index": 0, "function": {"arguments": arguments[:split]}}],
@@ -478,12 +696,12 @@ def main() -> int:
     parser.add_argument(
         "--tool",
         default=TOOL_NAME,
-        help=f"tool name the `@tool` trigger calls (default: {TOOL_NAME})",
+        help=f"tool the `@tool` keyword calls (default: {TOOL_NAME})",
     )
     parser.add_argument(
         "--tool-arguments",
         default=TOOL_ARGUMENTS,
-        help='JSON arguments for the triggered call (default: the ping-shaped object)',
+        help='JSON arguments for the `@tool` call (default: the ping-shaped object)',
     )
     args = parser.parse_args()
 

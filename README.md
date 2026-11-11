@@ -71,7 +71,7 @@ cargo run -- --resume      # 打开会话选择菜单（见"多会话"）
 - `POST /chat/completions` 支持 `"stream": true` 的 SSE 增量输出，也支持普通 JSON 响应；流式响应末尾附带 usage（`prompt_tokens: 42 / completion_tokens: 7`），供 footer 与 rollout 的用量链路验证；
 - `GET /models` 返回 OpenAI 形状的模型目录（供 `fetch_models` 发现），`test-model` 带 `context_length`（OpenRouter 拼写）、`second-model` 带 `context_window`，两种字段拼写都覆盖；
 - `GET /health` 返回 `{"status":"ok"}`；
-- 不校验 API key，回复内容为最后一条用户消息，便于确认流式渲染；
+- 不校验 API key；默认回复是 help（列出可触发工具的关键词），消息里带关键词时改为对应工具调用；
 - `--delay` 控制 token 间隔，`--port 0` 使用随机端口并打印实际地址。
 
 ```bash
@@ -368,10 +368,12 @@ rollout 记录并在恢复会话时还原。这也是未来 readonly / normal pr
 skills、workspace instructions 等上下文不需要专门的机制：作为普通插件的
 `system_prompt()` 片段注入即可，`/context` 会逐段标注出处。
 
-没有真实工具也能验证链路：用 `scripts/openai_test_server.py` 起测试服务后，
-消息里带 `@tool` 会触发一次 `ping` tool_call（参数分片流式下发；本体未注册
-该工具，会以 `unknown tool` 错误结果回传并继续回合），下一轮回复会复述工具
-结果，完成整条回环。
+没有真实工具也能验证链路：用 `scripts/openai_test_server.py` 起测试服务后，消息里
+的**关键词**会触发一次 tool_call（参数分片流式下发）：`@bash <命令>`、
+`@read <路径>`、`@write <路径> <内容>`、`@edit <路径> | <旧> | <新>` 分别调用对应的
+内置工具，`@tool` 则调用 `--tool` / `--tool-arguments` 指定的工具（默认 `ping`，
+本体未注册该工具，会以 `unknown tool` 错误结果回传）。结果回传后下一轮回复会复述
+工具结果，完成整条回环；**不带关键词的消息返回 help**，列出全部关键词与用法。
 
 ## 从 codex 提取了什么
 
@@ -402,7 +404,7 @@ codest/
 │   ├── plugins.md           # 静态插件系统设计
 │   └── multi-provider.md    # 多 Provider 框架设计
 ├── scripts/
-│   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务（--tool / --tool-arguments 可触发内置工具）
+│   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务（关键词 @bash/@read/@write/@edit/@tool 触发工具调用，默认回复 help）
 │   ├── pty_smoke.py          # 离线端到端冒烟测试（pty）
 │   └── tool_smoke.py         # 内置工具与 /tools 的端到端冒烟测试
 └── src/
