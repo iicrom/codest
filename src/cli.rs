@@ -241,6 +241,7 @@ pub async fn run_with(
             set: profiles.clone(),
             active: active.map(|(name, _)| name.to_string()),
         },
+        global.max_tool_rounds,
     )
     .await
 }
@@ -723,6 +724,7 @@ mod tests {
         let registry = two_provider_registry();
         let global = config::GlobalConfig {
             default: Some("q/m2".to_string()),
+            max_tool_rounds: None,
         };
         let profile = config::Profile {
             default: Some("p/m2".to_string()),

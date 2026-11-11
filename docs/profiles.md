@@ -51,7 +51,8 @@ dsh 的 profile 该借鉴什么、裁剪什么（§3–§4）；以及**为什�
 ### 2.2 tools 插件系统：雏形完整，缺配置面
 
 声明（`Plugin::tools()`）、执行（`Plugin::run_tool`）、回合循环
-（`MAX_TOOL_ROUNDS = 8`）、rollout 记录、流式 tool_calls 重组全部打通。
+（默认不设轮数上限，可配 `max_tool_rounds`）、rollout 记录、流式 tool_calls
+重组全部打通。
 真实缺口按优先级：
 
 1. ~~**无配置化启停**~~——已解决：`PluginHost::builtin_with_tools` 按插件

@@ -23,7 +23,7 @@ pub static THINKING_COMMAND: CommandSpec = CommandSpec::new(
     "thinking",
     &[],
     "/thinking",
-    "toggle whether the model's thinking cards expand when settled (ctrl+o expands everything)",
+    "toggle whether the model's thinking cards expand when settled (also Ctrl+T; Ctrl+O folds tool output instead)",
     ArgsPolicy::None,
 );
 

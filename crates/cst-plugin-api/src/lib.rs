@@ -81,7 +81,7 @@ pub use providers::ListModelsFuture;
 pub use providers::ProtocolFactory;
 pub use sse::SseDecoder;
 pub use sse::SseFrame;
-pub use tools::MAX_TOOL_ROUNDS;
+pub use tools::DEFAULT_MAX_TOOL_ROUNDS;
 pub use tools::ToolCall;
 pub use tools::ToolCallAccumulator;
 pub use tools::ToolExecutor;

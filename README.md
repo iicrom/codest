@@ -254,7 +254,8 @@ python3 scripts/markdown_smoke.py
 | 滚轮（fullscreen） | 滚动聊天记录（每格 3 行，`Alt`+滚轮 15 行） |
 | `PageUp` / `PageDown`（fullscreen） | 滚动聊天记录；inline 下交给终端 scrollback |
 | `Esc` | 关闭指令候选；生成中则中断正在生成的回复 |
-| `Ctrl+O` | 展开/折叠所有卡片：thinking 正文与工具输出全部摊开（`ctrl+o to expand` 提示的来源） |
+| `Ctrl+T` | 展开/折叠 thinking 卡片正文（`ctrl+t to expand` 提示的来源；等同 `/thinking`） |
+| `Ctrl+O` | 展开/折叠工具卡片输出：折叠时只显示前 3 行预览（`ctrl+o to expand` 提示的来源） |
 | `Ctrl+C` | 生成中：中断；有空输入时第一下清空；输入为空时连按两次退出 |
 | `Ctrl+D` | 输入为空时退出 |
 
@@ -371,10 +372,11 @@ codest 的指令和生命周期扩展都来自**编译期链接**的插件，不
 2. 请求自动带上 `tools` 字段；模型流式返回 `tool_calls` 后，worker 按 name
    派发到声明该工具的插件的 `run_tool()`；
 3. 执行结果（或 `error: …` 失败文本）作为 `role: "tool"` 消息回传，回合继续
-   （上限 8 轮，`Esc` 可中断）；每次调用在 transcript 上渲染为一张工具卡片
-   （`● bash(cargo build) · 4.2s` 表头 + `⎿` 正文，正文默认只显示前 3 行，
-   折叠部分以 `… +N lines (ctrl+o to expand)` 标注），会话持久化与恢复都覆盖
-   工具消息；
+   （轮数**默认不设上限**，与 codex 一致：模型不再调工具、出错或用户 `Esc`
+   中断才结束；需要兜底时在 `config.toml` 设 `max_tool_rounds = 64`）；每次
+   调用在 transcript 上渲染为一张工具卡片（`● bash(cargo build) · 4.2s` 表头 +
+   `⎿` 正文，正文默认只显示前 3 行，折叠部分以 `… +N lines (ctrl+o to expand)`
+   标注），会话持久化与恢复都覆盖工具消息；
 4. 用 `/context` 可以随时查看当前提供了哪些工具。
 
 内置两个工具插件（`src/plugins/builtin/tools/`）：

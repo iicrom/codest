@@ -22,9 +22,11 @@
 //! The tool header is `● name(args) · duration` with the name in the tool's
 //! category color and the `⎿` spine tinted to match; the thinking header is
 //! `⚓ thinking · duration` in the thinking color over a `│` rail. Folded, each
-//! card is that one header line plus a dim hint naming the expand key. Which
-//! cards show their body is decided per frame by [`CardDisplay`], resolved
-//! from the global toggles — cells themselves stay stateless.
+//! card is that one header line plus a dim hint naming its own expand key —
+//! `ctrl+t` for thinking, `ctrl+o` for tool output, since the two fold
+//! independently. Which cards show their body is decided per frame by
+//! [`CardDisplay`], resolved from the global toggles — cells themselves stay
+//! stateless.
 
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -56,12 +58,13 @@ const BRACKET_REST: &str = "    ";
 const RAIL: &str = "  │ ";
 
 /// Per-cell display flags, resolved by the front-end from its global toggles
-/// (`/thinking` and Ctrl+O) before rendering. Cells stay stateless: folding
-/// is decided per frame, exactly like codex's `HistoryRenderMode`.
+/// (Ctrl+T / `/thinking` and Ctrl+O) before rendering. The two card kinds
+/// fold independently, so one flag each. Cells stay stateless: folding is
+/// decided per frame, exactly like codex's `HistoryRenderMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CardDisplay {
     /// Thinking cards show their body instead of the folded one-liner
-    /// (`/thinking`, or Ctrl+O's expand-everything).
+    /// (Ctrl+T, or `/thinking`).
     pub thinking: bool,
     /// Tool cards show their full output instead of the head preview
     /// (Ctrl+O).
@@ -575,7 +578,7 @@ pub fn thinking_card_lines(
     let mut header = thinking_header(duration_ms);
     if !expanded {
         header.push(Span::styled(
-            " (ctrl+o to expand)".to_string(),
+            " (ctrl+t to expand)".to_string(),
             Style::default().fg(theme::DIM),
         ));
         return vec![Line::from(header)];
@@ -820,7 +823,7 @@ mod tests {
         };
         assert_eq!(
             plain(&cell.lines(60, &folded_all())),
-            vec!["⚓ thinking · 4.2s (ctrl+o to expand)"]
+            vec!["⚓ thinking · 4.2s (ctrl+t to expand)"]
         );
 
         // Even folded the header is the thinking color, not the notice gray.

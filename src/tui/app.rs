@@ -106,8 +106,9 @@ const MAX_LIVE_TAIL_ROWS: usize = 4;
 const MAX_COMMAND_MENU_ROWS: usize = 6;
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
-/// How long an ephemeral footer message (Ctrl+O's "cards expanded") stays
-/// visible. Long enough to read at a glance, gone before it can accumulate.
+/// How long an ephemeral footer message (Ctrl+T's "thinking expanded",
+/// Ctrl+O's "tool output expanded") stays visible. Long enough to read at a
+/// glance, gone before it can accumulate.
 const STATUS_TTL: Duration = Duration::from_millis(2_000);
 
 /// The profile side of startup: the whole `profiles.toml` table (for
@@ -129,7 +130,9 @@ pub struct ProfileStartup {
 /// profile set and the name of the profile this run started with (its tool
 /// filter is already applied to `plugins`). Providers with models discovery
 /// enabled are refreshed in the background, best-effort: results arrive as
-/// transcript notices.
+/// transcript notices. `max_tool_rounds` is `config.toml`'s optional cap on a
+/// turn's tool rounds; `None` leaves the loop unbounded.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     plugins: Arc<PluginHost>,
     pool: Arc<ModelPool>,
@@ -138,6 +141,7 @@ pub async fn run(
     mode: TuiMode,
     restore: RestoreMode,
     profiles: ProfileStartup,
+    max_tool_rounds: Option<usize>,
 ) -> Result<()> {
     // Created before setup so a partial setup still restores the terminal.
     let _guard = TerminalGuard { mode };
@@ -219,6 +223,7 @@ pub async fn run(
             profiles: profiles.set.clone(),
             profile: profiles.active.clone(),
             initial_effort: initial_effort.clone(),
+            max_tool_rounds,
         },
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -555,16 +560,18 @@ struct App {
     /// lazily-built `Vec`).
     enabled_tools_vec: Vec<String>,
     /// Whether thinking cards render expanded by default. Global across
-    /// sessions; `/thinking` toggles it, Ctrl+O expands everything, and
-    /// committed Thinking cells re-fold with the next frame.
+    /// sessions; Ctrl+T and `/thinking` both toggle it, and committed
+    /// Thinking cells re-fold with the next frame. Independent of
+    /// [`Self::show_tool_detail`]: the two card kinds fold separately.
     show_thinking: bool,
-    /// Ctrl+O's expand-everything: folded cards (thinking bodies, tool
-    /// output previews) show their full content while it is set.
-    verbose: bool,
+    /// Ctrl+O's tool-output switch: tool cards show their full output
+    /// instead of the three-line preview while it is set. Says nothing about
+    /// thinking cards — that is [`Self::show_thinking`].
+    show_tool_detail: bool,
     /// A short-lived line for the footer, with the moment it expires. Toggles
-    /// like Ctrl+O report here instead of pushing a transcript notice: the
-    /// feedback is worth a glance, not a permanent row in the message stream
-    /// that survives scrolling and session restores.
+    /// like Ctrl+T and Ctrl+O report here instead of pushing a transcript
+    /// notice: the feedback is worth a glance, not a permanent row in the
+    /// message stream that survives scrolling and session restores.
     status: Option<(String, Instant)>,
     /// When the current thinking stream began, for the settled card's
     /// duration chip. Set on the first visible delta of a stream.
@@ -728,7 +735,7 @@ impl App {
             enabled_tools,
             enabled_tools_vec,
             show_thinking: false,
-            verbose: false,
+            show_tool_detail: false,
             status: None,
             thinking_started: None,
             composer: Composer::new(),
@@ -965,7 +972,7 @@ impl App {
     /// bottom-anchored: the newest text is what the reader is watching.
     fn inline_live_tail(&self, width: usize, max_rows: usize) -> Vec<Line<'static>> {
         let view = self.view();
-        let thinking_expanded = self.show_thinking || self.verbose;
+        let thinking_expanded = self.show_thinking;
         // While reasoning with nothing visible yet, show the thinking tail.
         let thinking_only = view.live.as_ref().is_some_and(String::is_empty)
             && view
@@ -1013,10 +1020,10 @@ impl App {
     fn take_inline_pending(&mut self, width: usize) -> Vec<Line<'static>> {
         // The fold flags freeze per frame: a card flushes once, folded or
         // expanded as the toggles stand right now — scrollback cannot be
-        // rewritten to honor a later Ctrl+O.
+        // rewritten to honor a later Ctrl+T or Ctrl+O.
         let display = chat::CardDisplay {
-            thinking: self.show_thinking || self.verbose,
-            tool_detail: self.verbose,
+            thinking: self.show_thinking,
+            tool_detail: self.show_tool_detail,
         };
         let view = self.view_mut();
         // Inline mode has no viewport to park: the history goes to the
@@ -1234,17 +1241,30 @@ impl App {
 
         match key.code {
             KeyCode::Char('c') if ctrl => self.on_ctrl_c(),
-            // Ctrl+O (the cordis convention): expand every card — thinking
-            // bodies and full tool output — or fold them all back. The toggle
-            // reports in the footer rather than the transcript: it is a view
-            // switch, and a stream notice for it would outlive the keystroke
-            // in scrollback and in the restored session.
-            KeyCode::Char('o') if ctrl => {
-                self.verbose = !self.verbose;
-                let notice = if self.verbose {
-                    "cards expanded"
+            // Thinking and tool cards fold independently. Ctrl+T is the
+            // thinking switch (`/thinking` does the same, from the command
+            // line); Ctrl+O stays the tool-output switch. Keeping them apart
+            // means a reader can follow the reasoning without dumping a wall
+            // of command output over it, or vice versa.
+            //
+            // Both report in the footer rather than the transcript: they are
+            // view switches, and a stream notice for one would outlive the
+            // keystroke in scrollback and in the restored session.
+            KeyCode::Char('t') if ctrl => {
+                self.show_thinking = !self.show_thinking;
+                let notice = if self.show_thinking {
+                    "thinking expanded"
                 } else {
-                    "cards folded"
+                    "thinking folded"
+                };
+                self.flash(notice);
+            }
+            KeyCode::Char('o') if ctrl => {
+                self.show_tool_detail = !self.show_tool_detail;
+                let notice = if self.show_tool_detail {
+                    "tool output expanded"
+                } else {
+                    "tool output folded"
                 };
                 self.flash(notice);
             }
@@ -1306,9 +1326,9 @@ impl App {
         }
     }
 
-    /// Show a short-lived footer message. Used for view toggles (Ctrl+O),
-    /// where the feedback matters for a second and a transcript row would
-    /// pollute the conversation for the rest of the session.
+    /// Show a short-lived footer message. Used for view toggles (Ctrl+T,
+    /// Ctrl+O), where the feedback matters for a second and a transcript row
+    /// would pollute the conversation for the rest of the session.
     fn flash(&mut self, text: impl Into<String>) {
         self.status = Some((text.into(), Instant::now() + STATUS_TTL));
     }
@@ -2498,10 +2518,11 @@ impl App {
         self.enabled_tools_vec = self.enabled_tools.iter().cloned().collect();
     }
 
-    /// `/thinking`: fold or unfold the model's thinking cards. A global
-    /// display flag — committed Thinking cells in every session re-render
-    /// with it on the next frame. Ctrl+O additionally expands everything
-    /// ([`Self::verbose`]), folded or not.
+    /// `/thinking`: fold or unfold the model's thinking cards. The command
+    /// spelling of Ctrl+T, kept for discoverability and for hosts without the
+    /// key. A global display flag, so committed Thinking cells in every
+    /// session re-render with it on the next frame. Tool cards are untouched:
+    /// they fold on their own switch (Ctrl+O).
     fn toggle_thinking(&mut self) {
         self.show_thinking = !self.show_thinking;
         let state = if self.show_thinking {
@@ -3098,8 +3119,8 @@ impl App {
         }
 
         let display = chat::CardDisplay {
-            thinking: self.show_thinking || self.verbose,
-            tool_detail: self.verbose,
+            thinking: self.show_thinking,
+            tool_detail: self.show_tool_detail,
         };
         let busy = self.busy;
         let spinner = chat::SPINNER[self.tick % chat::SPINNER.len()];
@@ -3296,9 +3317,9 @@ impl App {
                 } else if self.busy {
                     "streaming…"
                 } else if self.mode == TuiMode::Fullscreen {
-                    "Enter · / commands · Ctrl+J newline · wheel scroll"
+                    "Enter · / commands · Ctrl+J newline · Ctrl+T thinking · Ctrl+O tools · wheel scroll"
                 } else {
-                    "Enter · / commands · Ctrl+J newline · PgUp/PgDn scroll"
+                    "Enter · / commands · Ctrl+J newline · Ctrl+T thinking · Ctrl+O tools · PgUp/PgDn scroll"
                 }
             }
         };
@@ -5136,35 +5157,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_o_expands_and_folds_every_card() {
+    async fn ctrl_o_toggles_tool_output_only() {
         let mut app = test_app();
-        assert!(!app.verbose);
+        assert!(!app.show_tool_detail);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        assert!(app.verbose);
+        assert!(app.show_tool_detail);
+        // Thinking has its own switch: Ctrl+O must not move it.
+        assert!(!app.show_thinking);
         // A view toggle reports in the footer, never as a transcript row: the
         // message stream must not grow a line per keystroke.
         let lines = render_lines(&mut app, 80, 20);
         let footer = lines.last().expect("footer row").clone();
-        assert!(footer.contains("cards expanded"), "{footer}");
+        assert!(footer.contains("tool output expanded"), "{footer}");
         assert!(
             !app.view()
                 .history
                 .iter()
-                .any(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("cards")))
+                .any(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("output")))
         );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        assert!(!app.verbose);
+        assert!(!app.show_tool_detail);
         let lines = render_lines(&mut app, 80, 20);
         let footer = lines.last().expect("footer row").clone();
-        assert!(footer.contains("cards folded"), "{footer}");
+        assert!(footer.contains("tool output folded"), "{footer}");
+    }
+
+    #[tokio::test]
+    async fn ctrl_t_toggles_thinking_only() {
+        let mut app = test_app();
+        assert!(!app.show_thinking);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.show_thinking);
+        // Tool output keeps its own switch: Ctrl+T must not move it.
+        assert!(!app.show_tool_detail);
+        let lines = render_lines(&mut app, 80, 20);
+        let footer = lines.last().expect("footer row").clone();
+        assert!(footer.contains("thinking expanded"), "{footer}");
         assert!(
             !app.view()
                 .history
                 .iter()
-                .any(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("cards")))
+                .any(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("thinking")))
         );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(!app.show_thinking);
+        let lines = render_lines(&mut app, 80, 20);
+        let footer = lines.last().expect("footer row").clone();
+        assert!(footer.contains("thinking folded"), "{footer}");
     }
 
     #[tokio::test]
@@ -5173,7 +5216,11 @@ mod tests {
         let before = app.view().history.len();
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
         let lines = render_lines(&mut app, 80, 20);
-        assert!(lines.last().is_some_and(|row| row.contains("cards expanded")));
+        assert!(
+            lines
+                .last()
+                .is_some_and(|row| row.contains("tool output expanded"))
+        );
 
         // Past the deadline the footer goes back to its hints, and the
         // transcript gained nothing along the way.
@@ -5185,7 +5232,7 @@ mod tests {
         assert!(app.status.is_none());
         let lines = render_lines(&mut app, 120, 20);
         let footer = lines.last().expect("footer row").clone();
-        assert!(!footer.contains("cards"), "{footer}");
+        assert!(!footer.contains("expanded"), "{footer}");
         assert!(footer.contains("Ctrl+J newline"), "{footer}");
         assert_eq!(app.view().history.len(), before);
     }
@@ -5528,7 +5575,7 @@ mod tests {
         let lines = render_lines(&mut app, 60, 20);
         let rendered = lines.join("\n");
         assert!(
-            rendered.contains("thinking · 4.2s (ctrl+o to expand)"),
+            rendered.contains("thinking · 4.2s (ctrl+t to expand)"),
             "{rendered}"
         );
         assert!(!rendered.contains("long thoughts"), "{rendered}");
@@ -5566,7 +5613,7 @@ mod tests {
         );
 
         // Ctrl+O: the whole output, hint gone.
-        app.verbose = true;
+        app.show_tool_detail = true;
         let lines = render_lines(&mut app, 80, 20);
         assert!(
             lines.iter().any(|line| line.trim_end() == "    e"),
@@ -5631,7 +5678,7 @@ mod tests {
             .collect();
         assert!(
             text.iter()
-                .any(|row| row.contains("⚓ thinking · 4.2s (ctrl+o to expand)")),
+                .any(|row| row.contains("⚓ thinking · 4.2s (ctrl+t to expand)")),
             "{text:?}"
         );
         assert!(

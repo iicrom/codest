@@ -195,8 +195,9 @@ pub trait Plugin: Sync {
 插件通过 `tools()` 声明工具（名称、描述、JSON Schema 参数文本），通过
 `run_tool()` 执行模型发起的调用。core 侧的回合循环负责整条链路：请求带上
 `tools` 字段 → 模型流式返回 `tool_calls` → worker 按名字派发到声明该工具的
-插件 → 结果作为 `role: "tool"` 消息回传 → 继续本轮对话（上限
-`MAX_TOOL_ROUNDS = 8` 轮，可被用户中断）。执行失败也回传给模型（内容为
+插件 → 结果作为 `role: "tool"` 消息回传 → 继续本轮对话（默认**不设轮数上限**，
+跟随 codex：只在模型不再调工具、请求出错或用户中断时结束；`config.toml` 的
+`max_tool_rounds` 可恢复兜底）。执行失败也回传给模型（内容为
 `error: …`），模型可以选择重试或换路；transcript 上每次调用渲染为一张
 工具卡片（表头 `● bash(cargo build) · 4.2s`，输出挂在 `⎿` 沟下）。
 

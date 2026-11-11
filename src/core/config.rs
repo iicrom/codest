@@ -44,6 +44,12 @@ pub use cst_plugin_api::config::{
 pub struct GlobalConfig {
     /// Initial model selection, `"provider/model"`.
     pub default: Option<String>,
+    /// Optional cap on model → tool → model rounds per user turn. Absent
+    /// leaves the turn loop unbounded, like codex; a value re-enables the
+    /// runaway guard (the turn then ends with a `tool round limit reached`
+    /// error once that many rounds have completed).
+    #[serde(default)]
+    pub max_tool_rounds: Option<usize>,
 }
 
 /// The `/profile` command: with a name, switch this run's active profile;
@@ -293,12 +299,26 @@ mod tests {
     }
 
     #[test]
+    fn max_tool_rounds_is_absent_by_default_and_parses_when_set() {
+        // Absent: the turn loop is unbounded, matching codex.
+        let unset = write_temp("global-unset.toml", "default = \"glm/glm-5.3\"\n");
+        assert_eq!(load_global(&unset).unwrap().max_tool_rounds, None);
+
+        // Set: an explicit runaway guard for hosts that want a ceiling.
+        let capped = write_temp("global-capped.toml", "max_tool_rounds = 64\n");
+        let global = load_global(&capped).unwrap();
+        assert_eq!(global.max_tool_rounds, Some(64));
+        assert_eq!(global.default, None);
+    }
+
+    #[test]
     fn parses_global_and_provider_files() {
         let global = write_temp("global.toml", "default = \"glm/glm-5.3\"\n");
         assert_eq!(
             load_global(&global).unwrap(),
             GlobalConfig {
-                default: Some("glm/glm-5.3".to_string())
+                default: Some("glm/glm-5.3".to_string()),
+                max_tool_rounds: None,
             }
         );
 

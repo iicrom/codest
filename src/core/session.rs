@@ -36,7 +36,6 @@ use crate::core::rollout::RolloutFile;
 use crate::core::rollout::RolloutItem;
 use crate::core::rollout::RolloutWriter;
 use crate::core::session_id::new_session_id;
-use crate::core::tools::MAX_TOOL_ROUNDS;
 use crate::core::tools::ToolCall;
 use crate::core::tools::ToolExecutor;
 use crate::core::tools::ToolSpec;
@@ -425,6 +424,11 @@ pub struct SessionBootstrap {
     /// before the first turn and over the model's `default_level`. `None`
     /// keeps the model-derived seeding.
     pub initial_effort: Option<String>,
+    /// Optional cap on model → tool → model rounds per user turn
+    /// (`config.toml`'s `max_tool_rounds`). `None` leaves the turn loop
+    /// unbounded, matching codex: it ends when the model stops calling
+    /// tools, the user interrupts, or the request fails.
+    pub max_tool_rounds: Option<usize>,
 }
 
 impl SessionBootstrap {
@@ -446,6 +450,7 @@ impl std::fmt::Debug for SessionBootstrap {
             .field("profiles", &self.profiles.len())
             .field("profile", &self.profile)
             .field("initial_effort", &self.initial_effort)
+            .field("max_tool_rounds", &self.max_tool_rounds)
             .finish()
     }
 }
@@ -603,6 +608,7 @@ async fn run_worker(
     let executor = bootstrap.executor.take();
     let profiles = std::mem::take(&mut bootstrap.profiles);
     let startup_profile = bootstrap.profile.take();
+    let max_tool_rounds = bootstrap.max_tool_rounds;
     let writer = bootstrap
         .rollout_dir
         .map(|dir| RolloutWriter::new(dir, bootstrap.cwd));
@@ -720,6 +726,7 @@ async fn run_worker(
                 executor: executor.clone(),
                 declared: tools.clone(),
                 enabled: session_tools[current].clone(),
+                max_tool_rounds,
             };
             run_turn(
                 &mut turn,
@@ -1114,6 +1121,11 @@ struct TurnContext {
     /// here means a hallucinated name (or a race with `/tools` mid-turn —
     /// the snapshot wins, ops are FIFO anyway).
     enabled: BTreeSet<String>,
+    /// Optional runaway guard: the turn errors out once this many rounds have
+    /// completed. `None` — the default — follows codex and leaves the loop
+    /// unbounded, ending it only when the model stops calling tools, the user
+    /// interrupts, or the request fails.
+    max_tool_rounds: Option<usize>,
 }
 
 async fn run_turn(
@@ -1220,14 +1232,16 @@ async fn run_turn(
             }
         }
 
-        if round >= MAX_TOOL_ROUNDS {
+        if let Some(max) = deps.max_tool_rounds
+            && round >= max
+        {
             finalize_error(
                 turn,
                 conversation,
                 rollouts,
                 current,
                 tx,
-                &format!("tool round limit reached ({MAX_TOOL_ROUNDS} rounds)"),
+                &format!("tool round limit reached ({max} rounds)"),
             );
             interrupt.clear();
             return;
@@ -1960,11 +1974,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_runaway_tool_loop_hits_the_round_limit() {
+    async fn a_runaway_tool_loop_hits_the_configured_round_limit() {
+        let rounds = 3usize;
         let calls = || {
             vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])]
         };
-        let client = ScriptedClient::new((0..MAX_TOOL_ROUNDS).map(|_| calls()).collect());
+        let client = ScriptedClient::new((0..rounds).map(|_| calls()).collect());
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                max_tool_rounds: Some(rounds),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        let events = collect_turn(&mut session).await;
+
+        let tool_events = events
+            .iter()
+            .filter(|event| matches!(event.msg, EventMsg::AgentToolCall { .. }))
+            .count();
+        assert_eq!(tool_events, rounds);
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::Error { message } if message.contains("tool round limit")
+        )));
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), rounds);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_loop_runs_until_the_model_stops_calling_tools() {
+        // The default (no `max_tool_rounds`) follows codex: the turn loop has
+        // no round cap, so a long tool-using turn is never cut short — only
+        // the model going quiet ends it. The script keeps calling tools well
+        // past the old eight-round ceiling, then answers.
+        let rounds = 20usize;
+        let calls = || {
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])]
+        };
+        let mut scripts: Vec<Vec<StreamItem>> = (0..rounds).map(|_| calls()).collect();
+        scripts.push(vec![StreamItem::Delta("done".to_string())]);
+        let client = ScriptedClient::new(scripts);
         let seen = client.snapshots();
         let mut session = AgentSession::spawn_with_bootstrap(
             Arc::new(client),
@@ -1983,13 +2039,19 @@ mod tests {
             .iter()
             .filter(|event| matches!(event.msg, EventMsg::AgentToolCall { .. }))
             .count();
-        assert_eq!(tool_events, MAX_TOOL_ROUNDS);
+        assert_eq!(tool_events, rounds);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.msg, EventMsg::Error { .. })),
+            "an unbounded loop must not end in a limit error"
+        );
         assert!(events.iter().any(|event| matches!(
             &event.msg,
-            EventMsg::Error { message } if message.contains("tool round limit")
+            EventMsg::AgentMessage { message } if message == "done"
         )));
         let seen = seen.lock().expect("lock");
-        assert_eq!(seen.len(), MAX_TOOL_ROUNDS);
+        assert_eq!(seen.len(), rounds + 1);
     }
 
     #[tokio::test]

@@ -17,10 +17,14 @@
 //! for `openai-compat` and for any plugin protocol. It lives here so both
 //! share one implementation instead of re-bugging fragment order twice.
 
-/// The maximum number of model → tool → model rounds in one user turn. A
-/// model that keeps calling tools past this limit ends the turn with an
-/// error instead of looping forever.
-pub const MAX_TOOL_ROUNDS: usize = 8;
+/// The default cap on model → tool → model rounds in one user turn: none.
+///
+/// The turn loop is deliberately unbounded, following codex: it ends when the
+/// model stops calling tools, the user interrupts, or the request fails, so a
+/// long read → edit → test cycle is never cut short by a loop counter. Esc
+/// remains the way out of a run that will not settle. `config.toml`'s
+/// `max_tool_rounds` re-enables a guard for hosts that want a ceiling.
+pub const DEFAULT_MAX_TOOL_ROUNDS: Option<usize> = None;
 
 /// A tool a plugin contributes to the model. `parameters_json` is the raw
 /// JSON-schema object for the `function.parameters` field (empty text means

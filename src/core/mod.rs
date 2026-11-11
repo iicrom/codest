@@ -64,4 +64,4 @@ pub use sessions::SESSION_COMMANDS;
 pub use context::CONTEXT_COMMANDS;
 pub use tokens::{context_percent, format_context_usage, format_tokens};
 pub use tools_switch::TOOLS_COMMANDS;
-pub use tools::{MAX_TOOL_ROUNDS, ToolCall, ToolExecutor, ToolSpec};
+pub use tools::{DEFAULT_MAX_TOOL_ROUNDS, ToolCall, ToolExecutor, ToolSpec};
