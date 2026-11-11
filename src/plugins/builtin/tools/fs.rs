@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use super::truncate;
 use super::workdir;
+use super::SHELL_TOOL_NAME;
 
 /// Lines `read` returns when the model does not ask for a window.
 const DEFAULT_LIMIT: usize = truncate::MAX_LINES;
@@ -84,8 +85,9 @@ pub(crate) fn run_read(arguments: &str) -> Result<String, String> {
     let head = &bytes[..bytes.len().min(4096)];
     if head.contains(&0u8) {
         return Err(format!(
-            "`{}` looks like a binary file; use `bash` with a targeted command instead",
-            path.display()
+            "`{}` looks like a binary file; use `{}` with a targeted command instead",
+            path.display(),
+            SHELL_TOOL_NAME
         ));
     }
     let content = String::from_utf8_lossy(&bytes);
@@ -182,8 +184,12 @@ pub(crate) fn run_edit(arguments: &str) -> Result<String, String> {
     }
 
     let bytes = std::fs::read(&path).map_err(|error| read_error(&path, error))?;
-    let raw = String::from_utf8(bytes)
-        .map_err(|_| format!("`{}` is not valid UTF-8; edit it with `bash` instead", path.display()))?;
+    let raw = String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "`{}` is not valid UTF-8; edit it with `{SHELL_TOOL_NAME}` instead",
+            path.display()
+        )
+    })?;
 
     // Edit on a normalized form (BOM gone, CRLF folded to LF) and restore
     // both afterwards, so untouched lines keep their exact bytes (pi's
@@ -253,10 +259,17 @@ mod tests {
         (path.clone(), path.display().to_string())
     }
 
+    /// `value` as a JSON string literal, quotes included — a path interpolated
+    /// raw would put Windows separators where JSON expects escapes (`\U…`)
+    /// and fail to parse before the executor ever sees it.
+    fn json_str(value: &str) -> String {
+        serde_json::Value::String(value.to_string()).to_string()
+    }
+
     #[test]
     fn read_formats_lines_with_numbers() {
         let (path, path_str) = write_setup("read-numbering", "alpha\nbeta\ngamma\n");
-        let out = run_read(&format!(r#"{{"path": "{path_str}"}}"#)).expect("read");
+        let out = run_read(&format!(r#"{{"path": {}}}"#, json_str(&path_str))).expect("read");
         assert!(out.contains("     1\talpha"), "{out}");
         assert!(out.contains("     3\tgamma"), "{out}");
         assert!(out.contains("3 lines total"), "{out}");
@@ -267,7 +280,8 @@ mod tests {
     fn read_windows_with_offset_and_limit() {
         let (path, path_str) = write_setup("read-window", "l1\nl2\nl3\nl4\nl5\n");
         let out = run_read(&format!(
-            r#"{{"path": "{path_str}", "offset": 2, "limit": 2}}"#
+            r#"{{"path": {}, "offset": 2, "limit": 2}}"#,
+            json_str(&path_str)
         ))
         .expect("read");
         assert!(out.contains("     2\tl2"), "{out}");
@@ -284,14 +298,18 @@ mod tests {
             .with_file_name("does-not-exist.txt")
             .display()
             .to_string();
-        assert!(run_read(&format!(r#"{{"path": "{missing}"}}"#)).is_err());
-        assert!(run_read(&format!(r#"{{"path": "{missing}", "offset": 0}}"#)).is_err());
-        assert!(run_read(&format!(r#"{{"path": "{missing}", "offset": 99}}"#)).is_err());
+        let missing = json_str(&missing);
+        assert!(run_read(&format!(r#"{{"path": {missing}}}"#)).is_err());
+        assert!(run_read(&format!(r#"{{"path": {missing}, "offset": 0}}"#)).is_err());
+        assert!(run_read(&format!(r#"{{"path": {missing}, "offset": 99}}"#)).is_err());
 
         let dir = tempdir("read-binary");
         let bin = dir.join("blob.bin");
         std::fs::write(&bin, [0x89u8, b'P', 0, b'N', 0, b'G']).expect("setup");
-        let out = run_read(&format!(r#"{{"path": "{}"}}"#, bin.display()));
+        let out = run_read(&format!(
+            r#"{{"path": {}}}"#,
+            json_str(&bin.display().to_string())
+        ));
         assert!(
             matches!(&out, Err(message) if message.contains("binary")),
             "{out:?}"
@@ -304,13 +322,17 @@ mod tests {
         let dir = tempdir("write-create");
         let path = dir.join("a/b/new.txt").display().to_string();
         let out = run_write(&format!(
-            r#"{{"path": "{path}", "content": "hello"}}"#
+            r#"{{"path": {}, "content": "hello"}}"#,
+            json_str(&path)
         ))
         .expect("write");
         assert!(out.contains("created"), "{out}");
         assert!(out.contains("5 bytes"), "{out}");
-        let second =
-            run_write(&format!(r#"{{"path": "{path}", "content": "hi"}}"#)).expect("rewrite");
+        let second = run_write(&format!(
+            r#"{{"path": {}, "content": "hi"}}"#,
+            json_str(&path)
+        ))
+        .expect("rewrite");
         assert!(second.contains("overwrote"), "{second}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -325,7 +347,8 @@ mod tests {
     fn edit_replaces_one_exact_match() {
         let (path, path_str) = write_setup("edit-basic", "fn main() {\n    todo!()\n}\n");
         let out = run_edit(&format!(
-            r#"{{"path": "{path_str}", "old_string": "todo!()", "new_string": "println!(\"hi\");"}}"#
+            r#"{{"path": {}, "old_string": "todo!()", "new_string": "println!(\"hi\");"}}"#,
+            json_str(&path_str)
         ))
         .expect("edit");
         assert!(out.contains("replaced 1 occurrence"), "{out}");
@@ -339,14 +362,16 @@ mod tests {
     fn edit_requires_uniqueness_unless_replace_all() {
         let (path, path_str) = write_setup("edit-unique", "a b a\n");
         let multi = run_edit(&format!(
-            r#"{{"path": "{path_str}", "old_string": "a", "new_string": "c"}}"#
+            r#"{{"path": {}, "old_string": "a", "new_string": "c"}}"#,
+            json_str(&path_str)
         ));
         assert!(
             matches!(&multi, Err(message) if message.contains("matches 2 locations")),
             "{multi:?}"
         );
         let all = run_edit(&format!(
-            r#"{{"path": "{path_str}", "old_string": "a", "new_string": "c", "replace_all": true}}"#
+            r#"{{"path": {}, "old_string": "a", "new_string": "c", "replace_all": true}}"#,
+            json_str(&path_str)
         ))
         .expect("edit all");
         assert!(all.contains("replaced 2 occurrences"), "{all}");
@@ -359,7 +384,8 @@ mod tests {
     fn edit_preserves_crlf_and_bom() {
         let (path, path_str) = write_setup("edit-crlf", "\u{feff}one\r\ntwo\r\n");
         run_edit(&format!(
-            r#"{{"path": "{path_str}", "old_string": "two", "new_string": "TWO"}}"#
+            r#"{{"path": {}, "old_string": "two", "new_string": "TWO"}}"#,
+            json_str(&path_str)
         ))
         .expect("edit");
         let bytes = std::fs::read(&path).expect("read back");
@@ -373,7 +399,8 @@ mod tests {
     fn edit_reports_missing_text_and_invalid_utf8() {
         let (path, path_str) = write_setup("edit-missing", "hello\n");
         let miss = run_edit(&format!(
-            r#"{{"path": "{path_str}", "old_string": "absent", "new_string": "x"}}"#
+            r#"{{"path": {}, "old_string": "absent", "new_string": "x"}}"#,
+            json_str(&path_str)
         ));
         assert!(
             matches!(&miss, Err(message) if message.contains("not found")),
@@ -385,8 +412,8 @@ mod tests {
         let bin = dir.join("blob.bin");
         std::fs::write(&bin, [0xff, 0xfe, 0x00]).expect("setup");
         let bad = run_edit(&format!(
-            r#"{{"path": "{}", "old_string": "a", "new_string": "b"}}"#,
-            bin.display()
+            r#"{{"path": {}, "old_string": "a", "new_string": "b"}}"#,
+            json_str(&bin.display().to_string())
         ));
         assert!(
             matches!(&bad, Err(message) if message.contains("UTF-8")),

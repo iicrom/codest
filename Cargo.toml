@@ -56,7 +56,7 @@ two-face = { version = "0.5", default-features = false, features = [
 ] }
 unicode-width = "0.2"
 
-# Process-group kill for the `bash` tool's timeout watchdog (unix only).
+# Process-group kill for the shell tool's timeout watchdog (unix only).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

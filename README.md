@@ -36,6 +36,10 @@ python3 scripts/tool_smoke.py # 工具冒烟测试：真实执行 bash / read �
 python3 scripts/markdown_smoke.py # Markdown 渲染可视检查：标题/列表/表格/代码块/引用
 ```
 
+> 三个 `scripts/*_smoke.py` 依赖 unix 伪终端（`pty` / `fcntl`），只在 unix 宿主上
+> 可跑；Windows 上用 `cargo test`，工具的单元测试会真实调用 `pwsh`（退出码、
+> stderr 合并、超时杀进程树、UTF-8 输出都在里面）。
+
 连接一个 OpenAI 兼容的流式接口（`CST_BASE_URL`/`CST_API_KEY` 需成对提供，只给其一时 codest 会在发送时提示补全）。无论是否指定 `--model`，codest 都会对该端点做模型发现（尽力而为）：`/model` 菜单补全端点的模型列表，窗口长度等元数据（footer 的上下文显示）也从发现结果带入：
 
 ```bash
@@ -355,9 +359,14 @@ codest 的指令和生命周期扩展都来自**编译期链接**的插件，不
 
 内置两个工具插件（`src/plugins/builtin/tools/`）：
 
-- **bash**（id `bash`）：单次 shell 执行，`$SHELL -c`，默认 300s 超时（可传
-  `timeout`，上限 600s），超时杀死整个进程组；输出合并 stderr、带退出码脚注，
-  按尾截断（最后 2000 行 / 50 KB，参考 pi）。
+- **shell**（id 与工具名跟随平台：unix 上是 `bash`，Windows 上是 `pwsh`）：
+  单次 shell 执行——unix 为 `$SHELL -c`，Windows 为
+  `pwsh -NoLogo -NoProfile -NonInteractive -Command`（命令包进一段带 UTF-8
+  编码与退出码归一的脚本）——默认 300s 超时（可传 `timeout`，上限 600s），
+  超时杀掉整棵进程树（unix 靠进程组，Windows 靠 `taskkill /F /T`）；输出合并
+  stderr、带退出码脚注，按尾截断（最后 2000 行 / 50 KB，参考 pi）。两种平台
+  共用同一个引擎（`tools/shell.rs`），只有命令行与措辞不同，所以
+  `/tools`、`profile.tools`、卡片表头在 Windows 上自然会叫 `pwsh`。
 - **fs**（id `fs`）：`read`（行号窗口，`offset`/`limit` 续读，二进制探测）、
   `write`（整文件写入，自动建父目录）、`edit`（精确字符串替换，要求唯一匹配或
   `replace_all`，保留 BOM 与 CRLF，语义与 dsh 一致）。三者共享工作目录解析与
@@ -372,11 +381,12 @@ skills、workspace instructions 等上下文不需要专门的机制：作为普
 `system_prompt()` 片段注入即可，`/context` 会逐段标注出处。
 
 没有真实工具也能验证链路：用 `scripts/openai_test_server.py` 起测试服务后，消息里
-的**关键词**会触发一次 tool_call（参数分片流式下发）：`@bash <命令>`、
-`@read <路径>`、`@write <路径> <内容>`、`@edit <路径> | <旧> | <新>` 分别调用对应的
-内置工具，`@tool` 则调用 `--tool` / `--tool-arguments` 指定的工具（默认 `ping`，
-本体未注册该工具，会以 `unknown tool` 错误结果回传）。结果回传后下一轮回复会复述
-工具结果，完成整条回环；**不带关键词的消息返回 help**，列出全部关键词与用法。
+的**关键词**会触发一次 tool_call（参数分片流式下发）：`@bash <命令>`（Windows 上
+为 `@pwsh <命令>`）、`@read <路径>`、`@write <路径> <内容>`、`@edit <路径> | <旧> | <新>`
+分别调用对应的内置工具，`@tool` 则调用 `--tool` / `--tool-arguments` 指定的工具
+（默认 `ping`，本体未注册该工具，会以 `unknown tool` 错误结果回传）。结果回传后
+下一轮回复会复述工具结果，完成整条回环；**不带关键词的消息返回 help**，列出全部
+关键词与用法。
 
 ## 从 codex 提取了什么
 
@@ -407,7 +417,7 @@ codest/
 │   ├── plugins.md           # 静态插件系统设计
 │   └── multi-provider.md    # 多 Provider 框架设计
 ├── scripts/
-│   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务（关键词 @bash/@read/@write/@edit/@tool 触发工具调用，默认回复 help）
+│   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务（关键词 @bash/@read/@write/@edit/@tool 触发工具调用，默认回复 help；Windows 上 shell 关键词为 @pwsh）
 │   ├── pty_smoke.py          # 离线端到端冒烟测试（pty）
 │   └── tool_smoke.py         # 内置工具与 /tools 的端到端冒烟测试
 └── src/

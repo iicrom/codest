@@ -104,6 +104,8 @@ default = "glm/glm-5.3"        # 初始 selection
 effort = "high"                # 初始 /effort；"off" = 不下发 effort 字段
 tools = ["bash"]               # 启用这些插件声明的工具（按插件 id）；
                                # 其余插件的工具不下发；缺省 = 全部；空表 = 无工具
+                               # Windows 上 shell 插件的 id 是 "pwsh"——
+                               # 见 docs/plugins.md §7「工具插件」
 
 [profiles.code.prompt]
 append = "你是资深 Rust 工程师…"   # 追加到 system prompt 末尾
@@ -261,7 +263,8 @@ effort_field = "none"                          # 端点拒绝未知请求字段
    SetToolsEnabled`）按工具名细调当前会话的启用集：禁用的工具不再声明给
    模型（省 token、防幻觉调用），执行期门禁兜底拒绝误调用；开关随 rollout
    记录（`tools_switched`）并按会话恢复。同时落地 `ToolSpec.read_only`
-   标记与内置 `bash` / `fs`（`read`/`write`/`edit`）插件。这是 readonly /
+   标记与内置 `bash`（Windows 上为 `pwsh`）/ `fs`（`read`/`write`/`edit`）
+   插件。这是 readonly /
    normal profile 的会话侧落点：profile 按插件 id 粗筛（装配期，§4.1），
    `/tools` 按工具名细调（会话期），未来 profile 可以再叠加"只启用
    `read_only=true` 工具"的种子集。

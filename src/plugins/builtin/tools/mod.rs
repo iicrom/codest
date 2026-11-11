@@ -1,32 +1,56 @@
-//! Built-in tool plugins: `bash` and the file tools (`read`/`write`/`edit`).
+//! Built-in tool plugins: the shell tool and the file tools
+//! (`read`/`write`/`edit`).
 //!
 //! Two plugins rather than one, so the existing profile machinery's
 //! plugin-id filter already answers the coarse question (a future
-//! read-only profile can enable `fs` without `bash`); the session-level
+//! read-only profile can enable `fs` without the shell); the session-level
 //! `/tools` switch does the fine-grained work per tool. Shapes follow the
 //! references distilled in each module: pi for schemas/truncation, dsh for
 //! the edit semantics, codex for collection caps and the kill-on-timeout
 //! posture.
 //!
+//! The shell tool is the platform's own — `bash` on unix hosts, `pwsh` on
+//! Windows — selected at compile time below. Both are thin shims over the
+//! shared engine in [`shell`], so only the command line and the wording
+//! differ: a Windows host gets a PowerShell tool and a schema that says so,
+//! instead of a `bash` tool that cannot spawn.
+//!
 //! These are the first tools in the tree, so they also carry the working
 //! conventions the model needs: relative paths resolve against the process
 //! working directory (the workspace codest was started in), and the system
-//! prompt section below teaches read-before-edit and edit-over-write.
+//! prompt sections below teach read-before-edit and edit-over-write.
 
-mod bash;
 mod fs;
+mod shell;
 mod truncate;
+
+#[cfg(not(windows))]
+mod bash;
+#[cfg(windows)]
+mod pwsh;
+
+/// The host's shell tool module: everything platform-specific (name, schema,
+/// prompt section, argument shim) comes from this one alias, so nothing else
+/// in the tree has to branch on the platform.
+#[cfg(not(windows))]
+use self::bash as shell_tool;
+#[cfg(windows)]
+use self::pwsh as shell_tool;
 
 use crate::core::tools::ToolCall;
 use crate::core::tools::ToolSpec;
 use crate::plugins::Plugin;
 use crate::plugins::PluginError;
 
-pub static BASH: BashPlugin = BashPlugin;
+pub static SHELL: ShellPlugin = ShellPlugin;
 pub static FS: FsPlugin = FsPlugin;
 
-pub struct BashPlugin;
+pub struct ShellPlugin;
 pub struct FsPlugin;
+
+/// The enabled shell tool's name (`bash` / `pwsh`) — for messages elsewhere
+/// that have to point the model at it.
+pub(crate) use shell_tool::TOOL_NAME as SHELL_TOOL_NAME;
 
 /// Resolve a tool path against the working directory (absolute paths pass
 /// through). The process working directory is the workspace codest was
@@ -35,35 +59,12 @@ pub(crate) fn workdir() -> Result<std::path::PathBuf, String> {
     std::env::current_dir().map_err(|error| format!("cannot resolve the working directory: {error}"))
 }
 
-static BASH_SPEC: ToolSpec = ToolSpec {
-    name: "bash",
-    description: "Run one shell command in the working directory and return its \
-combined output (stdout + stderr), with an exit-code footer. Use for anything \
-not covered by the other tools. Output is truncated; narrow the command if you \
-need more. A `timeout` (seconds, default 300, max 600) kills the command tree \
-on expiry.",
-    parameters_json: r#"{
-  "type": "object",
-  "properties": {
-    "command": {
-      "type": "string",
-      "description": "The shell command to run."
-    },
-    "timeout": {
-      "type": "integer",
-      "description": "Seconds to wait before killing the command tree (default 300, max 600)."
-    }
-  },
-  "required": ["command"]
-}"#,
-    read_only: false,
-};
-
 static READ_SPEC: ToolSpec = ToolSpec {
     name: "read",
     description: "Read a text file with line numbers. Returns up to 2000 lines \
 (50 KB) from `offset` (1-based line, default 1); the result says how to \
-continue when truncated. Binary files are refused — use `bash` for those.",
+continue when truncated. Binary files are refused — read them with the shell \
+tool instead.",
     parameters_json: r#"{
   "type": "object",
   "properties": {
@@ -137,35 +138,33 @@ once — include enough surrounding lines to make it unique — or set \
     read_only: false,
 };
 
-static BASH_PROMPT: &str = r#"## Tools
-Work through the tools; do not ask the user to run commands for you.
-- `bash` runs one shell command per call in the working directory. Chain with `&&` / `;` when one shell session is needed; there is no persistent shell.
+static FS_PROMPT: &str = r#"## Files
 - `read` shows a numbered window of a text file; continue large files with `offset`.
 - `edit` replaces exact text; `old_string` must be unique (or pass `replace_all`). `write` overwrites whole files.
-- Read a file before editing or overwriting it. Prefer `edit` over `write` for existing files.
-- Relative paths resolve against the working directory. Tool output is truncated; narrow commands instead of paging everything."#;
+- Read a file before editing or overwriting it. Prefer `edit` over `write` for existing files."#;
 
-static BASH_TOOLS: [ToolSpec; 1] = [BASH_SPEC];
+static SHELL_TOOLS: [ToolSpec; 1] = [shell_tool::SPEC];
 static FS_TOOLS: [ToolSpec; 3] = [READ_SPEC, WRITE_SPEC, EDIT_SPEC];
 
-impl Plugin for BashPlugin {
+impl Plugin for ShellPlugin {
     fn id(&self) -> &'static str {
-        "bash"
+        shell_tool::TOOL_NAME
     }
 
     fn system_prompt(&self) -> Option<&'static str> {
-        Some(BASH_PROMPT)
+        Some(shell_tool::PROMPT)
     }
 
     fn tools(&self) -> &'static [ToolSpec] {
-        &BASH_TOOLS
+        &SHELL_TOOLS
     }
 
     fn run_tool(&self, call: &ToolCall) -> Result<String, PluginError> {
         match call.name.as_str() {
-            "bash" => bash::run_bash(&call.arguments).map_err(PluginError::new),
+            shell_tool::TOOL_NAME => shell_tool::run(&call.arguments).map_err(PluginError::new),
             other => Err(PluginError::new(format!(
-                "plugin `bash` does not implement tool `{other}`"
+                "plugin `{}` does not implement tool `{other}`",
+                shell_tool::TOOL_NAME
             ))),
         }
     }
@@ -174,6 +173,10 @@ impl Plugin for BashPlugin {
 impl Plugin for FsPlugin {
     fn id(&self) -> &'static str {
         "fs"
+    }
+
+    fn system_prompt(&self) -> Option<&'static str> {
+        Some(FS_PROMPT)
     }
 
     fn tools(&self) -> &'static [ToolSpec] {
@@ -201,7 +204,7 @@ mod tests {
 
     #[test]
     fn specs_parse_and_carry_the_read_only_flag() {
-        for spec in [&BASH_SPEC, &READ_SPEC, &WRITE_SPEC, &EDIT_SPEC] {
+        for spec in [&SHELL_TOOLS[0], &READ_SPEC, &WRITE_SPEC, &EDIT_SPEC] {
             let function = spec.function_json();
             assert_eq!(function["type"], "function", "{}", spec.name);
             assert_eq!(
@@ -212,16 +215,38 @@ mod tests {
             );
         }
         assert!(READ_SPEC.read_only);
-        assert!(!BASH_SPEC.read_only);
+        assert!(!SHELL_TOOLS[0].read_only);
         assert!(!WRITE_SPEC.read_only);
         assert!(!EDIT_SPEC.read_only);
     }
 
+    /// The tool is the host's own: same argument shape either way, but the
+    /// name the model sees, the plugin id `profile.tools` filters on, and the
+    /// prompt that teaches it must all agree with the platform.
+    #[test]
+    fn the_shell_tool_is_named_for_the_host() {
+        let expected = if cfg!(windows) { "pwsh" } else { "bash" };
+        assert_eq!(shell_tool::TOOL_NAME, expected);
+        assert_eq!(SHELL_TOOLS[0].name, expected);
+        assert_eq!(SHELL.id(), expected);
+        assert!(
+            shell_tool::PROMPT.contains(expected),
+            "{}",
+            shell_tool::PROMPT
+        );
+        // Both platforms declare the same arguments, so a cached schema or a
+        // familiar model call keeps working across hosts.
+        let parameters: serde_json::Value =
+            serde_json::from_str(SHELL_TOOLS[0].parameters_json).expect("schema");
+        assert_eq!(parameters["required"][0], "command");
+        assert!(parameters["properties"]["timeout"].is_object());
+    }
+
     #[test]
     fn executors_route_by_tool_name() {
-        assert!(BASH.run_tool(&ToolCall {
+        assert!(SHELL.run_tool(&ToolCall {
             id: "c1".to_string(),
-            name: "not-bash".to_string(),
+            name: "not-the-shell".to_string(),
             arguments: "{}".to_string(),
         })
         .is_err());

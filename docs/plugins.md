@@ -378,6 +378,37 @@ ConversationCleared
 这些插件覆盖了三种典型形态：只读命令（`help`/`status`）、请求宿主动作
 （`clear`/`quit`）、以及不需要命令的纯钩子插件（文档示例）。
 
+### 工具插件
+
+工具插件没有命令（`/help` 里看不到它们），但它们是内置集合的另一半：
+
+| 插件 id | 工具 | 说明 |
+| --- | --- | --- |
+| `bash` / `pwsh` | 同名（`bash` / `pwsh`） | 一次一条命令；超时杀进程树；非零退出码照常回传给模型 |
+| `fs` | `read` / `write` / `edit` | 文件读写；只有 `read` 是 `read_only` |
+
+**shell 工具按宿主平台在编译期选定**（`tools/mod.rs` 的 `#[cfg]` 别名）：
+unix 上是 `bash`（`$SHELL -c`，回退 `/bin/sh`），Windows 上是 `pwsh`（`pwsh
+-NoLogo -NoProfile -NonInteractive -Command`）。平台模块只负责命令行与措辞，
+spawn、看门狗、输出收集与截断都在共享的 `tools/shell.rs` 里，所以两边行为
+一致：默认 300s 超时（上限 600s）、stdout+stderr 合并、尾部截断、退出码脚注。
+
+Windows 的差异是透明的，但值得写下来：
+
+- **工具名 = 插件 id = 平台名**：Windows 上 `/tools`、`profile.tools`、卡片
+  表头说的都是 `pwsh`；schema 的参数形状不变（`command` / `timeout`），
+  所以模型侧调用写法跨平台可复用。
+- **杀进程树**：Windows 没有可信号的进程组，超时改用 `taskkill /F /T`
+  （失败再回退到直接 `kill`）。
+- **退出码**：命令被包进一段脚本，`$ErrorActionPreference` 为 `Continue`；
+  结尾先取 `$LASTEXITCODE`（原生命令，例如失败的 `cargo build`），再取 `$?`
+  （失败的 cmdlet → 1），异常被捕获后按 1 退出。否则 `pwsh -Command` 会把
+  cmdlet 失败报成 0。
+- **编码**：脚本开头把 `[Console]::OutputEncoding` 钉成 UTF-8，避免原生
+  命令的输出按控制台旧代码页解码成乱码。
+- `pwsh` 是 PowerShell 7，Windows 上需要单独安装；缺失时工具返回带安装提示
+  的错误（不静默回退到 `powershell.exe`，那会让同一台机器上的行为不一致）。
+
 `/context` 曾由 `prompt_debug` 插件承担，现在是前端自带命令
 （`core::context` + `tui::context_view`），有两种形态：
 

@@ -21,7 +21,7 @@ pub const THINKING: Color = Color::LightMagenta;
 // Tool-card category colors (the cordis-harness-tui convention: the card's
 // status dot and tool name carry the tool's category, not its outcome — the
 // outcome is the glyph itself, `●` success vs `✗` error).
-/// `bash` and other command runners.
+/// Command runners: `bash`, `pwsh`.
 pub const TOOL_EXEC: Color = Color::Cyan;
 /// Read-only file tools (`read`).
 pub const TOOL_READ: Color = Color::Green;

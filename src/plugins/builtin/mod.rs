@@ -16,7 +16,10 @@ pub use clear::CLEAR;
 pub use help::HELP;
 pub use quit::QUIT;
 pub use status::STATUS;
-pub use tools::BASH;
+/// The host's shell tool plugin: `bash` on unix, `pwsh` on Windows. The id
+/// and the tool name follow the platform, so `/tools` and `profile.tools`
+/// speak the same word on either host.
+pub use tools::SHELL;
 pub use tools::FS;
 
 /// Every plugin compiled into the binary, in hook and menu order. The tool
@@ -29,6 +32,6 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &clear::CLEAR,
     &quit::QUIT,
     &status::STATUS,
-    &tools::BASH,
+    &tools::SHELL,
     &tools::FS,
 ];
