@@ -374,6 +374,14 @@ struct ActiveTurn {
     /// The selection that serves this turn, recorded with the usage in the
     /// rollout. `None` on a fixed backend.
     model: Option<String>,
+    /// Reasoning streamed this round. It stays out of the conversation — the
+    /// model must not see its own thinking replayed — but the rollout keeps
+    /// it as display metadata so a resumed session can show the thinking
+    /// cards again. Cleared as each round commits its text.
+    thinking: String,
+    /// When this round's first reasoning delta arrived, for the duration chip
+    /// recorded with [`Self::thinking`].
+    thinking_started: Option<std::time::Instant>,
 }
 
 /// What the worker starts from: sessions restored from disk plus the rollout
@@ -721,6 +729,8 @@ async fn run_worker(
                     model: backend
                         .selection()
                         .map(|selection| selection.as_str().to_string()),
+                    thinking: String::new(),
+                    thinking_started: None,
                 });
             }
             Op::Interrupt => {
@@ -1081,8 +1091,14 @@ async fn run_turn(
                             ));
                         }
                         Some(Ok(StreamItem::Thinking(delta))) => {
-                            // Reasoning output stays out of the conversation and
-                            // the rollout; the front-end renders it display-only.
+                            // Reasoning stays out of the conversation; the
+                            // rollout keeps it as display metadata (under the
+                            // assistant message it preceded) so a resumed
+                            // session shows the thinking cards again.
+                            if turn.thinking_started.is_none() {
+                                turn.thinking_started = Some(std::time::Instant::now());
+                            }
+                            turn.thinking.push_str(&delta);
                             let _ = tx.send(Event::new(
                                 turn.id.clone(),
                                 EventMsg::AgentThinkingDelta { delta },
@@ -1168,7 +1184,8 @@ async fn run_turn(
 
 /// Commit the text streamed so far this round (assistant message in the
 /// conversation and rollout, `AgentMessage` to the front-end) and empty the
-/// accumulator so the next round starts clean.
+/// accumulator so the next round starts clean. This round's reasoning is
+/// recorded first, ahead of the message it preceded.
 fn commit_round_text(
     turn: &mut ActiveTurn,
     conversation: &mut Conversation,
@@ -1176,6 +1193,7 @@ fn commit_round_text(
     current: usize,
     tx: &mpsc::UnboundedSender<Event>,
 ) {
+    commit_reasoning(turn, rollouts, current);
     if turn.assistant.is_empty() {
         return;
     }
@@ -1183,6 +1201,25 @@ fn commit_round_text(
     conversation.push_assistant(text.clone());
     rollouts.append(current, RolloutItem::AssistantMessage { message: text.clone() });
     let _ = tx.send(Event::new(turn.id.clone(), EventMsg::AgentMessage { message: text }));
+}
+
+/// Record this round's reasoning as display metadata for a resumed session,
+/// then clear it so the next round starts clean.
+///
+/// The item lands right before the round's assistant message, which is how a
+/// replay puts the thinking card back above the answer it preceded. Reasoning
+/// is deliberately kept out of [`crate::core::conversation::Conversation`]: the
+/// model must not see its own thinking replayed as conversation.
+fn commit_reasoning(turn: &mut ActiveTurn, rollouts: &mut Rollouts, current: usize) {
+    if turn.thinking.is_empty() {
+        return;
+    }
+    let text = std::mem::take(&mut turn.thinking);
+    let duration_ms = turn
+        .thinking_started
+        .take()
+        .map(|started| started.elapsed().as_millis() as u64);
+    rollouts.append(current, RolloutItem::AssistantReasoning { text, duration_ms });
 }
 
 /// Run one tool call, record it everywhere, and tell the front-end. Failures
@@ -1324,12 +1361,13 @@ fn apply_model_switch(
 }
 
 fn finalize_complete(
-    turn: &ActiveTurn,
+    turn: &mut ActiveTurn,
     conversation: &mut Conversation,
     rollouts: &mut Rollouts,
     current: usize,
     tx: &mpsc::UnboundedSender<Event>,
 ) {
+    commit_reasoning(turn, rollouts, current);
     conversation.push_assistant(turn.assistant.clone());
     rollouts.append(
         current,
@@ -1358,13 +1396,17 @@ fn finalize_complete(
 }
 
 fn finalize_aborted(
-    turn: &ActiveTurn,
+    turn: &mut ActiveTurn,
     conversation: &mut Conversation,
     rollouts: &mut Rollouts,
     current: usize,
     tx: &mpsc::UnboundedSender<Event>,
 ) {
     if !turn.assistant.is_empty() {
+        // Reasoning is recorded only alongside the text it preceded: with no
+        // assistant message to attach it to, a resumed session would show it
+        // above the wrong turn.
+        commit_reasoning(turn, rollouts, current);
         conversation.push_assistant(turn.assistant.clone());
         rollouts.append(
             current,
@@ -1389,7 +1431,7 @@ fn finalize_aborted(
 }
 
 fn finalize_error(
-    turn: &ActiveTurn,
+    turn: &mut ActiveTurn,
     conversation: &mut Conversation,
     rollouts: &mut Rollouts,
     current: usize,
@@ -1398,6 +1440,9 @@ fn finalize_error(
 ) {
     // Keep any partial text in the transcript so the next turn has context.
     if !turn.assistant.is_empty() {
+        // Reasoning rides along with the text it preceded (see
+        // `finalize_aborted`).
+        commit_reasoning(turn, rollouts, current);
         conversation.push_assistant(turn.assistant.clone());
         rollouts.append(
             current,
@@ -1928,6 +1973,62 @@ mod tests {
         assert_eq!(messages[2].role, Role::Tool);
         assert_eq!(messages[2].content, "pong {}");
         assert_eq!(messages[3].content, "all done");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A tool round that reasons first records the reasoning ahead of the
+    /// calls message, so a resumed session shows the card above the round
+    /// it belonged to.
+    #[tokio::test]
+    async fn tool_round_records_its_reasoning_before_the_calls() {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-reasoning-round-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let client = ScriptedClient::new(vec![
+            vec![
+                StreamItem::Thinking("should ping".to_string()),
+                StreamItem::ToolCalls(vec![tool_call("c1", "ping")]),
+            ],
+            vec![StreamItem::Delta("all done".to_string())],
+        ]);
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                fresh: true,
+                ..SessionBootstrap::default()
+            },
+        );
+        session.submit_user_turn("hi");
+        collect_turn(&mut session).await;
+        session.shutdown();
+        while session.next_event().await.is_some() {}
+
+        let loaded = crate::core::rollout::load_workspace_sessions(&dir).expect("load");
+        let thinking = &loaded[0].thinking;
+        // Only the first round reasoned; the block sits above the calls
+        // message at index 1.
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(thinking[0].text, "should ping");
+        assert_eq!(thinking[0].before, 1);
+
+        // On disk the reasoning line precedes the calls line.
+        let content = std::fs::read_to_string(&loaded[0].path).expect("read rollout");
+        let reasoning_at = content.find("assistant_reasoning").expect("reasoning item");
+        let calls_at = content.find("assistant_tool_calls").expect("calls item");
+        assert!(reasoning_at < calls_at, "{content}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2559,6 +2660,7 @@ mod tests {
             total_input: 0,
             total_output: 0,
             messages: vec![Message::user("hello"), Message::assistant("hi")],
+            thinking: Vec::new(),
             undo: Vec::new(),
             name: None,
             profile: None,
@@ -2628,6 +2730,65 @@ mod tests {
         }
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(matches!(&events[0].msg, EventMsg::SessionSwitched { session: 0 }));
+    }
+
+    #[tokio::test]
+    async fn thinking_is_recorded_for_resume_but_stays_out_of_the_conversation() {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-thinking-rollout-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let client = ScriptedClient::new(vec![vec![
+            StreamItem::Thinking("weighing the answer".to_string()),
+            StreamItem::Delta("the answer".to_string()),
+        ]]);
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                loaded: Vec::new(),
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                fresh: true,
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hello");
+        collect_turn(&mut session).await;
+
+        // Reasoning is display metadata: the model never sees it replayed.
+        {
+            let snapshots = seen.lock().expect("lock");
+            assert_eq!(snapshots.len(), 1);
+            assert_eq!(snapshots[0].len(), 2);
+            assert!(snapshots[0].iter().all(|m| !m.content.contains("weighing")));
+        }
+
+        session.shutdown();
+        while session.next_event().await.is_some() {}
+
+        let loaded = crate::core::rollout::load_workspace_sessions(&dir).expect("load");
+        assert_eq!(loaded.len(), 1);
+        // The replayed conversation is still user + assistant …
+        assert_eq!(loaded[0].messages.len(), 2);
+        // … and the thinking block rides along, attached to the answer it
+        // preceded so a resumed session can render the card again.
+        let thinking = &loaded[0].thinking;
+        assert_eq!(thinking.len(), 1);
+        assert_eq!(thinking[0].text, "weighing the answer");
+        assert_eq!(thinking[0].before, 1);
+        assert!(thinking[0].duration_ms.is_some());
+
+        let content = std::fs::read_to_string(&loaded[0].path).expect("read rollout");
+        assert_eq!(content.matches("assistant_reasoning").count(), 1);
     }
 
     #[tokio::test]

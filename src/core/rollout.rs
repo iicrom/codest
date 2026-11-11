@@ -156,6 +156,20 @@ pub enum RolloutItem {
     AssistantMessage {
         message: String,
     },
+    /// The reasoning the model streamed before the following assistant message.
+    ///
+    /// Display-only: it never re-enters the conversation (a model must not see
+    /// its own thinking replayed), but a resumed session needs it to show the
+    /// thinking cards again. It is written right before the
+    /// [`RolloutItem::AssistantMessage`] or [`RolloutItem::AssistantToolCalls`]
+    /// of the same round, and replay attaches it to that message.
+    AssistantReasoning {
+        text: String,
+        /// How long the reasoning stream ran, for the card's duration chip;
+        /// absent in files written before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     /// The model asked for tool calls; one item carries the whole round's
     /// calls and replays as one assistant message with `tool_calls`.
     AssistantToolCalls {
@@ -238,6 +252,17 @@ pub struct RolloutLine {
     pub item: RolloutItem,
 }
 
+/// One reasoning block restored from a rollout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkingRecord {
+    /// The index of the message the reasoning preceded: the transcript shows
+    /// this thinking card before message `before` (and after the one at
+    /// `before - 1`).
+    pub before: usize,
+    pub text: String,
+    pub duration_ms: Option<u64>,
+}
+
 /// A session restored from disk.
 #[derive(Debug, Clone)]
 pub struct LoadedSession {
@@ -245,6 +270,9 @@ pub struct LoadedSession {
     pub path: PathBuf,
     /// Replayed conversation messages, in order.
     pub messages: Vec<Message>,
+    /// Replayed reasoning blocks, keyed to the message they preceded. Display
+    /// only: [`Self::messages`] is what reaches the model.
+    pub thinking: Vec<ThinkingRecord>,
     /// Name after replaying renames; `None` falls back to the first user
     /// message (the default naming rule).
     pub name: Option<String>,
@@ -387,12 +415,35 @@ pub fn list_workspace_sessions(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files.into_iter().map(|(_, path)| path).collect())
 }
 
+/// Attach a replayed reasoning block to the message that follows it.
+///
+/// Reasoning and its assistant message are written back to back, so a file
+/// truncated between the two lines leaves it dangling — it is dropped rather
+/// than shown above an unrelated turn.
+fn attach_reasoning(
+    thinking: &mut Vec<ThinkingRecord>,
+    pending: &mut Option<(String, Option<u64>)>,
+    before: usize,
+) {
+    if let Some((text, duration_ms)) = pending.take() {
+        thinking.push(ThinkingRecord {
+            before,
+            text,
+            duration_ms,
+        });
+    }
+}
+
 /// Load and replay one rollout file. Unknown item types are skipped so newer
 /// codest versions can extend the format without breaking older readers.
 pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     let content = std::fs::read_to_string(path)?;
     let mut meta = None;
     let mut messages = Vec::new();
+    let mut thinking: Vec<ThinkingRecord> = Vec::new();
+    // A reasoning item waits for the assistant message it preceded; the two
+    // are written back to back, so the gap only spans a truncated file.
+    let mut pending_reasoning: Option<(String, Option<u64>)> = None;
     let mut undo = Vec::new();
     let mut name = None;
     let mut model = None;
@@ -425,9 +476,16 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 meta = Some(session_meta);
             }
             RolloutItem::UserMessage { message } => messages.push(Message::user(message)),
-            RolloutItem::AssistantMessage { message } => messages.push(Message::assistant(message)),
+            RolloutItem::AssistantMessage { message } => {
+                attach_reasoning(&mut thinking, &mut pending_reasoning, messages.len());
+                messages.push(Message::assistant(message));
+            }
             RolloutItem::AssistantToolCalls { calls } => {
+                attach_reasoning(&mut thinking, &mut pending_reasoning, messages.len());
                 messages.push(Message::assistant_tool_calls(calls))
+            }
+            RolloutItem::AssistantReasoning { text, duration_ms } => {
+                pending_reasoning = Some((text, duration_ms));
             }
             RolloutItem::ToolResult {
                 tool_call_id,
@@ -436,6 +494,10 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
             RolloutItem::Cleared => {
                 messages.clear();
+                // Reasoning is display metadata for the messages above it, so
+                // a clear drops it too.
+                thinking.clear();
+                pending_reasoning = None;
                 // The dropped turns' usage no longer describes the context,
                 // and the live `/clear` drops the checkpoints with it.
                 undo.clear();
@@ -485,6 +547,15 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 for (index, _) in pairs.iter().rev() {
                     messages.remove(*index);
                 }
+                // A thinking card sits before a message index; every earlier
+                // deletion shifts it down with the message it precedes.
+                for (index, _) in pairs.iter().rev() {
+                    for record in thinking.iter_mut() {
+                        if record.before > *index {
+                            record.before -= 1;
+                        }
+                    }
+                }
                 undo.push(crate::core::conversation::UndoEntry::Deleted { removed: pairs });
             }
             RolloutItem::ContextEdited {
@@ -503,6 +574,11 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                     Some(crate::core::conversation::UndoEntry::Deleted { removed }) => {
                         for (index, message) in removed {
                             messages.insert(index, message);
+                            for record in thinking.iter_mut() {
+                                if record.before >= index {
+                                    record.before += 1;
+                                }
+                            }
                         }
                     }
                     Some(crate::core::conversation::UndoEntry::Edited { index, previous }) => {
@@ -526,6 +602,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
         meta,
         path: path.to_path_buf(),
         messages,
+        thinking,
         undo,
         name,
         model,
@@ -779,6 +856,136 @@ mod tests {
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.messages.len(), 1);
         assert!(loaded.undo.is_empty());
+    }
+
+    /// Reasoning is display metadata: replay hands it back attached to the
+    /// message it preceded, without ever becoming a conversation message of
+    /// its own.
+    #[test]
+    fn reasoning_replays_ahead_of_the_message_it_preceded() {
+        let dir = tempdir("thinking");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "q".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::AssistantReasoning {
+                text: "thinking about it".to_string(),
+                duration_ms: Some(1_500),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::AssistantMessage {
+                message: "a".to_string(),
+            })
+            .expect("append");
+        // A pure tool-call round carries no text but still had reasoning; the
+        // block belongs to the calls message that follows it.
+        rollout
+            .append(&RolloutItem::AssistantReasoning {
+                text: "should call a tool".to_string(),
+                duration_ms: None,
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::AssistantToolCalls {
+                calls: vec![crate::core::tools::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "ping".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            })
+            .expect("append");
+        // Reasoning with no message after it (a file truncated mid-write) is
+        // dropped rather than shown above an unrelated turn.
+        rollout
+            .append(&RolloutItem::AssistantReasoning {
+                text: "orphan".to_string(),
+                duration_ms: None,
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        // The conversation is unchanged: user, answer, tool calls.
+        assert_eq!(
+            loaded.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::Assistant]
+        );
+        assert_eq!(
+            loaded.thinking,
+            vec![
+                ThinkingRecord {
+                    before: 1,
+                    text: "thinking about it".to_string(),
+                    duration_ms: Some(1_500),
+                },
+                ThinkingRecord {
+                    before: 2,
+                    text: "should call a tool".to_string(),
+                    duration_ms: None,
+                },
+            ]
+        );
+    }
+
+    /// A reasoning block is anchored to a message index, so `/context`
+    /// deletions and their undo shift it with the message it sits above.
+    #[test]
+    fn context_deletions_shift_thinking_with_their_message() {
+        let dir = tempdir("thinking-shift");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+
+        for (text, reasoning) in [("one", "about one"), ("two", "about two")] {
+            rollout
+                .append(&RolloutItem::UserMessage {
+                    message: text.to_string(),
+                })
+                .expect("append");
+            rollout
+                .append(&RolloutItem::AssistantReasoning {
+                    text: reasoning.to_string(),
+                    duration_ms: None,
+                })
+                .expect("append");
+            rollout
+                .append(&RolloutItem::AssistantMessage {
+                    message: format!("re {text}"),
+                })
+                .expect("append");
+        }
+        // Drop the first user message: every later message (and the thinking
+        // above it) moves down one slot.
+        rollout
+            .append(&RolloutItem::ContextDeleted {
+                indices: vec![0],
+                removed: vec![Message::user("one")],
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(
+            loaded.thinking,
+            vec![
+                // "about one" preceded the deleted answer, which is gone; it
+                // now sits above the following message.
+                ThinkingRecord {
+                    before: 0,
+                    text: "about one".to_string(),
+                    duration_ms: None,
+                },
+                ThinkingRecord {
+                    before: 2,
+                    text: "about two".to_string(),
+                    duration_ms: None,
+                },
+            ]
+        );
     }
 
     #[test]

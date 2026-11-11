@@ -108,7 +108,16 @@ impl SessionView {
         // Tool-call cells are keyed by the model's call ids so the follow-up
         // `Role::Tool` messages attach their output to the right cell.
         let mut call_cells = std::collections::HashMap::new();
-        for message in &loaded.messages {
+        // Reasoning blocks carry the index of the message they preceded; they
+        // render as thinking cards just above it, the way they streamed.
+        let mut thinking = loaded.thinking.iter().peekable();
+        for (position, message) in loaded.messages.iter().enumerate() {
+            while let Some(record) = thinking.next_if(|record| record.before <= position) {
+                view.history.push(HistoryCell::Thinking {
+                    text: record.text.clone(),
+                    duration_ms: record.duration_ms,
+                });
+            }
             match message.role {
                 Role::User => view
                     .history
@@ -142,6 +151,15 @@ impl SessionView {
                 }
                 Role::System => {}
             }
+        }
+        // A reasoning block can outlive its message (a transcript edited down
+        // to nothing after it): keep it as a trailing card rather than losing
+        // it silently.
+        for record in thinking {
+            view.history.push(HistoryCell::Thinking {
+                text: record.text.clone(),
+                duration_ms: record.duration_ms,
+            });
         }
         view.name = loaded.name.clone().or(loaded.meta.name.clone());
         // The rollout's recorded usage seeds the footer immediately: a
@@ -256,6 +274,124 @@ mod tests {
         assert_eq!(view.display_name(), Some("hello there"));
         view.name = Some("custom".to_string());
         assert_eq!(view.display_name(), Some("custom"));
+    }
+
+    #[test]
+    fn restored_view_puts_thinking_cards_back_above_their_answers() {
+        let loaded = LoadedSession {
+            meta: crate::core::SessionMeta {
+                version: 1,
+                id: "s".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                cwd: "/tmp/demo".to_string(),
+                system_prompt: "be brief".to_string(),
+                name: None,
+                provider: None,
+                model: None,
+                profile: None,
+            },
+            path: std::path::PathBuf::from("/tmp/s.jsonl"),
+            messages: vec![
+                crate::core::protocol::Message::user("q"),
+                crate::core::protocol::Message::assistant("a"),
+                crate::core::protocol::Message::user("q2"),
+                crate::core::protocol::Message::assistant("a2"),
+            ],
+            // One block before the first answer, one before the second.
+            thinking: vec![
+                crate::core::rollout::ThinkingRecord {
+                    before: 1,
+                    text: "pondering q".to_string(),
+                    duration_ms: Some(4_200),
+                },
+                crate::core::rollout::ThinkingRecord {
+                    before: 3,
+                    text: "pondering q2".to_string(),
+                    duration_ms: None,
+                },
+            ],
+            undo: Vec::new(),
+            name: None,
+            model: None,
+            last_usage: None,
+            total_input: 0,
+            total_output: 0,
+            profile: None,
+            tools: None,
+        };
+
+        let view = SessionView::restored(&loaded);
+        let cells: Vec<&str> = view
+            .history
+            .iter()
+            .map(|cell| match cell {
+                HistoryCell::User(_) => "user",
+                HistoryCell::Assistant(_) => "assistant",
+                HistoryCell::Thinking { .. } => "thinking",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            cells,
+            vec![
+                "user",
+                "thinking",
+                "assistant",
+                "user",
+                "thinking",
+                "assistant",
+            ]
+        );
+        assert!(matches!(
+            &view.history[1],
+            HistoryCell::Thinking { text, duration_ms: Some(4_200) } if text == "pondering q"
+        ));
+        // The restored cards count as already printed, like the rest.
+        assert_eq!(view.printed_cells, view.history.len());
+    }
+
+    #[test]
+    fn restored_thinking_without_a_message_follows_the_transcript() {
+        let mut loaded = LoadedSession {
+            meta: crate::core::SessionMeta {
+                version: 1,
+                id: "s".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                cwd: "/tmp/demo".to_string(),
+                system_prompt: "be brief".to_string(),
+                name: None,
+                provider: None,
+                model: None,
+                profile: None,
+            },
+            path: std::path::PathBuf::from("/tmp/s.jsonl"),
+            messages: vec![crate::core::protocol::Message::user("q")],
+            thinking: vec![crate::core::rollout::ThinkingRecord {
+                before: 5,
+                text: "late".to_string(),
+                duration_ms: None,
+            }],
+            undo: Vec::new(),
+            name: None,
+            model: None,
+            last_usage: None,
+            total_input: 0,
+            total_output: 0,
+            profile: None,
+            tools: None,
+        };
+        loaded
+            .messages
+            .push(crate::core::protocol::Message::user("q2"));
+
+        // The block anchors past the last message it could precede: it is
+        // rendered as a trailing card rather than dropped.
+        let view = SessionView::restored(&loaded);
+        assert!(matches!(
+            view.history.last(),
+            Some(HistoryCell::Thinking { text, .. }) if text == "late"
+        ));
+        assert_eq!(view.history.len(), 3);
     }
 
     #[test]

@@ -176,8 +176,10 @@ footer 的 `provider/model` 标签，事件到达时权威回填。
 - **`ModelStream` 条目从 `String` 改为 `#[non_exhaustive] enum StreamItem`**：
   `Delta`（正文）、`Thinking`（`delta.reasoning_content`，reasoning 模型的思考
   增量）、`Usage`（token 计数）。worker 把 Thinking 转成
-  `EventMsg::AgentThinkingDelta`（TUI 以暗色渲染、`/thinking` 可折叠；仅显示，
-  不进模型上下文与 rollout）、Usage 在完整结束时以
+  `EventMsg::AgentThinkingDelta`（TUI 以暗色渲染、`/thinking` 可折叠），并且
+  只作为**显示元数据**记进 rollout（`assistant_reasoning`，写在其对应的
+  assistant 消息之前），回放时还原成 thinking 卡片；它始终不进模型上下文——
+  模型不该看到自己被回放的思考。Usage 在完整结束时以
   `EventMsg::TurnUsage` 发出。渲染策略可以后补，通道先通——enum 后加 variant
   是破坏性变更，实现方会全体返工；
 - **per-turn 请求选项**：`ModelClient::stream_chat` 增加 `TurnOptions`
