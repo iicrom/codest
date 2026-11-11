@@ -24,7 +24,6 @@
 //! failed fetch never empties it.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -372,11 +371,17 @@ pub enum PoolError {
     DiscoveryNotConfigured { provider: String, reason: String },
 }
 
-/// Clients per selection, built on first use; plus the fetched-models overlay
-/// and its on-disk cache.
+/// The provider registry, plus the fetched-models overlay and its on-disk
+/// cache.
+///
+/// Clients are deliberately **not** cached here. A client carries the session
+/// header name but is handed the session id per turn, and the id follows the
+/// active session — two sessions on the same `provider/model` must not share a
+/// client, or the second one would keep announcing the first one's id. Clients
+/// are cheap to build (the underlying HTTP connection pool is process-wide, in
+/// [`crate::core::openai_compat`]), so the worker builds one per turn.
 pub struct ModelPool {
     registry: RwLock<Arc<ProviderRegistry>>,
-    clients: Mutex<HashMap<String, Arc<dyn ModelClient>>>,
     /// Models discovered through the providers' models APIs, merged over the
     /// declared ones. Keyed by provider name.
     fetched: Mutex<BTreeMap<String, Vec<ModelInfo>>>,
@@ -387,7 +392,6 @@ impl ModelPool {
     pub fn new(registry: ProviderRegistry) -> Self {
         Self {
             registry: RwLock::new(Arc::new(registry)),
-            clients: Mutex::new(HashMap::new()),
             fetched: Mutex::new(BTreeMap::new()),
             cache_path: None,
         }
@@ -419,9 +423,8 @@ impl ModelPool {
     /// empty model id, or invalid wire quirks are errors and leave the pool
     /// untouched.
     ///
-    /// Cached clients for the provider are evicted: they were built from the
-    /// old `base_url`/`api_key`, and keeping them would silently send requests
-    /// to the previous endpoint.
+    /// No client bookkeeping is needed: clients are built per turn, so the
+    /// next one already reads the new `base_url`/`api_key`.
     pub fn install_instance(&self, instance: ProviderInstance) -> Result<(), RegistryError> {
         let name = instance.name.clone();
         let mut guard = self.registry.write().expect("pool lock");
@@ -434,16 +437,6 @@ impl ModelPool {
         instances.push(instance);
         let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
         *guard = Arc::new(rebuilt);
-        drop(guard);
-
-        self.clients
-            .lock()
-            .expect("pool lock")
-            .retain(|selection, _| {
-                !selection
-                    .strip_prefix(name.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-            });
         self.fetched.lock().expect("pool lock").remove(&name);
         Ok(())
     }
@@ -463,16 +456,6 @@ impl ModelPool {
             .collect();
         let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
         *guard = Arc::new(rebuilt);
-        drop(guard);
-
-        self.clients
-            .lock()
-            .expect("pool lock")
-            .retain(|selection, _| {
-                !selection
-                    .strip_prefix(name)
-                    .is_some_and(|rest| rest.starts_with('/'))
-            });
         self.fetched.lock().expect("pool lock").remove(name);
         Ok(true)
     }
@@ -493,13 +476,9 @@ impl ModelPool {
             .map(|missing| missing_credential_guidance(provider, missing))
     }
 
-    /// The client for one selection, built on first use and cached.
+    /// The client for one selection, built fresh. Callers that need a session
+    /// id on the wire pass it per turn through `TurnOptions`, not here.
     pub fn client(&self, selection: &Selection) -> Result<Arc<dyn ModelClient>, PoolError> {
-        let key = selection.as_str();
-        if let Some(client) = self.clients.lock().expect("pool lock").get(key.as_str()) {
-            return Ok(client.clone());
-        }
-
         let registry = self.registry();
         let instance = registry
             .instance(&selection.provider)
@@ -521,10 +500,6 @@ impl ModelPool {
                 provider: selection.provider.clone(),
                 source,
             })?;
-        self.clients
-            .lock()
-            .expect("pool lock")
-            .insert(key.to_string(), client.clone());
         Ok(client)
     }
 
@@ -703,9 +678,13 @@ static OPENAI_COMPAT_FACTORY: OpenAiCompatFactory = OpenAiCompatFactory;
 
 impl OpenAiCompatFactory {
     /// The client one instance of `openai-compat` builds into: URL, key,
-    /// static headers, `body_overrides`, and wire quirks, all baked in at
-    /// construction. Split out of [`ProtocolFactory::create`] so tests can
-    /// inspect the built client's state.
+    /// static headers, `body_overrides`, wire quirks, and the session header
+    /// name, all baked in at construction. Split out of
+    /// [`ProtocolFactory::create`] so tests can inspect the built client's
+    /// state.
+    ///
+    /// The session header *name* is configuration, so it is resolved here; the
+    /// session *id* is per-turn state and rides [`TurnOptions`] instead.
     fn build_client(
         instance: &ProviderInstance,
         model: &str,
@@ -717,10 +696,20 @@ impl OpenAiCompatFactory {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
+        let quirks = instance.wire.clone().unwrap_or_default();
+        // A model's own `session_header` overrides the instance's.
+        let model_header = instance
+            .models
+            .iter()
+            .find(|declared| declared.id == model)
+            .and_then(|declared| declared.session_header.as_deref());
+        let session_header =
+            crate::core::config::resolve_session_header(&quirks, model_header).map(str::to_string);
         Ok(OpenAiCompatClient::new(api_key, base_url, model)?
             .with_headers(headers)
             .with_body_overrides(instance.body_overrides.clone())
-            .with_quirks(instance.wire.clone().unwrap_or_default()))
+            .with_quirks(quirks)
+            .with_session_header(session_header))
     }
 }
 
@@ -832,6 +821,8 @@ pub fn models_from_openai_list(payload: &serde_json::Value) -> Vec<ModelInfo> {
             context_window,
             reasoning: None,
             default_level,
+            // Models discovery reports no per-model overrides.
+            session_header: None,
         });
     }
     models
@@ -945,6 +936,7 @@ mod tests {
         let quirks = WireQuirks {
             thinking_fields: vec!["reasoning".to_string(), "thinking".to_string()],
             effort_field: "reasoning".to_string(),
+            ..Default::default()
         };
         let mut inst = instance("p", Some(DEFAULT_PROTOCOL), &["m"]);
         inst.wire = Some(quirks.clone());
@@ -956,6 +948,85 @@ mod tests {
         let inst = instance("plain", Some(DEFAULT_PROTOCOL), &["m"]);
         let client = OpenAiCompatFactory::build_client(&inst, "m").expect("client builds");
         assert_eq!(client.quirks(), &WireQuirks::default());
+    }
+
+    /// The session header name is configuration: the instance decides, a model
+    /// may override it, and `none` at either level turns it off. The value
+    /// (the session id) arrives per turn and is not part of the client.
+    #[test]
+    fn session_header_resolves_instance_then_model() {
+        use crate::core::TurnOptions;
+        use crate::core::config::{SESSION_HEADER_NONE, WireQuirks};
+
+        // An instance with no wire table still sends `session-id`.
+        let inst = instance("p", Some(DEFAULT_PROTOCOL), &["m"]);
+        let client = OpenAiCompatFactory::build_client(&inst, "m").expect("client builds");
+        assert_eq!(
+            client.session_headers(&TurnOptions {
+                effort: None,
+                tools: Vec::new(),
+                session_id: Some("sid".to_string()),
+            }),
+            vec![("session-id", "sid")]
+        );
+
+        // The instance renames it for everyone…
+        let mut inst = instance("p", Some(DEFAULT_PROTOCOL), &["m"]);
+        inst.wire = Some(WireQuirks {
+            session_header: "x-session".to_string(),
+            ..Default::default()
+        });
+        let client = OpenAiCompatFactory::build_client(&inst, "m").expect("client builds");
+        assert_eq!(
+            client.session_headers(&TurnOptions {
+                effort: None,
+                tools: Vec::new(),
+                session_id: Some("sid".to_string()),
+            }),
+            vec![("x-session", "sid")]
+        );
+
+        // …and a single model can opt out while the instance keeps sending.
+        let mut inst = instance("p", Some(DEFAULT_PROTOCOL), &["quiet", "loud"]);
+        inst.models[0].session_header = Some(SESSION_HEADER_NONE.to_string());
+        let quiet = OpenAiCompatFactory::build_client(&inst, "quiet").expect("client builds");
+        assert!(
+            quiet
+                .session_headers(&TurnOptions {
+                    effort: None,
+                    tools: Vec::new(),
+                    session_id: Some("sid".to_string()),
+                })
+                .is_empty(),
+            "a model that opts out sends no session header"
+        );
+        let loud = OpenAiCompatFactory::build_client(&inst, "loud").expect("client builds");
+        assert_eq!(
+            loud.session_headers(&TurnOptions {
+                effort: None,
+                tools: Vec::new(),
+                session_id: Some("sid".to_string()),
+            }),
+            vec![("session-id", "sid")],
+            "the neighbouring model keeps the default"
+        );
+
+        // An instance-wide opt-out applies to models that do not override it.
+        let mut inst = instance("p", Some(DEFAULT_PROTOCOL), &["m"]);
+        inst.wire = Some(WireQuirks {
+            session_header: SESSION_HEADER_NONE.to_string(),
+            ..Default::default()
+        });
+        let client = OpenAiCompatFactory::build_client(&inst, "m").expect("client builds");
+        assert!(
+            client
+                .session_headers(&TurnOptions {
+                    effort: None,
+                    tools: Vec::new(),
+                    session_id: Some("sid".to_string()),
+                })
+                .is_empty()
+        );
     }
 
     #[test]
@@ -990,15 +1061,21 @@ mod tests {
         assert!(error.contains("no models"), "{error}");
     }
 
+    /// Clients are never shared: a client carries the session header name but
+    /// is handed the session id per turn, so two sessions on one selection must
+    /// each get their own. Reuse would announce the wrong session upstream.
     #[test]
-    fn pool_builds_clients_lazily_and_caches_them() {
+    fn pool_builds_a_fresh_client_per_call() {
         let registry =
             ProviderRegistry::build(&[], vec![instance("p", None, &["m1", "m2"])]).unwrap();
         let pool = ModelPool::new(registry);
 
         let first = pool.client(&Selection::new("p", "m1")).unwrap();
         let again = pool.client(&Selection::new("p", "m1")).unwrap();
-        assert!(Arc::ptr_eq(&first, &again), "cached per selection");
+        assert!(
+            !Arc::ptr_eq(&first, &again),
+            "the same selection must not share a client across sessions"
+        );
         let other = pool.client(&Selection::new("p", "m2")).unwrap();
         assert!(!Arc::ptr_eq(&first, &other));
 
@@ -1184,23 +1261,25 @@ mod tests {
     }
 
     /// `/provider` installs an instance after the pool exists: the registry
-    /// must see it, a replacement must win, and cached clients built from the
-    /// old endpoint must not survive.
+    /// must see it and a replacement must win.
+    ///
+    /// Nothing needs evicting, because clients are built per turn — the next
+    /// one reads the replaced instance. The check below pins that property by
+    /// asserting the newly built client points at the new endpoint.
     #[test]
-    fn install_instance_registers_and_evicts_stale_clients() {
+    fn install_instance_registers_and_replaces() {
         let registry = ProviderRegistry::build(&[], vec![instance("p", None, &["m1"])]).unwrap();
         let pool = ModelPool::new(registry);
-        let before = pool.client(&Selection::new("p", "m1")).expect("client");
 
         let mut replacement = instance("p", None, &["m1"]);
         replacement.base_url = Some("http://127.0.0.1:2/v1".to_string());
         pool.install_instance(replacement).expect("install");
 
-        let after = pool.client(&Selection::new("p", "m1")).expect("client");
-        assert!(
-            !Arc::ptr_eq(&before, &after),
-            "a client built from the old endpoint must be evicted"
-        );
+        // Clients are built per turn, so the next one is built from the
+        // *replaced* instance — no cache to invalidate.
+        let installed = pool.registry().instance("p").expect("instance").clone();
+        let client = OpenAiCompatFactory::build_client(&installed, "m1").expect("client");
+        assert_eq!(client.endpoint(), "http://127.0.0.1:2/v1/chat/completions");
 
         // A brand-new provider becomes selectable.
         pool.install_instance(instance("q", None, &["qm"]))

@@ -1,11 +1,16 @@
 //! Session persistence (rollouts), distilled from codex's `rollout` crate.
 //!
 //! One session = one append-only JSONL file under
-//! `~/.codest/sessions/<workspace-hash>/rollout-<id>.jsonl` (override the root
-//! with `CODEST_HOME`, mirroring codex's `CODEX_HOME`). The first line is the
-//! [`SessionMeta`]; every following line is a [`RolloutItem`] stamped with a
-//! timestamp. Replaying the items rebuilds the exact conversation the worker
+//! `~/.codest/sessions/<workspace-hash>/rollout-<uuid>.jsonl` (override the
+//! root with `CODEST_HOME`, mirroring codex's `CODEX_HOME`). The first line is
+//! the [`SessionMeta`]; every following line is a [`RolloutItem`] stamped with
+//! a timestamp. Replaying the items rebuilds the exact conversation the worker
 //! held, so resume is faithful by construction.
+//!
+//! The session id is a UUIDv7 ([`crate::core::session_id`]), so the file name
+//! sorts by creation and doubles as the session's identity everywhere. Files
+//! whose names are not uuids — including the pre-uuid hex-nanosecond names —
+//! are not sessions this build knows about and are skipped on listing.
 //!
 //! Like codex, the recorder lives in the core: the worker appends a line
 //! whenever the conversation actually changes (user message, finished
@@ -106,6 +111,9 @@ fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+/// Nanosecond clock, used only to make test tempdir names unique — session
+/// ids are uuids now, so the library no longer needs it.
+#[cfg(test)]
 fn now_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -311,48 +319,41 @@ impl RolloutWriter {
         Self { dir, cwd }
     }
 
-    /// Create a new rollout file (meta line included) for a fresh session.
-    /// The id comes from the current time; on the unlikely name collision the
-    /// id is regenerated. `provider`/`model` record the initial selection,
+    /// Create a new rollout file (meta line included) for a fresh session,
+    /// under the caller-supplied `id`.
+    ///
+    /// The id is allocated by the worker when the session is *created*, not
+    /// here: a turn needs a session header before its rollout file exists, so
+    /// identity and persistence are deliberately separate (codex's eager-id /
+    /// lazy-file split). `provider`/`model` record the initial selection,
     /// `profile` the profile the run started with.
     pub fn start_session(
         &self,
+        id: &str,
         system_prompt: &str,
         provider: Option<&str>,
         model: Option<&str>,
         profile: Option<&str>,
     ) -> io::Result<RolloutFile> {
         std::fs::create_dir_all(&self.dir)?;
-        let mut last_error = None;
-        for _ in 0..5 {
-            let id = format!("{:x}", now_nanos());
-            let path = self
-                .dir
-                .join(format!("{ROLLOUT_PREFIX}{id}{ROLLOUT_SUFFIX}"));
-            let meta = SessionMeta {
-                version: FORMAT_VERSION,
-                id: id.clone(),
-                created_at: format_timestamp(now_seconds()),
-                cwd: self.cwd.clone(),
-                system_prompt: system_prompt.to_string(),
-                name: None,
-                provider: provider.map(str::to_string),
-                model: model.map(str::to_string),
-                profile: profile.map(str::to_string),
-            };
-            match OpenOptions::new().create_new(true).append(true).open(&path) {
-                Ok(file) => {
-                    let mut rollout = RolloutFile { path, file };
-                    rollout.append(&RolloutItem::SessionMeta(meta))?;
-                    return Ok(rollout);
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    last_error = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| io::Error::other("could not create rollout file")))
+        let path = self
+            .dir
+            .join(format!("{ROLLOUT_PREFIX}{id}{ROLLOUT_SUFFIX}"));
+        let meta = SessionMeta {
+            version: FORMAT_VERSION,
+            id: id.to_string(),
+            created_at: format_timestamp(now_seconds()),
+            cwd: self.cwd.clone(),
+            system_prompt: system_prompt.to_string(),
+            name: None,
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+            profile: profile.map(str::to_string),
+        };
+        let file = OpenOptions::new().create_new(true).append(true).open(&path)?;
+        let mut rollout = RolloutFile { path, file };
+        rollout.append(&RolloutItem::SessionMeta(meta))?;
+        Ok(rollout)
     }
 
     /// Reopen an existing rollout for appending (a resumed session keeps
@@ -388,10 +389,14 @@ impl RolloutFile {
     }
 }
 
-/// Every rollout file of a workspace, oldest first. Files whose names do not
-/// parse sort after the parseable ones, by name.
+/// Every rollout file of a workspace, oldest first.
+///
+/// The file name is the session id — a UUIDv7 — so plain name order is
+/// creation order. Files whose names are not uuids are not sessions this
+/// build can read: the pre-uuid hex-nanosecond names are skipped outright
+/// rather than sorted, because their lexical order is unrelated to time.
 pub fn list_workspace_sessions(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut files: Vec<(Option<u128>, PathBuf)> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -404,15 +409,14 @@ pub fn list_workspace_sessions(dir: &Path) -> io::Result<Vec<PathBuf>> {
         }
         let id = name
             .trim_start_matches(ROLLOUT_PREFIX)
-            .trim_end_matches(ROLLOUT_SUFFIX)
-            .parse::<u128>()
-            .ok();
-        files.push((id, path));
+            .trim_end_matches(ROLLOUT_SUFFIX);
+        if !crate::core::session_id::is_session_id(id) {
+            continue;
+        }
+        files.push(path);
     }
-    files.sort_by(|(left_id, left), (right_id, right)| {
-        left_id.cmp(right_id).then_with(|| left.cmp(right))
-    });
-    Ok(files.into_iter().map(|(_, path)| path).collect())
+    files.sort();
+    Ok(files)
 }
 
 /// Attach a replayed reasoning block to the message that follows it.
@@ -643,6 +647,11 @@ mod tests {
         dir
     }
 
+    /// A fresh session id per call site, so no test hard-codes a file name.
+    fn new_id() -> String {
+        crate::core::session_id::new_session_id()
+    }
+
     #[test]
     fn workspace_hash_is_stable_hex() {
         let first = workspace_hash(Path::new("/tmp/demo"));
@@ -667,9 +676,17 @@ mod tests {
     fn start_session_writes_meta_and_reloads() {
         let dir = tempdir("start");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let id = new_id();
+        let mut rollout = writer
+            .start_session(&id, "be brief", None, None, None)
+            .expect("start");
 
         assert!(rollout.path.starts_with(&dir));
+        assert_eq!(
+            rollout.path.file_name().and_then(|name| name.to_str()),
+            Some(format!("rollout-{id}.jsonl").as_str()),
+            "the file name is the session id"
+        );
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -695,7 +712,7 @@ mod tests {
     fn replay_applies_clears_and_renames_in_order() {
         let dir = tempdir("replay");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
 
         rollout
             .append(&RolloutItem::UserMessage {
@@ -729,7 +746,7 @@ mod tests {
 
         let dir = tempdir("context-edit");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
         for text in ["one", "two", "three"] {
             rollout
                 .append(&RolloutItem::UserMessage {
@@ -797,7 +814,7 @@ mod tests {
     fn context_restored_replays_and_clear_drops_the_stack() {
         let dir = tempdir("context-undo");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -834,7 +851,7 @@ mod tests {
     fn corrupt_context_delete_markers_are_skipped() {
         let dir = tempdir("context-corrupt");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -865,7 +882,7 @@ mod tests {
     fn reasoning_replays_ahead_of_the_message_it_preceded() {
         let dir = tempdir("thinking");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
 
         rollout
             .append(&RolloutItem::UserMessage {
@@ -938,7 +955,7 @@ mod tests {
     fn context_deletions_shift_thinking_with_their_message() {
         let dir = tempdir("thinking-shift");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
 
         for (text, reasoning) in [("one", "about one"), ("two", "about two")] {
             rollout
@@ -992,20 +1009,45 @@ mod tests {
     fn listing_sorts_oldest_first() {
         let dir = tempdir("list");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let first = writer.start_session("one", None, None, None).expect("start");
-        // Ensure distinct ids even with a coarse clock.
+        let first = writer
+            .start_session(&new_id(), "one", None, None, None)
+            .expect("start");
+        // v7 embeds the creation time; a tick between them keeps the
+        // comparison meaningful even on a coarse clock.
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = writer.start_session("two", None, None, None).expect("start");
+        let second = writer
+            .start_session(&new_id(), "two", None, None, None)
+            .expect("start");
 
         let listed = list_workspace_sessions(&dir).expect("list");
         assert_eq!(listed, vec![first.path, second.path]);
     }
 
     #[test]
+    fn listing_skips_files_that_are_not_session_ids() {
+        let dir = tempdir("list-legacy");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let session = writer
+            .start_session(&new_id(), "one", None, None, None)
+            .expect("start");
+
+        // A pre-uuid rollout name, and a stray file that is not a rollout.
+        std::fs::write(dir.join("rollout-18f2c3d4e5f60718.jsonl"), "{}\n").expect("legacy file");
+        std::fs::write(dir.join("notes.txt"), "hi").expect("stray file");
+
+        let listed = list_workspace_sessions(&dir).expect("list");
+        assert_eq!(
+            listed,
+            vec![session.path],
+            "only uuid-named rollouts are sessions this build reads"
+        );
+    }
+
+    #[test]
     fn load_skips_unknown_item_types() {
         let dir = tempdir("unknown");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -1030,7 +1072,7 @@ mod tests {
     fn reasoning_effort_switched_round_trips_and_replay_ignores_it() {
         let dir = tempdir("effort");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::ReasoningEffortSwitched {
                 effort: Some("high".to_string()),
@@ -1055,7 +1097,7 @@ mod tests {
         let dir = tempdir("profile");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
         let mut rollout = writer
-            .start_session("be brief", None, None, Some("code"))
+            .start_session(&new_id(), "be brief", None, None, Some("code"))
             .expect("start");
         // The meta line seeds the startup profile…
         let loaded = load_session(&rollout.path).expect("load");
@@ -1086,7 +1128,7 @@ mod tests {
     fn tools_switched_round_trips_and_replays_the_last_set() {
         let dir = tempdir("tools");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
         // No switch yet: the session never customized its tools.
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.tools, None);
@@ -1123,7 +1165,7 @@ mod tests {
         let dir = tempdir("model");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
         let mut rollout = writer
-            .start_session("be brief", Some("openai"), Some("gpt-4o-mini"), None)
+            .start_session(&new_id(), "be brief", Some("openai"), Some("gpt-4o-mini"), None)
             .expect("start");
         // The meta line seeds the initial selection…
         let loaded = load_session(&rollout.path).expect("load");
@@ -1168,7 +1210,7 @@ mod tests {
     fn turn_usage_round_trips_and_clear_resets_it() {
         let dir = tempdir("usage");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session("be brief", None, None, None).expect("start");
+        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "first".to_string(),

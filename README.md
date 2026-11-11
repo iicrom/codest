@@ -307,9 +307,9 @@ codest 支持多轮独立对话：会话按创建顺序编号（从 1 开始）�
 
 每次对话都按 codex 的 rollout 方案蒸馏后落盘：工作区级隔离，跨次启动可恢复。
 
-- 存储在 `~/.codest/sessions/<工作区哈希>/rollout-<id>.jsonl`（根目录可用 `CODEST_HOME` 覆盖，镜像 codex 的 `CODEX_HOME`；工作区哈希 = 启动目录的 FNV-1a）；
+- 存储在 `~/.codest/sessions/<工作区哈希>/rollout-<uuid>.jsonl`（根目录可用 `CODEST_HOME` 覆盖，镜像 codex 的 `CODEX_HOME`；工作区哈希 = 启动目录的 FNV-1a）。文件名里的 `<uuid>` 就是会话 id：UUIDv7，时间有序，所以文件名排序即创建顺序。同一个值也是发给 provider 的 session 头取值。旧的 hex-nanos 文件名不再被识别为会话，设计见 [`docs/session-id.md`](docs/session-id.md)；
 - 文件是 append-only JSONL：首行是会话元数据（id、创建时间、工作区、系统提示词），之后用户消息、完成的助手消息、`/clear`、`/rename` 各记一行——回放这些行即可精确重建当时的对话；
-- 还没有输入过的空会话不写 rollout 文件：文件在该会话收到第一条用户消息时才创建，随手开一下 `/new` 不会在磁盘上留垃圾；
+- 还没有输入过的空会话不写 rollout 文件：文件在该会话收到第一条用户消息时才创建，随手开一下 `/new` 不会在磁盘上留垃圾。但会话 id 在会话创建时就已分配，因为第一轮请求就要带 session 头（codex 的 eager-id / lazy-file 拆分）；
 - 写入是尽力而为：落盘失败只影响持久化，不影响对话（会话留在内存）；
 - 每次启动都会加载本工作区已保存的会话，`/sessions` 在任何启动方式下都是同一份列表。默认激活一个新会话；也可以显式指定恢复方式：
 
@@ -317,6 +317,30 @@ codest 支持多轮独立对话：会话按创建顺序编号（从 1 开始）�
 codest --continue        # 直接激活最近一次保存的会话（-c 等价）
 codest --resume          # 同 --continue，并在启动时打开会话选择菜单
 ```
+
+### 会话 id 与 session 头
+
+每个会话有一个 UUIDv7 的 id，一个值贯穿全程：rollout 文件名、`SessionMeta.id`、以及发给 provider 的 session 头取值。
+
+**默认每个请求都带 `session-id: <uuid>`**——这是 codex 的头拼写，Opencode 的 console / 网关与多数"按会话做路由与 prompt cache"的后端认它。关闭或改名在 `providers.toml` 里按 provider 或按 model 配置：
+
+```toml
+[[providers]]
+name = "strict-endpoint"
+base_url = "https://example.test/v1"
+wire = { session_header = "none" }     # 这个实例不发（端点拒绝未知头时用）
+
+[[providers]]
+name = "gateway"
+base_url = "https://gateway.test/v1"
+wire = { session_header = "x-session-id" }   # 改用网关自己的拼写
+
+  [[providers.models]]
+  id = "quiet-model"
+  session_header = "none"              # 只关掉这一个模型
+```
+
+头的取值随会话切换而变，因此不能写死在 `headers` 里；`headers` 中手写的同名项会被逐轮值覆盖。完整设计（eager-id / lazy-file、为什么 client 每轮重建）见 [`docs/session-id.md`](docs/session-id.md)。
 
 ## 插件（编译期静态）
 
@@ -405,10 +429,12 @@ codest/
 ├── README.md
 ├── docs/
 │   ├── plugins.md           # 静态插件系统设计
-│   └── multi-provider.md    # 多 Provider 框架设计
+│   ├── multi-provider.md    # 多 Provider 框架设计
+│   └── session-id.md        # 会话 id（UUIDv7）与上游 session 头
 ├── scripts/
 │   ├── openai_test_server.py # 本地 OpenAI 兼容测试服务（关键词 @bash/@read/@write/@edit/@tool 触发工具调用，默认回复 help）
 │   ├── pty_smoke.py          # 离线端到端冒烟测试（pty）
+│   ├── session_header_smoke.py # 断言 session 头真的发到了线上
 │   └── tool_smoke.py         # 内置工具与 /tools 的端到端冒烟测试
 └── src/
     ├── main.rs              # codest 主入口

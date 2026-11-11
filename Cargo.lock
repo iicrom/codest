@@ -341,6 +341,7 @@ dependencies = [
  "toml",
  "two-face",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]

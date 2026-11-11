@@ -35,6 +35,7 @@ use crate::core::rollout::LoadedSession;
 use crate::core::rollout::RolloutFile;
 use crate::core::rollout::RolloutItem;
 use crate::core::rollout::RolloutWriter;
+use crate::core::session_id::new_session_id;
 use crate::core::tools::MAX_TOOL_ROUNDS;
 use crate::core::tools::ToolCall;
 use crate::core::tools::ToolExecutor;
@@ -82,18 +83,23 @@ pub enum ModelBackend {
     Pooled {
         pool: Arc<ModelPool>,
         current: Selection,
-        client: Arc<dyn ModelClient>,
     },
     Empty { pool: Arc<ModelPool> },
 }
 
 impl ModelBackend {
-    /// The client for the upcoming turn. Only meaningful for the backends
-    /// that have one — callers guard `Empty` before reaching here.
-    fn client(&self) -> &Arc<dyn ModelClient> {
+    /// The client for the upcoming turn, built fresh.
+    ///
+    /// Pooled clients are **not** reused across sessions or turns: the client
+    /// carries the session header name, and the header's value follows the
+    /// active session, so a shared client would keep announcing the session it
+    /// was built for. Only the fixed backend's client is kept for the run.
+    /// Only meaningful for backends that have one — callers guard `Empty`
+    /// before reaching here.
+    fn client(&self) -> Result<Arc<dyn ModelClient>, String> {
         match self {
-            ModelBackend::Fixed(client) => client,
-            ModelBackend::Pooled { client, .. } => client,
+            ModelBackend::Fixed(client) => Ok(client.clone()),
+            ModelBackend::Pooled { pool, current } => Self::client_for(pool, current),
             ModelBackend::Empty { .. } => unreachable!("Empty backend has no client; guard turns with has_client()"),
         }
     }
@@ -117,28 +123,28 @@ impl ModelBackend {
         }
     }
 
-    /// Switch the pooled backend to another `provider/model`. The new client
-    /// is built (or cache-hit) here, so a broken selection surfaces as this
-    /// error instead of failing the next turn. A fixed backend cannot
-    /// switch; an empty backend becomes pooled on the first successful one.
+    /// Switch the pooled backend to another `provider/model`. The selection is
+    /// validated (and its client proven buildable) here, so a broken choice
+    /// surfaces as this error instead of failing the next turn. A fixed
+    /// backend cannot switch; an empty backend becomes pooled on the first
+    /// successful one.
     fn switch(&mut self, selection: &str) -> Result<Selection, String> {
         match self {
             ModelBackend::Fixed(_) => Err("model switching is unavailable: \
                 this session runs a fixed backend"
                 .to_string()),
-            ModelBackend::Pooled { pool, current, client } => {
+            ModelBackend::Pooled { pool, current } => {
                 let parsed = Self::resolve(pool, selection)?;
+                Self::client_for(pool, &parsed)?;
                 *current = parsed.clone();
-                *client = Self::client_for(pool, &parsed)?;
                 Ok(parsed)
             }
             ModelBackend::Empty { pool } => {
                 let parsed = Self::resolve(pool, selection)?;
-                let client = Self::client_for(pool, &parsed)?;
+                Self::client_for(pool, &parsed)?;
                 *self = ModelBackend::Pooled {
                     pool: pool.clone(),
                     current: parsed.clone(),
-                    client,
                 };
                 Ok(parsed)
             }
@@ -203,11 +209,16 @@ impl AgentSession {
         bootstrap: SessionBootstrap,
     ) -> Result<Self, String> {
         let backend = match selection {
-            Some(selection) => ModelBackend::Pooled {
-                client: pool.client(selection).map_err(|error| error.to_string())?,
-                current: selection.clone(),
-                pool,
-            },
+            Some(selection) => {
+                // Prove the selection builds a client before starting, so a
+                // broken endpoint fails at startup rather than on the first
+                // turn. The client itself is per-turn, not stored.
+                pool.client(selection).map_err(|error| error.to_string())?;
+                ModelBackend::Pooled {
+                    current: selection.clone(),
+                    pool,
+                }
+            }
             None => ModelBackend::Empty { pool },
         };
         Ok(Self::spawn_with_backend(backend, system_prompt, bootstrap))
@@ -444,7 +455,15 @@ impl std::fmt::Debug for SessionBootstrap {
 /// stays out of the rollout directory entirely, so idle `/new` sessions do
 /// not litter it. Items recorded before the first user message (an early
 /// `/rename`, say) are held back and flushed into the file in order.
+///
+/// The session *id* is allocated eagerly, when the slot is created, even
+/// though the file is not: the first turn already needs a session header for
+/// its requests, and that is long before the file exists (codex's eager-id /
+/// lazy-file split). The id therefore lives in the slot, not in the file.
 struct RolloutSlot {
+    /// This session's id: the rollout file name once one exists, the session
+    /// header's value from the very first turn.
+    id: String,
     file: Option<RolloutFile>,
     pending: Vec<RolloutItem>,
     /// Set when the rollout file cannot be created or reopened; the session
@@ -453,16 +472,18 @@ struct RolloutSlot {
 }
 
 impl RolloutSlot {
-    fn inactive() -> Self {
+    fn inactive(id: String) -> Self {
         Self {
+            id,
             file: None,
             pending: Vec::new(),
             disabled: false,
         }
     }
 
-    fn orphaned() -> Self {
+    fn orphaned(id: String) -> Self {
         Self {
+            id,
             file: None,
             pending: Vec::new(),
             disabled: true,
@@ -483,8 +504,13 @@ struct Rollouts {
 }
 
 impl Rollouts {
-    fn push_slot(&mut self) {
-        self.slots.push(RolloutSlot::inactive());
+    fn push_slot(&mut self, id: String) {
+        self.slots.push(RolloutSlot::inactive(id));
+    }
+
+    /// The session id at `index`, or `None` for an index with no slot.
+    fn id(&self, index: usize) -> Option<&str> {
+        self.slots.get(index).map(|slot| slot.id.as_str())
     }
 
     fn append(&mut self, index: usize, item: RolloutItem) {
@@ -502,8 +528,9 @@ impl Rollouts {
                 slot.pending.push(item);
                 return;
             }
-            // First user input: the session earns its rollout file now, with
-            // any buffered items flushed ahead of the message.
+            // First user input: the session earns its rollout file now, under
+            // the id it has carried since creation, with any buffered items
+            // flushed ahead of the message.
             let (provider, model) = match self.selection.as_ref() {
                 Some(selection) => (
                     Some(selection.provider.as_str()),
@@ -511,7 +538,14 @@ impl Rollouts {
                 ),
                 None => (None, None),
             };
-            match writer.start_session(&self.system_prompt, provider, model, self.profile.as_deref()) {
+            let slot_id = slot.id.clone();
+            match writer.start_session(
+                &slot_id,
+                &self.system_prompt,
+                provider,
+                model,
+                self.profile.as_deref(),
+            ) {
                 Ok(mut file) => {
                     for buffered in std::mem::take(&mut slot.pending) {
                         if let Err(error) = file.append(&buffered) {
@@ -594,16 +628,17 @@ async fn run_worker(
         let slot = match writer.as_ref() {
             Some(writer) => match writer.open_existing(&loaded.path) {
                 Ok(file) => RolloutSlot {
+                    id: loaded.meta.id.clone(),
                     file: Some(file),
                     pending: Vec::new(),
                     disabled: false,
                 },
                 Err(error) => {
                     eprintln!("codest: cannot reopen rollout: {error}");
-                    RolloutSlot::orphaned()
+                    RolloutSlot::orphaned(loaded.meta.id.clone())
                 }
             },
-            None => RolloutSlot::inactive(),
+            None => RolloutSlot::inactive(loaded.meta.id.clone()),
         };
         // A recorded session restores the tool set it last ran with; `None`
         // means it never customized one, so every declared tool starts
@@ -627,7 +662,7 @@ async fn run_worker(
     // restore modes only fall back to one when nothing was restored.
     if bootstrap.fresh || sessions.is_empty() {
         sessions.push(Conversation::new(system_prompt.clone()));
-        slots.push(RolloutSlot::inactive());
+        slots.push(RolloutSlot::inactive(new_session_id()));
         session_models.push(None);
         session_tools.push(default_enabled(&tools));
     }
@@ -662,11 +697,25 @@ async fn run_worker(
     loop {
         if let Some(mut turn) = active.take() {
             interrupt.install(turn.cancel.clone());
+            let Ok(client) = backend.client() else {
+                // The selection stopped resolving between the turn starting
+                // and this round; report it as a turn error rather than
+                // dropping the turn silently.
+                let _ = tx.send(Event::new(
+                    turn.id.clone(),
+                    EventMsg::Error {
+                        message: "the active model selection is no longer available".to_string(),
+                    },
+                ));
+                let _ = tx.send(Event::new(turn.id, EventMsg::TurnComplete));
+                continue;
+            };
             let deps = TurnContext {
-                client: backend.client().clone(),
+                client,
                 options: TurnOptions {
                     effort: effort.clone(),
                     tools: declared_tools(&tools, &session_tools[current]),
+                    session_id: rollouts.id(current).map(str::to_string),
                 },
                 executor: executor.clone(),
                 declared: tools.clone(),
@@ -711,11 +760,22 @@ async fn run_worker(
                 sessions[current].push_user(text.clone());
                 rollouts.append(current, RolloutItem::UserMessage { message: text });
                 let cancel = CancellationToken::new();
-                let stream = backend.client().stream_chat(
+                let Ok(client) = backend.client() else {
+                    let _ = tx.send(Event::new(
+                        submission.id,
+                        EventMsg::Error {
+                            message: "the active model selection is no longer available"
+                                .to_string(),
+                        },
+                    ));
+                    continue;
+                };
+                let stream = client.stream_chat(
                     sessions[current].snapshot(),
                     TurnOptions {
                         effort: effort.clone(),
                         tools: declared_tools(&tools, &session_tools[current]),
+                        session_id: rollouts.id(current).map(str::to_string),
                     },
                     cancel.clone(),
                 );
@@ -750,7 +810,7 @@ async fn run_worker(
                 sessions.push(Conversation::new(system_prompt.clone()));
                 let previous = current;
                 current = sessions.len() - 1;
-                rollouts.push_slot();
+                rollouts.push_slot(new_session_id());
                 session_tools.push(default_enabled(&tools));
                 // A fresh session starts with every tool enabled. The
                 // front-end's mirror still shows the previous session's set,
@@ -2215,6 +2275,169 @@ mod tests {
         assert_eq!(seen[0][1].content, "first");
         assert_eq!(seen[0][2].content, "ok");
         assert_eq!(seen[0][3].content, "second");
+    }
+
+    /// A unique scratch directory for one test.
+    fn tempdir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-session-test-{name}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    /// A session id exists before its rollout file does, and the first turn
+    /// already carries it — that is the whole reason identity and persistence
+    /// are separate (codex's eager-id / lazy-file split).
+    #[tokio::test]
+    async fn a_fresh_session_has_an_id_before_it_has_a_file() {
+        let dir = tempdir("eager-id");
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(EchoModelClient::new(Duration::ZERO)),
+            "be brief",
+            SessionBootstrap {
+                loaded: Vec::new(),
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                fresh: true,
+                ..SessionBootstrap::default()
+            },
+        );
+
+        // No user message yet: no rollout file has been created.
+        assert!(
+            crate::core::rollout::list_workspace_sessions(&dir)
+                .expect("list")
+                .is_empty(),
+            "an idle session must not litter the rollout directory"
+        );
+
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+
+        let files = crate::core::rollout::list_workspace_sessions(&dir).expect("list");
+        assert_eq!(files.len(), 1, "the first turn wrote exactly one rollout");
+        let name = files[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("name");
+        let id = name
+            .trim_start_matches("rollout-")
+            .trim_end_matches(".jsonl");
+        assert!(
+            crate::core::session_id::is_session_id(id),
+            "the file name is the session id: {name}"
+        );
+    }
+
+    /// Resuming must not mint a new id: the whole point is that the same
+    /// conversation keeps its upstream identity across restarts.
+    #[tokio::test]
+    async fn resuming_a_session_reuses_its_persisted_id() {
+        let dir = tempdir("resume-id");
+        let bootstrap = |loaded, fresh| SessionBootstrap {
+            loaded,
+            rollout_dir: Some(dir.clone()),
+            cwd: "/tmp/demo".to_string(),
+            fresh,
+            ..SessionBootstrap::default()
+        };
+
+        // First run: record one turn.
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(RecordingClient::new()),
+            "be brief",
+            bootstrap(Vec::new(), true),
+        );
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+        session.shutdown();
+        while session.next_event().await.is_some() {}
+
+        let loaded = crate::core::rollout::load_workspace_sessions(&dir).expect("load");
+        assert_eq!(loaded.len(), 1);
+        let persisted_id = loaded[0].meta.id.clone();
+        assert!(
+            crate::core::session_id::is_session_id(&persisted_id),
+            "the meta id is a session id: {persisted_id}"
+        );
+
+        // Second run: the same session, and its id goes out with the turn.
+        let client = RecordingClient::new();
+        let options = client.turn_options();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            bootstrap(loaded, false),
+        );
+        session.submit_user_turn("second");
+        collect_turn(&mut session).await;
+
+        let options = options.lock().expect("lock");
+        assert_eq!(options.len(), 1);
+        assert_eq!(
+            options[0].session_id.as_deref(),
+            Some(persisted_id.as_str()),
+            "a resumed session must announce the id it was saved under"
+        );
+    }
+
+    /// Switching sessions switches the id sent upstream, because the client is
+    /// rebuilt per turn rather than cached per selection.
+    #[tokio::test]
+    async fn switching_sessions_switches_the_id_sent_upstream() {
+        let client = RecordingClient::new();
+        let options = client.turn_options();
+        let mut session = AgentSession::spawn(Arc::new(client));
+
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+
+        // Ops are FIFO, so the new session is active by the time this turn is
+        // served; `collect_turn` drains its `SessionStarted` on the way.
+        session.new_session();
+        session.submit_user_turn("second");
+        collect_turn(&mut session).await;
+
+        // Read the ids under a scoped guard: the next section awaits again, and
+        // holding a std MutexGuard across an await point is a bug waiting to
+        // happen (clippy is right to complain).
+        let (first_id, second_id) = {
+            let seen = options.lock().expect("lock");
+            assert_eq!(seen.len(), 2);
+            let first_id = seen[0]
+                .session_id
+                .clone()
+                .expect("the first turn carries a session id");
+            let second_id = seen[1]
+                .session_id
+                .clone()
+                .expect("the second turn carries a session id");
+            (first_id, second_id)
+        };
+        assert_ne!(
+            first_id, second_id,
+            "a new session must not inherit the previous session's id"
+        );
+        assert!(crate::core::session_id::is_session_id(&first_id));
+        assert!(crate::core::session_id::is_session_id(&second_id));
+
+        // Switching back re-announces the original session, not the newest.
+        session.switch_session(0);
+        session.submit_user_turn("third");
+        collect_turn(&mut session).await;
+        let seen = options.lock().expect("lock");
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            seen[2].session_id.as_deref(),
+            Some(first_id.as_str()),
+            "switching back must re-announce the session being switched to"
+        );
     }
 
     #[tokio::test]

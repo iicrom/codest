@@ -45,6 +45,15 @@ pub struct TurnOptions {
     /// Tools declared by plugins and offered to the model this turn. Empty
     /// sends no `tools` field at all.
     pub tools: Vec<crate::tools::ToolSpec>,
+    /// The active session's id, sent under the client's configured session
+    /// header (`session-id` by default) so an upstream can route and cache
+    /// per conversation. Stable for a session across turns and restarts;
+    /// `None` sends no session header.
+    ///
+    /// This rides the per-turn options rather than the client because the
+    /// value follows the *active session*, while the header name is baked into
+    /// the client from provider configuration.
+    pub session_id: Option<String>,
 }
 
 /// A streaming chat backend.

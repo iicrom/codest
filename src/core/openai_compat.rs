@@ -44,6 +44,28 @@ pub struct OpenAiCompatClient {
     headers: Vec<(String, String)>,
     body_overrides: serde_json::Map<String, Value>,
     quirks: WireQuirks,
+    /// The header session ids are sent under, resolved from the instance's
+    /// `wire.session_header` and the model's own override. `None` sends none.
+    session_header: Option<String>,
+}
+
+/// The process-wide HTTP client. Clients are rebuilt per turn (the session id
+/// changes with the active session, and it must not be baked into a cached
+/// client), so the connection pool has to outlive them — otherwise every turn
+/// would pay for a fresh TCP/TLS handshake.
+static HTTP: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+
+fn shared_http() -> Result<Client, ModelError> {
+    if let Some(client) = HTTP.get() {
+        return Ok(client.clone());
+    }
+    let built = Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(ModelError::network)?;
+    // A racing first caller may have won; either client is equivalent.
+    let _ = HTTP.set(built);
+    Ok(HTTP.get().expect("HTTP was just set").clone())
 }
 
 impl OpenAiCompatClient {
@@ -53,14 +75,24 @@ impl OpenAiCompatClient {
         model: impl Into<String>,
     ) -> Result<Self, ModelError> {
         Ok(Self {
-            http: Self::build_http()?,
+            http: shared_http()?,
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
             headers: Vec::new(),
             body_overrides: serde_json::Map::new(),
             quirks: WireQuirks::default(),
+            session_header: None,
         })
+    }
+
+    /// The header session ids go under (`session-id` by default), or `None`
+    /// to send none. Resolved once from provider configuration: a model's own
+    /// setting beats the instance's, and `"none"` at either level suppresses
+    /// the header.
+    pub fn with_session_header(mut self, header: Option<String>) -> Self {
+        self.session_header = header;
+        self
     }
 
     /// Static headers sent with every request. Callers' values override the
@@ -94,16 +126,23 @@ impl OpenAiCompatClient {
         &self.quirks
     }
 
-    fn build_http() -> Result<Client, ModelError> {
-        Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .build()
-            .map_err(ModelError::network)
+    /// Accepts either a base URL (`https://host/v1`) or the full endpoint.
+    pub(crate) fn endpoint(&self) -> String {
+        endpoint_url(&self.base_url)
     }
 
-    /// Accepts either a base URL (`https://host/v1`) or the full endpoint.
-    fn endpoint(&self) -> String {
-        endpoint_url(&self.base_url)
+    /// The per-turn headers: the configured session header, when both a name
+    /// and a session id are present. Kept separate from [`Self::headers`] so
+    /// tests can assert the wire shape without a server, and so the ordering
+    /// below stays explicit.
+    pub(crate) fn session_headers<'a>(
+        &'a self,
+        options: &'a TurnOptions,
+    ) -> Vec<(&'a str, &'a str)> {
+        match (self.session_header.as_deref(), options.session_id.as_deref()) {
+            (Some(header), Some(session_id)) => vec![(header, session_id)],
+            _ => Vec::new(),
+        }
     }
 
     /// The request body: the standard fields with `body_overrides` merged on
@@ -220,12 +259,24 @@ impl ModelClient for OpenAiCompatClient {
         let body = self.request_body(&messages, &options);
         let http = self.http.clone();
         let headers = self.headers.clone();
+        // Session headers go on after the static ones so a live session id
+        // wins over a hand-written `headers = { "session-id" = ... }` in
+        // providers.toml — the same precedence `/effort` has over
+        // `body_overrides`.
+        let session_headers: Vec<(String, String)> = self
+            .session_headers(&options)
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
         let quirks = self.quirks.clone();
 
         Box::pin(async_stream::try_stream! {
             let response = {
                 let mut request = http.post(&url).bearer_auth(&api_key);
                 for (key, value) in &headers {
+                    request = request.header(key, value);
+                }
+                for (key, value) in &session_headers {
                     request = request.header(key, value);
                 }
                 let send_result = tokio::select! {
@@ -508,6 +559,7 @@ mod tests {
         let options = |effort: Option<&str>| TurnOptions {
             effort: effort.map(str::to_string),
             tools: Vec::new(),
+            session_id: None,
         };
 
         // No effort: the field is absent entirely, not null.
@@ -541,6 +593,7 @@ mod tests {
                 parameters_json: r#"{ "type": "object" }"#,
                 read_only: true,
             }],
+            session_id: None,
         };
         let body = client.request_body(&[Message::user("hi")], &options);
         assert_eq!(body["tools"][0]["type"], "function");
@@ -709,6 +762,7 @@ mod tests {
         let options = |effort: Option<&str>| TurnOptions {
             effort: effort.map(str::to_string),
             tools: Vec::new(),
+            session_id: None,
         };
 
         // An alternative spelling renames the request field.
@@ -732,6 +786,65 @@ mod tests {
         let body = client.request_body(&[Message::user("hi")], &options(Some("high")));
         assert!(body.get("reasoning").is_none());
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn the_session_header_carries_the_turn_session_id() {
+        let options = |session_id: Option<&str>| TurnOptions {
+            effort: None,
+            tools: Vec::new(),
+            session_id: session_id.map(str::to_string),
+        };
+        let session = "0192f0c4-6a3b-7c1d-8e2f-3a4b5c6d7e8f";
+
+        // Default: the instance sends codex's `session-id` spelling.
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m")
+            .unwrap()
+            .with_session_header(Some("session-id".to_string()));
+        assert_eq!(
+            client.session_headers(&options(Some(session))),
+            vec![("session-id", session)]
+        );
+
+        // No session id this turn: no header at all, not an empty one.
+        assert!(client.session_headers(&options(None)).is_empty());
+
+        // A model that renamed the header sends the new spelling.
+        let client = client.with_session_header(Some("x-session-id".to_string()));
+        assert_eq!(
+            client.session_headers(&options(Some(session))),
+            vec![("x-session-id", session)]
+        );
+
+        // An opted-out instance sends nothing even with a session id.
+        let client = client.with_session_header(None);
+        assert!(client.session_headers(&options(Some(session))).is_empty());
+    }
+
+    #[test]
+    fn the_session_header_value_follows_the_active_session() {
+        // The point of rebuilding clients per turn: the same client config
+        // must announce whichever session the turn belongs to. Reusing one
+        // client across sessions would pin the first session's id.
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m")
+            .unwrap()
+            .with_session_header(Some("session-id".to_string()));
+        let turn = |session_id: &str| TurnOptions {
+            effort: None,
+            tools: Vec::new(),
+            session_id: Some(session_id.to_string()),
+        };
+
+        let first = "0192f0c4-6a3b-7c1d-8e2f-000000000001";
+        let second = "0192f0c4-6a3b-7c1d-8e2f-000000000002";
+        assert_eq!(
+            client.session_headers(&turn(first)),
+            vec![("session-id", first)]
+        );
+        assert_eq!(
+            client.session_headers(&turn(second)),
+            vec![("session-id", second)]
+        );
     }
 
     #[test]

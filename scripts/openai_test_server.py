@@ -121,7 +121,9 @@ def help_reply(messages: Any) -> str:
         "- `--port 0` picks an ephemeral port and prints the URL on stdout\n"
         "- `--delay` spaces the streamed tokens; `--quiet` stops request logging\n"
         "- `--model` names the fallback model; `--tool` / `--tool-arguments` "
-        "decide what `@tool` calls"
+        "decide what `@tool` calls\n"
+        "- `--dump-headers PATH` appends one JSON line per request with its "
+        "headers, so a test can assert the session header reached the wire"
     )
 
 
@@ -365,6 +367,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": {"message": f"unknown path: {self.path}"}})
             return
 
+        self._record_headers()
+
         try:
             body = self._read_json()
         except ValueError as error:
@@ -379,6 +383,22 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_stream(body)
         else:
             self._send_completion(body)
+
+    def _record_headers(self) -> None:
+        """Append this request's headers as one JSON line to `--dump-headers`.
+
+        The session header is the one thing a client can only get wrong on the
+        wire, so the smoke tests assert it here rather than trusting the body.
+        """
+        sink = getattr(self.server, "dump_headers", None)
+        if not sink:
+            return
+        record = {"path": self.path, "headers": {key: value for key, value in self.headers.items()}}
+        try:
+            with open(sink, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as error:
+            sys.stderr.write(f"codest-test-server: cannot write header dump: {error}\n")
 
     def _read_json(self) -> Any:
         try:
@@ -666,6 +686,7 @@ class TestServer(ThreadingHTTPServer):
         quiet: bool,
         tool_name: str = TOOL_NAME,
         tool_arguments: str = TOOL_ARGUMENTS,
+        dump_headers: str | None = None,
     ) -> None:
         super().__init__(address, ChatHandler)
         self.delay = delay
@@ -673,6 +694,9 @@ class TestServer(ThreadingHTTPServer):
         self.quiet = quiet
         self.tool_name = tool_name
         self.tool_arguments = tool_arguments
+        # Where to append one JSON line per request with its headers; the
+        # smoke tests read it to prove the session header reaches the wire.
+        self.dump_headers = dump_headers
 
 
 def main() -> int:
@@ -703,6 +727,12 @@ def main() -> int:
         default=TOOL_ARGUMENTS,
         help='JSON arguments for the `@tool` call (default: the ping-shaped object)',
     )
+    parser.add_argument(
+        "--dump-headers",
+        default=None,
+        metavar="PATH",
+        help="append one JSON line per request with its headers (for header assertions)",
+    )
     args = parser.parse_args()
 
     server = TestServer(
@@ -712,6 +742,7 @@ def main() -> int:
         quiet=args.quiet,
         tool_name=args.tool,
         tool_arguments=args.tool_arguments,
+        dump_headers=args.dump_headers,
     )
     host, port = server.server_address[:2]
     print(f"codest test server listening on http://{host}:{port}/v1", flush=True)

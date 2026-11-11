@@ -34,6 +34,7 @@ pub mod providers;
 pub mod reasoning;
 pub mod rollout;
 pub mod session;
+pub mod session_id;
 pub mod sessions;
 pub mod sse;
 pub mod tokens;
@@ -58,6 +59,7 @@ pub use providers::{
 pub use reasoning::{DEFAULT_EFFORT_LEVELS, EFFORT_COMMAND, REASONING_COMMANDS, THINKING_COMMAND};
 pub use rollout::{LoadedSession, RolloutItem, RolloutWriter, SessionMeta};
 pub use session::{AgentSession, SessionBootstrap};
+pub use session_id::{is_session_id, new_session_id};
 pub use sessions::SESSION_COMMANDS;
 pub use context::CONTEXT_COMMANDS;
 pub use tokens::{context_percent, format_context_usage, format_tokens};

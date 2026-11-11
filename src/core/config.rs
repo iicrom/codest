@@ -33,8 +33,9 @@ use crate::core::rollout::codest_home;
 /// The provider vocabulary lives in the contract crate so an external plugin
 /// can name it. The host keeps this path as the historical import site.
 pub use cst_plugin_api::config::{
-    DEFAULT_EFFORT_FIELD, DEFAULT_PROTOCOL, DEFAULT_THINKING_FIELD, EFFORT_FIELD_NONE, ModelInfo,
-    ProviderInstance, WireQuirks, expand_env_template, toml_table_to_json_map, toml_to_json,
+    DEFAULT_EFFORT_FIELD, DEFAULT_PROTOCOL, DEFAULT_SESSION_HEADER, DEFAULT_THINKING_FIELD,
+    EFFORT_FIELD_NONE, ModelInfo, ProviderInstance, SESSION_HEADER_NONE, WireQuirks,
+    expand_env_template, resolve_session_header, toml_table_to_json_map, toml_to_json,
 };
 
 /// `config.toml` — global settings.
@@ -458,9 +459,75 @@ effort_filed = "reasoning"
         let quirks = WireQuirks {
             thinking_fields: Vec::new(),
             effort_field: "thinking".to_string(),
+            ..Default::default()
         };
         assert!(quirks.validate().is_ok(), "free-form field names are the point");
         assert!(WireQuirks::default().validate().is_ok());
+    }
+
+    #[test]
+    fn session_header_defaults_on_and_can_be_turned_off() {
+        // Default: every instance announces its session under codex's
+        // spelling, so `opencode-go` and friends can route and cache per
+        // conversation without configuration.
+        let quirks = WireQuirks::default();
+        assert_eq!(quirks.session_header, DEFAULT_SESSION_HEADER);
+        assert_eq!(quirks.session_header_name(), Some("session-id"));
+
+        // `none` opts the instance out entirely.
+        let quirks = WireQuirks {
+            session_header: SESSION_HEADER_NONE.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(quirks.session_header_name(), None);
+        assert!(quirks.validate().is_ok(), "opting out is not an error");
+
+        // An empty name is a typo, not an opt-out.
+        let quirks = WireQuirks {
+            session_header: "  ".to_string(),
+            ..Default::default()
+        };
+        assert!(quirks.validate().is_err());
+    }
+
+    #[test]
+    fn a_models_session_header_overrides_the_instances() {
+        let quirks = WireQuirks::default();
+
+        // Inherit the instance setting.
+        assert_eq!(resolve_session_header(&quirks, None), Some("session-id"));
+
+        // Rename it for this model only.
+        assert_eq!(
+            resolve_session_header(&quirks, Some("x-session-id")),
+            Some("x-session-id")
+        );
+
+        // A model can opt out even when the instance sends one.
+        assert_eq!(
+            resolve_session_header(&quirks, Some(SESSION_HEADER_NONE)),
+            None
+        );
+
+        // And a model can opt in on an opted-out instance.
+        let off = WireQuirks {
+            session_header: SESSION_HEADER_NONE.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_session_header(&off, None), None);
+        assert_eq!(
+            resolve_session_header(&off, Some("session-id")),
+            Some("session-id")
+        );
+    }
+
+    #[test]
+    fn providers_toml_without_a_session_header_still_parses() {
+        // The field is additive: configurations written before it existed
+        // keep loading, and get the default (send `session-id`).
+        let parsed: WireQuirks = toml::from_str("effort_field = \"reasoning\"").expect("parse");
+        assert_eq!(parsed.session_header, DEFAULT_SESSION_HEADER);
+        assert_eq!(parsed.effort_field, "reasoning");
     }
 
     #[test]

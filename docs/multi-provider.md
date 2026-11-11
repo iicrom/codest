@@ -93,7 +93,28 @@ base_url = "http://127.0.0.1:8080/v1"
 api_key = "test"
 headers = { "X-Custom-Header" = "value" }      # 静态请求头：多数"特殊端点"免插件
 body_overrides = { temperature = 0.5 }          # 请求体字段覆盖（覆盖标准字段）
+
+[[providers]]
+name = "opencode-go"
+base_url = "https://opencode.ai/inference/go/v1"
+api_key = "$OPENCODE_KEY"
+wire = { session_header = "session-id" }        # 缺省值，写出来只是显式
+
+  [[providers.models]]
+  id = "opencode-go/gpt-5"
+  session_header = "none"                       # 只对这个模型关闭 session 头
 ```
+
+会话头（`wire.session_header` / `models.session_header`）：
+
+| 配置 | 效果 |
+| --- | --- |
+| 都不写 | 每个请求带 `session-id: <会话 uuid>`——**缺省即发送**，codex 的拼写，OpenCode 的 console 与网关认这个头 |
+| `wire = { session_header = "x-session-id" }` | 该实例改用别的头名（有的网关只认自己的拼写） |
+| `wire = { session_header = "none" }` | 该实例完全不发 session 头（端点拒绝未知头时用） |
+| 单个 `[[providers.models]]` 写 `session_header` | 覆盖实例设置；写 `"none"` 只关掉这一个模型 |
+
+头的**取值**是当前会话的 id，随会话切换而变，所以不能写死在 `headers` 里；`headers` 里手写的同名项会被它覆盖（与 `/effort` 覆盖 `body_overrides` 的优先级一致）。设计背景见 [`session-id.md`](session-id.md)。
 
 规则：
 

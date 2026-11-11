@@ -25,6 +25,15 @@ pub const DEFAULT_EFFORT_FIELD: &str = "reasoning_effort";
 /// The `wire.effort_field` value that never sends the per-turn effort, for
 /// endpoints that reject unknown request fields outright.
 pub const EFFORT_FIELD_NONE: &str = "none";
+/// The request header that carries the session id by default.
+///
+/// This is codex's spelling, and the one OpenCode's console accepts from
+/// codex-style clients: one stable value per conversation, reused across every
+/// request so the upstream can route consistently and reuse its prompt cache.
+pub const DEFAULT_SESSION_HEADER: &str = "session-id";
+/// The `wire.session_header` / `models.session_header` value that never sends
+/// the session header, for endpoints that reject unknown headers.
+pub const SESSION_HEADER_NONE: &str = "none";
 
 /// One model of a provider: an id plus optional display metadata. The fields
 /// beyond `id` are advisory — `reasoning` and `default_level` feed `/effort`,
@@ -46,6 +55,11 @@ pub struct ModelInfo {
     /// API alike.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_level: Option<String>,
+    /// Overrides the instance's `wire.session_header` for this model: a
+    /// header name, or [`SESSION_HEADER_NONE`] to send no session header at
+    /// all. `None` inherits the instance setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_header: Option<String>,
 }
 
 impl ModelInfo {
@@ -57,6 +71,7 @@ impl ModelInfo {
             context_window: None,
             reasoning: None,
             default_level: None,
+            session_header: None,
         }
     }
 
@@ -72,11 +87,12 @@ impl ModelInfo {
 ///
 /// The vocabulary is deliberately small and free-form: providers invent new
 /// spellings faster than an enum can follow, and a field name is data, not
-/// logic. `WireQuirks` covers only the two points where the wire shape has no
-/// safe fallback — which delta field carries reasoning text, and where the
-/// per-turn effort goes. Everything else (usage token spellings, context
-/// window spellings, request body fixes) is already tolerated in code or
-/// expressible through [`ProviderInstance::body_overrides`].
+/// logic. `WireQuirks` covers only the points where the wire shape has no
+/// safe fallback — which delta field carries reasoning text, where the
+/// per-turn effort goes, and which header carries the session id. Everything
+/// else (usage token spellings, context window spellings, request body fixes)
+/// is already tolerated in code or expressible through
+/// [`ProviderInstance::body_overrides`].
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WireQuirks {
@@ -86,6 +102,10 @@ pub struct WireQuirks {
     /// The top-level request field that carries the per-turn effort selected
     /// with `/effort`. [`EFFORT_FIELD_NONE`] never sends the field.
     pub effort_field: String,
+    /// The request header that carries this session's id on every request.
+    /// [`SESSION_HEADER_NONE`] never sends it. A model's own
+    /// [`ModelInfo::session_header`] overrides this per model.
+    pub session_header: String,
 }
 
 impl Default for WireQuirks {
@@ -93,6 +113,7 @@ impl Default for WireQuirks {
         Self {
             thinking_fields: vec![DEFAULT_THINKING_FIELD.to_string()],
             effort_field: DEFAULT_EFFORT_FIELD.to_string(),
+            session_header: DEFAULT_SESSION_HEADER.to_string(),
         }
     }
 }
@@ -105,12 +126,41 @@ impl WireQuirks {
         if self.effort_field.trim().is_empty() {
             return Err("wire.effort_field must not be empty".to_string());
         }
+        if self.session_header.trim().is_empty() {
+            return Err("wire.session_header must not be empty".to_string());
+        }
         for field in &self.thinking_fields {
             if field.trim().is_empty() {
                 return Err("wire.thinking_fields entries must not be empty".to_string());
             }
         }
         Ok(())
+    }
+
+    /// The header name session ids are sent under, or `None` when this
+    /// instance opted out. Applied over [`Self::session_header`] by a model's
+    /// own `session_header` when it declares one.
+    pub fn session_header_name(&self) -> Option<&str> {
+        let name = self.session_header.trim();
+        (!name.is_empty() && name != SESSION_HEADER_NONE).then_some(name)
+    }
+}
+
+/// Resolve the session header name for one model of an instance: the model's
+/// own `session_header` wins over the instance's `wire.session_header`, and
+/// [`SESSION_HEADER_NONE`] at either level suppresses it.
+///
+/// Lives here rather than in the host so a protocol plugin resolves it the
+/// same way the built-in `openai-compat` factory does.
+pub fn resolve_session_header<'a>(
+    quirks: &'a WireQuirks,
+    model_header: Option<&'a str>,
+) -> Option<&'a str> {
+    match model_header.map(str::trim) {
+        Some(SESSION_HEADER_NONE) => None,
+        Some(name) if !name.is_empty() => Some(name),
+        Some(_) => quirks.session_header_name(),
+        None => quirks.session_header_name(),
     }
 }
 
