@@ -2641,6 +2641,35 @@ impl App {
                         self.submit_user_turn(text);
                     }
                 }
+                PluginEffect::ContinueTurn => {
+                    // `/continue`: drive the active transcript without a new
+                    // user message — the recovery path for an interrupted
+                    // turn. Like `SubmitUserTurn`, honored only while the
+                    // agent is idle; refused with the same guidance a message
+                    // gets when no usable route exists. Nothing is appended:
+                    // the model picks up where the transcript stands.
+                    if self.busy {
+                        continue;
+                    }
+                    if self.route.is_none() {
+                        let guidance = if self.pool.registry().instances().is_empty() {
+                            crate::core::providers::NO_MODEL_GUIDANCE.to_string()
+                        } else {
+                            crate::core::providers::NO_MODEL_SELECTED.to_string()
+                        };
+                        self.view_mut().history.push(HistoryCell::Error(guidance));
+                        continue;
+                    }
+                    if let Some(prompt) = self.route_guidance() {
+                        self.view_mut().history.push(HistoryCell::Error(prompt));
+                        continue;
+                    }
+                    let view = self.view_mut();
+                    view.live = Some(String::new());
+                    view.follow = true;
+                    self.busy = true;
+                    self.session.continue_turn();
+                }
             }
         }
     }
@@ -4631,7 +4660,7 @@ mod tests {
         // Wide enough that the alias hints are not clipped.
         let lines = render_lines(&mut app, 110, 20);
         let rendered = lines.join("\n");
-        // Eighteen names (fourteen commands plus four aliases) share a
+        // Nineteen names (fifteen commands plus four aliases) share a
         // six-row window; the first page shows /help with its aliases and the
         // first commands, aliases labeled with the command they point at.
         assert!(rendered.contains("▸ /help"), "{rendered}");
@@ -4654,8 +4683,9 @@ mod tests {
 
         // Moving the selection pages the window onto the tail; the longest
         // command name still gets a separating space before its summary.
-        // (Ten presses put the selection on the /resume alias.)
-        for _ in 0..10 {
+        // (Eleven presses put the selection on the /resume alias; /continue
+        // sits between /status and /new.)
+        for _ in 0..11 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let lines = render_lines(&mut app, 110, 20);
@@ -4706,6 +4736,50 @@ mod tests {
             app.view().history.last(),
             Some(HistoryCell::User(text)) if text == "hello"
         ));
+    }
+
+    /// `/continue` on a model-less run gets the same guidance a refused
+    /// message gets, and once a model is active the effect starts a turn that
+    /// appends no user message — the transcript is driven as it stands.
+    #[tokio::test]
+    async fn continue_with_no_model_shows_guidance_instead_of_submitting() {
+        let mut app = test_app_without_model();
+        app.apply_effects(vec![PluginEffect::ContinueTurn]);
+
+        assert!(!app.busy);
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(text)) if text.contains("no model is configured"),
+        ));
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ModelSwitched {
+                model: "test/one".to_string(),
+            },
+        ));
+        app.apply_effects(vec![PluginEffect::ContinueTurn]);
+        assert!(app.busy);
+        assert!(app.view().live.is_some());
+        assert!(
+            !app.view()
+                .history
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::User(_))),
+            "no user message is appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_while_busy_is_ignored() {
+        let mut app = test_app();
+        app.busy = true;
+        let before = app.view().history.len();
+
+        app.apply_effects(vec![PluginEffect::ContinueTurn]);
+
+        assert!(app.busy);
+        assert_eq!(app.view().history.len(), before);
     }
 
     #[tokio::test]
@@ -5814,8 +5888,8 @@ mod tests {
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            18,
-            "fourteen commands plus four aliases"
+            19,
+            "fifteen commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -5862,9 +5936,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 17);
+        assert_eq!(app.command_selection, 18);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 16);
+        assert_eq!(app.command_selection, 17);
     }
 
     #[tokio::test]

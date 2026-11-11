@@ -602,6 +602,11 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             format!("{} has no session meta line", path.display()),
         )
     })?;
+    // A crash mid-turn can truncate the file between a calls message and its
+    // results; close the round so the restored conversation is valid on the
+    // wire. The file stays untouched — append-only, and replaying this repair
+    // is idempotent.
+    crate::core::conversation::Conversation::close_unanswered_tool_calls(&mut messages);
     Ok(LoadedSession {
         meta,
         path: path.to_path_buf(),
@@ -927,10 +932,11 @@ mod tests {
             .expect("append");
 
         let loaded = load_session(&rollout.path).expect("load");
-        // The conversation is unchanged: user, answer, tool calls.
+        // The conversation replays with the dangling round closed: user,
+        // answer, tool calls — plus the interrupted result the replay adds.
         assert_eq!(
             loaded.messages.iter().map(|m| m.role).collect::<Vec<_>>(),
-            vec![Role::User, Role::Assistant, Role::Assistant]
+            vec![Role::User, Role::Assistant, Role::Assistant, Role::Tool]
         );
         assert_eq!(
             loaded.thinking,
@@ -1259,5 +1265,56 @@ mod tests {
         assert_eq!(loaded.total_input, 0);
         assert_eq!(loaded.total_output, 0);
         assert_eq!(loaded.messages.len(), 1);
+    }
+
+    /// A crash mid-turn truncates the file between a calls message and its
+    /// results; the replay closes the round so the restored conversation is
+    /// valid on the wire. The file itself stays append-only untouched — the
+    /// repair is per replay, and a later result line completes the round.
+    #[test]
+    fn replay_closes_a_truncated_tool_round() {
+        let dir = tempdir("truncated");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "run it".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::AssistantToolCalls {
+                calls: vec![crate::core::tools::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "ping".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(
+            loaded.messages[2],
+            Message::tool_result(
+                "call_1",
+                crate::core::conversation::INTERRUPTED_TOOL_RESULT
+            )
+        );
+        assert_eq!(
+            Conversation::validate_tool_structure(&loaded.messages),
+            Ok(())
+        );
+
+        rollout
+            .append(&RolloutItem::ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: "pong".to_string(),
+            })
+            .expect("append");
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages.len(), 3);
+        assert_eq!(loaded.messages[2], Message::tool_result("call_1", "pong"));
     }
 }

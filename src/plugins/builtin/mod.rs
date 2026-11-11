@@ -5,6 +5,9 @@
 //! which order hooks run.
 
 mod clear;
+// `continue` is a keyword; the raw identifier keeps the file named after the
+// command like every other plugin here.
+mod r#continue;
 mod help;
 mod quit;
 mod status;
@@ -14,6 +17,7 @@ use crate::plugins::Plugin;
 
 pub use clear::CLEAR;
 pub use help::HELP;
+pub use r#continue::CONTINUE;
 pub use quit::QUIT;
 pub use status::STATUS;
 pub use tools::BASH;
@@ -29,6 +33,7 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &clear::CLEAR,
     &quit::QUIT,
     &status::STATUS,
+    &r#continue::CONTINUE,
     &tools::BASH,
     &tools::FS,
 ];

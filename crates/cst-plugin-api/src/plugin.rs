@@ -153,6 +153,11 @@ pub enum PluginEffect {
     SetComposer(String),
     /// Submit a new user turn, if the agent is idle.
     SubmitUserTurn(String),
+    /// Continue the active conversation without a new user message
+    /// (`/continue`): the model is driven from the transcript as it stands —
+    /// the recovery path for an interrupted turn. Honored only while the
+    /// agent is idle and a model is usable.
+    ContinueTurn,
 }
 
 /// A plugin-authored report (e.g. `/context`): a bold title over titled
@@ -361,6 +366,10 @@ impl<'a> PluginContext<'a> {
 
     pub fn submit_user_turn(&mut self, text: impl Into<String>) {
         self.effects.push(PluginEffect::SubmitUserTurn(text.into()));
+    }
+
+    pub fn continue_turn(&mut self) {
+        self.effects.push(PluginEffect::ContinueTurn);
     }
 
     /// Take the collected effects. The host calls this after dispatch.

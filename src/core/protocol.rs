@@ -17,6 +17,13 @@ pub use cst_plugin_api::message::Role;
 pub enum Op {
     /// Start one turn with a new user message.
     UserTurn { text: String },
+    /// Continue the active conversation without appending a user message:
+    /// the model is driven from the transcript as it stands. The recovery
+    /// path for an interrupted turn — a crash left a dangling user message,
+    /// a tool round without its results, or an abort cut the last answer
+    /// short. Answered like `UserTurn` (`TurnStarted` … `TurnComplete`), or
+    /// an `Error` plus `TurnComplete` when there is nothing to continue.
+    ContinueTurn,
     /// Drop the transcript, keeping the system prompt.
     ClearConversation,
     /// Cancel the in-flight turn, keeping any text streamed so far.

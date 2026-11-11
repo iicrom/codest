@@ -356,7 +356,9 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
                 checks = {
                     "no model footer": "codest · no model" in screen,
                     "no model banner": "backend: no model" in raw_after,
-                    "commands work": "/clear" in screen and "/quit" in screen,
+                    # The /help notice is taller than a fixed-size grid shows;
+                    # the raw capture holds the whole thing.
+                    "commands work": "/clear" in raw_after and "/quit" in raw_after,
                     "guidance on send": "no model is configured" in screen,
                     "composer preserved": "› hello from pty" in screen,
                     "idle state": "ready" in screen,
@@ -365,7 +367,7 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
             else:
                 checks = {
                     "partial footer": "codest · untitled/test-model" in screen,
-                    "commands work": "/clear" in screen and "/quit" in screen,
+                    "commands work": "/clear" in raw_after and "/quit" in raw_after,
                     "guidance names missing key": "missing `api_key`" in screen,
                     "composer preserved": "› hello from pty" in screen,
                     "idle state": "ready" in screen,

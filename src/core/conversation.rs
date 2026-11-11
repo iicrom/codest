@@ -18,6 +18,13 @@ use crate::core::protocol::Role;
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "You are codest, a concise and helpful terminal assistant. Answer in the user's language.";
 
+/// The result recorded for a tool call whose turn ended before the call did:
+/// an abort between the calls message and its results, and a rollout file
+/// truncated the same way. The model reads it on the next turn and can react
+/// to the interruption instead of the shape being rejected on the wire.
+pub const INTERRUPTED_TOOL_RESULT: &str =
+    "interrupted: the session ended before this tool call finished";
+
 /// One reversible context modification: the inverse of a `delete_at` or
 /// `edit_content`, recorded automatically so [`Conversation::undo_last_edit`]
 /// can restore it. Entries are LIFO — each one was computed against the
@@ -103,6 +110,13 @@ impl Conversation {
 
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Mutable access to the transcript, for repairs that append to it
+    /// (`close_unanswered_tool_calls` after an abort). The system prompt
+    /// stays private.
+    pub fn messages_mut(&mut self) -> &mut Vec<Message> {
+        &mut self.messages
     }
 
     pub fn is_empty(&self) -> bool {
@@ -232,6 +246,48 @@ impl Conversation {
             }
         }
         Ok(())
+    }
+
+    /// Append a `tool` result for every tool call that has none, directly
+    /// after each round's answered results, and return the appended
+    /// `(id, content)` pairs. Only an interrupted turn can leave calls
+    /// unanswered — results follow their calls immediately, and `/context`
+    /// edits may not break the shape — but the walk mirrors
+    /// [`Conversation::validate_tool_structure`], so every gap it would
+    /// reject gets closed.
+    pub fn close_unanswered_tool_calls(messages: &mut Vec<Message>) -> Vec<(String, String)> {
+        let mut closed = Vec::new();
+        let mut index = 0;
+        while index < messages.len() {
+            if messages[index].role != Role::Assistant {
+                index += 1;
+                continue;
+            }
+            let Some(calls) = messages[index].tool_calls.clone().filter(|calls| !calls.is_empty())
+            else {
+                index += 1;
+                continue;
+            };
+            // Walk the round's results; whatever is still pending after them
+            // was never answered.
+            let mut pending: BTreeSet<String> =
+                calls.iter().map(|call| call.id.clone()).collect();
+            let mut cursor = index + 1;
+            while cursor < messages.len() && messages[cursor].role == Role::Tool {
+                if let Some(id) = &messages[cursor].tool_call_id {
+                    pending.remove(id);
+                }
+                cursor += 1;
+            }
+            for id in &pending {
+                let pair = (id.clone(), INTERRUPTED_TOOL_RESULT.to_string());
+                messages.insert(cursor, Message::tool_result(pair.0.clone(), pair.1.clone()));
+                cursor += 1;
+                closed.push(pair);
+            }
+            index = cursor;
+        }
+        closed
     }
 }
 
@@ -464,5 +520,58 @@ mod tests {
             Ok(())
         );
         assert_eq!(conv.len(), 4);
+    }
+
+    /// An interrupted turn leaves its calls unanswered; the repair closes the
+    /// round with an explicit interrupted result and keeps the wire shape.
+    #[test]
+    fn close_unanswered_tool_calls_repairs_a_dangling_round() {
+        let mut messages = vec![
+            Message::user("hi"),
+            Message::assistant_tool_calls(vec![call("call_1")]),
+        ];
+        let closed = Conversation::close_unanswered_tool_calls(&mut messages);
+
+        assert_eq!(closed, vec![("call_1".to_string(), INTERRUPTED_TOOL_RESULT.to_string())]);
+        assert_eq!(
+            messages[2],
+            Message::tool_result("call_1", INTERRUPTED_TOOL_RESULT)
+        );
+        assert_eq!(
+            Conversation::validate_tool_structure(&messages),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn close_unanswered_tool_calls_leaves_complete_rounds_alone() {
+        let mut messages = vec![
+            Message::user("hi"),
+            Message::assistant_tool_calls(vec![call("call_1")]),
+            Message::tool_result("call_1", "pong"),
+            Message::assistant("done"),
+        ];
+        let snapshot = messages.clone();
+        assert!(Conversation::close_unanswered_tool_calls(&mut messages).is_empty());
+        assert_eq!(messages, snapshot);
+    }
+
+    /// A round with several calls may have been cut off after only some of
+    /// them were answered; the rest get their result after the answered ones.
+    #[test]
+    fn close_unanswered_tool_calls_answers_only_the_missing_ids() {
+        let mut messages = vec![
+            Message::user("hi"),
+            Message::assistant_tool_calls(vec![call("call_1"), call("call_2")]),
+            Message::tool_result("call_2", "pong"),
+        ];
+        let closed = Conversation::close_unanswered_tool_calls(&mut messages);
+
+        assert_eq!(closed, vec![("call_1".to_string(), INTERRUPTED_TOOL_RESULT.to_string())]);
+        assert_eq!(messages[3], Message::tool_result("call_1", INTERRUPTED_TOOL_RESULT));
+        assert_eq!(
+            Conversation::validate_tool_structure(&messages),
+            Ok(())
+        );
     }
 }

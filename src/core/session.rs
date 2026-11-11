@@ -261,6 +261,13 @@ impl AgentSession {
         self.submit(Op::UserTurn { text: text.into() })
     }
 
+    /// Continue the active conversation without a new user message (`/continue`):
+    /// the recovery path for an interrupted turn. The result arrives like a
+    /// `UserTurn`'s, or an error event when there is nothing to continue.
+    pub fn continue_turn(&self) -> String {
+        self.submit(Op::ContinueTurn)
+    }
+
     /// Drop the conversation history, keeping the system prompt.
     pub fn clear_conversation(&self) -> String {
         self.submit(Op::ClearConversation)
@@ -775,6 +782,75 @@ async fn run_worker(
                                 .to_string(),
                         },
                     ));
+                    continue;
+                };
+                let stream = client.stream_chat(
+                    sessions[current].snapshot(),
+                    TurnOptions {
+                        effort: effort.clone(),
+                        tools: declared_tools(&tools, &session_tools[current]),
+                        session_id: rollouts.id(current).map(str::to_string),
+                    },
+                    cancel.clone(),
+                );
+                let _ = tx.send(Event::new(submission.id.clone(), EventMsg::TurnStarted));
+                active = Some(ActiveTurn {
+                    id: submission.id,
+                    stream,
+                    cancel,
+                    assistant: String::new(),
+                    usage: None,
+                    model: backend
+                        .selection()
+                        .map(|selection| selection.as_str().to_string()),
+                    thinking: String::new(),
+                    thinking_started: None,
+                });
+            }
+            Op::ContinueTurn => {
+                // The same two stops as a user turn: guidance instead of a
+                // doomed request — non-TUI front-ends rely on this guard.
+                let blocked = match &backend {
+                    ModelBackend::Empty { .. } => {
+                        Some(crate::core::providers::NO_MODEL_GUIDANCE.to_string())
+                    }
+                    ModelBackend::Pooled { pool, current, .. } => {
+                        pool.missing_credential(&current.provider)
+                    }
+                    ModelBackend::Fixed(_) => None,
+                };
+                if let Some(message) = blocked {
+                    let _ = tx.send(Event::new(submission.id.clone(), EventMsg::Error { message }));
+                    // Paired with TurnComplete so a front-end that marked the
+                    // turn as running eagerly (the TUI does) unblocks.
+                    let _ = tx.send(Event::new(submission.id, EventMsg::TurnComplete));
+                    continue;
+                }
+                if sessions[current].is_empty() {
+                    let _ = tx.send(Event::new(
+                        submission.id.clone(),
+                        EventMsg::Error {
+                            message: "nothing to continue: this session has no messages yet"
+                                .to_string(),
+                        },
+                    ));
+                    let _ = tx.send(Event::new(submission.id, EventMsg::TurnComplete));
+                    continue;
+                }
+                // No user message is appended: the transcript is driven as it
+                // stands — a dangling user message left by a crash, an
+                // unanswered tool round (closed at replay), or an answer an
+                // abort cut short.
+                let cancel = CancellationToken::new();
+                let Ok(client) = backend.client() else {
+                    let _ = tx.send(Event::new(
+                        submission.id.clone(),
+                        EventMsg::Error {
+                            message: "the active model selection is no longer available"
+                                .to_string(),
+                        },
+                    ));
+                    let _ = tx.send(Event::new(submission.id, EventMsg::TurnComplete));
                     continue;
                 };
                 let stream = client.stream_chat(
@@ -1476,6 +1552,20 @@ fn finalize_aborted(
     current: usize,
     tx: &mpsc::UnboundedSender<Event>,
 ) {
+    // An abort between the calls message and its results leaves the round
+    // unanswered, which the endpoint rejects on the next request. Close it
+    // with an explicit interrupted result — in the conversation and the
+    // rollout alike, so a replay sees the same shape. A no-op for an abort
+    // during streaming (no calls pending).
+    for (id, content) in Conversation::close_unanswered_tool_calls(conversation.messages_mut()) {
+        rollouts.append(
+            current,
+            RolloutItem::ToolResult {
+                tool_call_id: id,
+                content,
+            },
+        );
+    }
     if !turn.assistant.is_empty() {
         // Reasoning is recorded only alongside the text it preceded: with no
         // assistant message to attach it to, a resumed session would show it
@@ -1943,6 +2033,124 @@ mod tests {
             ]
         ));
         assert_eq!(seen.lock().expect("lock").len(), 1);
+    }
+
+    /// `/continue` on an empty conversation refuses instead of driving the
+    /// model. Error and TurnComplete travel together so a front-end that
+    /// marked the turn as running eagerly unblocks.
+    #[tokio::test]
+    async fn continue_on_an_empty_conversation_errors_without_a_request() {
+        let client = RecordingClient::new();
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn(Arc::new(client));
+
+        session.continue_turn();
+        let events = collect_turn(&mut session).await;
+
+        let messages: Vec<&EventMsg> = events.iter().map(|event| &event.msg).collect();
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                EventMsg::Error { .. },
+                EventMsg::TurnComplete
+            ]
+        ));
+        assert!(seen.lock().expect("lock").is_empty());
+    }
+
+    /// A continue drives the transcript as it stands: no user message is
+    /// appended, so the model sees exactly the context the last turn ended
+    /// with — the recovery path for a dangling user message after a crash.
+    #[tokio::test]
+    async fn continue_drives_the_transcript_without_a_new_user_message() {
+        let client = RecordingClient::new();
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn(Arc::new(client));
+
+        session.submit_user_turn("hello");
+        collect_turn(&mut session).await;
+        session.continue_turn();
+        collect_turn(&mut session).await;
+
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 2, "one request per turn");
+        // The second request carries the first turn's context plus its reply
+        // — and no second copy of the user message.
+        assert_eq!(seen[1].len(), 3); // system + user + the first reply
+        assert_eq!(seen[1][1].content, "hello");
+        assert_eq!(seen[1][2].content, "ok");
+        assert_eq!(
+            seen[1].iter().filter(|message| message.role == Role::User).count(),
+            1
+        );
+    }
+
+    /// An abort during a tool call closes the unanswered round with an
+    /// explicit interrupted result — in the conversation (the next request
+    /// stays wire-valid) and in the rollout file.
+    #[tokio::test]
+    async fn an_abort_mid_tool_call_closes_the_round_with_an_interrupted_result() {
+        use std::sync::atomic::Ordering;
+
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = ScriptedClient::new(vec![vec![StreamItem::ToolCalls(vec![tool_call(
+            "c1", "ping",
+        )])]]);
+        let dir = tempdir("abort-repair");
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(GateExecutor {
+                    entered,
+                    release: release.clone(),
+                })),
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        entered_rx.recv().await.expect("the tool started");
+        session.interrupt();
+        release.store(true, Ordering::SeqCst);
+        collect_turn(&mut session).await;
+
+        // The transcript ends with the interrupted result, keeping the shape
+        // the endpoint accepts.
+        session.inspect_conversation();
+        let event = session.next_event().await.expect("snapshot event");
+        let messages = match event.msg {
+            EventMsg::ConversationSnapshot { messages } => messages,
+            other => panic!("expected a conversation snapshot, got {other:?}"),
+        };
+        assert_eq!(messages.len(), 4); // system + user + calls + interrupted result
+        assert_eq!(
+            messages[3],
+            Message::tool_result(
+                "c1",
+                crate::core::conversation::INTERRUPTED_TOOL_RESULT
+            )
+        );
+        assert_eq!(
+            Conversation::validate_tool_structure(&messages[1..]),
+            Ok(())
+        );
+
+        // The rollout file recorded the same closure, so a replay sees the
+        // identical transcript.
+        let loaded = crate::core::rollout::load_workspace_sessions(&dir).expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].messages[2],
+            Message::tool_result(
+                "c1",
+                crate::core::conversation::INTERRUPTED_TOOL_RESULT
+            )
+        );
     }
 
     #[tokio::test]

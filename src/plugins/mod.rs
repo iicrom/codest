@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "clear", "quit", "status", "new", "rename", "sessions",
+                "help", "clear", "quit", "status", "continue", "new", "rename", "sessions",
                 "model", "provider", "effort", "thinking", "profile", "tools", "context"
             ]
         );
@@ -969,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_and_quit_are_effects() {
+    fn clear_quit_and_continue_are_effects() {
         // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
         // must not break the shipped-table assertion.
         let host = PluginHost::shipped().expect("shipped plugins");
@@ -980,6 +980,10 @@ mod tests {
         assert_eq!(
             host.dispatch_command(&invocation(&host, "/quit"), info(&host)),
             vec![PluginEffect::Quit]
+        );
+        assert_eq!(
+            host.dispatch_command(&invocation(&host, "/continue"), info(&host)),
+            vec![PluginEffect::ContinueTurn]
         );
     }
 

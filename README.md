@@ -273,6 +273,7 @@ python3 scripts/markdown_smoke.py
 | `/new` | — | 归档当前对话，开启一个新的空会话 |
 | `/rename <name>` | — | 重命名当前会话；默认名取该会话第一句用户输入 |
 | `/sessions` | `/resume` | 打开会话列表菜单，切换并继续以前的会话 |
+| `/continue` | — | 不追加用户消息，直接从当前 transcript 续跑当前会话；异常中断（崩溃、Ctrl+C 打断）后的恢复入口，详见 [`docs/session-continue.md`](docs/session-continue.md) |
 | `/model` | — | 打开模型菜单，在 `provider/model` 之间切换（见"多 Provider"） |
 | `/provider` | — | 打开 provider 向导：新增 OpenAI 兼容端点、登录插件贡献的 provider、查看已配置列表（见"`/provider`"） |
 | `/effort [level]` | — | 查看或设置模型推理等级：无参数打开 `↑`/`↓` 选择菜单，`/effort <level>` 直接设置，`off` 清除；随请求以 `reasoning_effort` 字段发送。等级表来自模型的 `reasoning` 声明或 models API 的 `default_level`（选中模型时自动采纳为初始值） |
@@ -297,9 +298,10 @@ codest 支持多轮独立对话：会话按创建顺序编号（从 1 开始）�
 | `/new` | 归档当前会话，开启一个新的空会话并切换过去 |
 | `/rename <name>` | 重命名当前会话，用于会话列表展示 |
 | `/sessions`（`/resume`） | 打开会话列表菜单：`↑`/`↓` 选择、`Enter` 切换并继续、`Esc` 关闭 |
+| `/continue` | 不切换会话、不重发消息，直接从当前 transcript 续跑——异常中断后的恢复入口（见下） |
 
 - 会话默认以该会话的第一句用户输入命名（参考 dsh），`/rename` 可以随时改名。
-- 同一时刻只有一个会话在生成；生成中的输入会被忽略，`/new` 与 `/sessions` 都要在回合结束后使用（必要时先 `Esc` 中断）。
+- 同一时刻只有一个会话在生成；生成中的输入会被忽略，`/new`、`/sessions` 与 `/continue` 都要在回合结束后使用（必要时先 `Esc` 中断）。
 - 切换会恢复该会话的模型上下文，后续对话继续在原历史上进行；`/clear` 只影响当前会话。
 - 会话列表每行显示会话名、记录条数，当前会话标有 `current`。
 - `/new`、`/rename` 与 `/sessions` 是本体常驻命令，不属于插件系统。
@@ -318,6 +320,8 @@ codest 支持多轮独立对话：会话按创建顺序编号（从 1 开始）�
 codest --continue        # 直接激活最近一次保存的会话（-c 等价）
 codest --resume          # 同 --continue，并在启动时打开会话选择菜单
 ```
+
+- 进程已经运行时的恢复入口是内置插件命令 `/continue`：不切换会话、不重发消息，直接从当前 transcript 续跑。被中断的工具轮会在打断时（Ctrl+C）与回放时各补一行显式的 `interrupted` 工具结果，保证下一次请求的 wire 形状合法；文件本身仍是 append-only，不做改写。语义与实现详见 [`docs/session-continue.md`](docs/session-continue.md)；
 
 ### 会话 id 与 session 头
 
@@ -349,11 +353,11 @@ codest 的指令和生命周期扩展都来自**编译期链接**的插件，不
 
 - 插件是普通的 Rust 模块，注册表是 `src/plugins/builtin/mod.rs` 里的一个 `static` 切片；注册顺序就是钩子执行顺序和菜单顺序。
 - 插件可以贡献 slash 命令、系统提示词片段、`on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` 钩子、工具（`tools()` 声明 + `run_tool()` 执行），以及多 Provider 的协议工厂（`protocols()`，见"多 Provider"）。
-- 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、报告块、清屏、退出、设置输入框、提交新回合），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
+- 插件不直接操作终端或会话，只返回 `PluginEffect`（通知、错误、报告块、清屏、退出、设置输入框、提交新回合、续跑当前会话），由 TUI 统一应用；因此插件代码不依赖 ratatui，也可以被其他前端复用。
 - 重复插件 id、重复命令名/别名、重复工具名、非法命令名会在启动时被拒绝。
 - 外部插件（第三方仓库）通过 `codest plugin install` 装进一个仓库外生成的 wrapper crate，不需要改动本仓库；`PluginHost::shipped()` 始终只含内置插件，是测试用的稳定表。
 
-内置的 `/help`、`/clear`、`/quit`、`/status`、`/context` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)；外部插件的安装与契约版本规则见 [`docs/local-plugins.md`](docs/local-plugins.md)。
+内置的 `/help`、`/clear`、`/quit`、`/status`、`/continue`、`/context` 本身就是插件，可以作为示例。完整契约、执行顺序、错误处理和“新增插件”的完整代码见 [`docs/plugins.md`](docs/plugins.md)；外部插件的安装与契约版本规则见 [`docs/local-plugins.md`](docs/local-plugins.md)。
 
 新增插件的最小步骤：
 
@@ -465,7 +469,8 @@ codest/
     │       ├── help.rs      # /help
     │       ├── clear.rs     # /clear
     │       ├── quit.rs      # /quit
-    │       └── status.rs    # /status
+    │       ├── status.rs    # /status
+    │       └── continue.rs  # /continue（异常中断后续跑当前会话）
     └── tui/
         ├── app.rs           # 事件循环 / fullscreen & inline 渲染 / /model 菜单
         ├── session.rs       # 每会话视图状态（SessionView）
@@ -483,7 +488,7 @@ codest/
 - Markdown 渲染是精简版：没有 OSC 8 超链接、表格的 key/value 降级、mermaid 和数学公式；图片只显示 alt 文本和地址。代码块有语法高亮（见"回答的 Markdown 渲染"）。
 - 插件是编译期静态链接的：新增/修改插件需要改代码并重新编译，不支持运行时加载 `.so` 或脚本插件；插件与主程序同权限，没有沙箱隔离。
 - 插件钩子在 TUI 线程同步执行，不能做阻塞 I/O。
-- 会话按 rollout 保存在 `~/.codest/sessions/<工作区哈希>/`（`CODEST_HOME` 可覆盖），跨次启动可用 `--continue` / `--resume` 恢复；没有并发写锁（同时开多个 codest 写同一工作区没有保护）、没有归档/删除/搜索，也没有跨工作区的会话迁移。
+- 会话按 rollout 保存在 `~/.codest/sessions/<工作区哈希>/`（`CODEST_HOME` 可覆盖），跨次启动可用 `--continue` / `--resume` 恢复，进程内异常中断可用 `/continue` 直接续跑当前会话（被中断的工具轮以显式 interrupted 结果封口，见 [`docs/session-continue.md`](docs/session-continue.md)）；没有并发写锁（同时开多个 codest 写同一工作区没有保护）、没有归档/删除/搜索，也没有跨工作区的会话迁移。
 - 没有网络重试、代理、认证刷新；HTTP 客户端只实现一次请求 + SSE 增量解析。API key 支持 `$VAR` 模板引用环境变量，但没有 OAuth/凭据存储，token 轮换需在协议工厂内部自行解决。
 - 没有外网也能玩：`protocol = "test"` 提供进程内 echo 后端；真实端点仍需 API key 或先启动 `scripts/openai_test_server.py`。
 - 思考内容（`reasoning_content`）在回答上方渲染为一张 thinking 卡片（表头 `⚓ thinking · 4.2s` 用专属紫色，斜体正文挂在 `│` 轨道下；卡片版式参照 cordis-harness-tui），`/thinking` 随时折叠/展开；`/effort` 以 `reasoning_effort` 字段随请求发送（等级表取模型声明的 `reasoning`，未声明时用内置默认集）。模型元数据可带 `default_level`（providers.toml 声明或 models API 返回均可）：选中该模型时自动作为初始推理等级，footer 常显当前值。footer 常显上下文窗口与用量：有 `context_window` 时总长始终显示（测量前 `—/100.0k`，测量后 `13.0k/100.0k (6%)`，占用 ≥90% 变强调色；无窗口只显示 `13.0k tok`），`/model` 菜单每行列出各自的窗口长度，`/status` 输出用量、窗口与会话累计；models API 的 `context_length`/`context_window` 字段会自动填充 `ModelInfo::context_window`。每轮完成的模型与 usage 以 `turn_usage` 变体写入 rollout（后端未报 usage 的轮次不记录），`/clear` 一并重置；`--continue`/`--resume` 回放为初始统计（含最后使用的模型选择：provider 已不在配置中时保持当前选择并提示），恢复的会话立即显示上下文占用，会话间切换同样恢复该会话的模型（已在位时不重复切换）。它同时作为显示元数据写进 rollout（`assistant_reasoning`，紧随其后的 assistant 消息之前），`--continue`/`--resume` 恢复会话时 thinking 卡片一并回放；但它不进模型上下文——模型不会看到自己被回放的思考。
