@@ -14,6 +14,16 @@ pub const WARNING: Color = Color::Yellow;
 pub const SUBTLE: Color = Color::Gray;
 pub const DIM: Color = Color::DarkGray;
 
+// Tool-card category colors (the cordis-harness-tui convention: the card's
+// status dot and tool name carry the tool's category, not its outcome — the
+// outcome is the glyph itself, `●` success vs `✗` error).
+/// `bash` and other command runners.
+pub const TOOL_EXEC: Color = Color::Cyan;
+/// Read-only file tools (`read`).
+pub const TOOL_READ: Color = Color::Green;
+/// Mutating file tools (`write`, `edit`).
+pub const TOOL_MUTATE: Color = Color::Yellow;
+
 // Code-block syntax highlighting. Semantic names rather than "the color of a
 // function": each kind is one palette entry, so restyling code means editing
 // this block and `highlight::style` keeps its shape.

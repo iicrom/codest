@@ -104,7 +104,6 @@ const MAX_COMPOSER_ROWS: usize = 8;
 /// lines that produced.
 const MAX_LIVE_TAIL_ROWS: usize = 4;
 const MAX_COMMAND_MENU_ROWS: usize = 6;
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
 
@@ -552,9 +551,16 @@ struct App {
     /// whenever the set changes (the struct is `Copy`, so it cannot borrow a
     /// lazily-built `Vec`).
     enabled_tools_vec: Vec<String>,
-    /// Whether thinking output renders expanded. Global across sessions;
-    /// `/thinking` toggles it, and committed Thinking cells re-fold with it.
+    /// Whether thinking cards render expanded by default. Global across
+    /// sessions; `/thinking` toggles it, Ctrl+O expands everything, and
+    /// committed Thinking cells re-fold with the next frame.
     show_thinking: bool,
+    /// Ctrl+O's expand-everything: folded cards (thinking bodies, tool
+    /// output previews) show their full content while it is set.
+    verbose: bool,
+    /// When the current thinking stream began, for the settled card's
+    /// duration chip. Set on the first visible delta of a stream.
+    thinking_started: Option<Instant>,
     composer: Composer,
     /// Selected row in the slash-command menu.
     command_selection: usize,
@@ -713,7 +719,9 @@ impl App {
             tools,
             enabled_tools,
             enabled_tools_vec,
-            show_thinking: true,
+            show_thinking: false,
+            verbose: false,
+            thinking_started: None,
             composer: Composer::new(),
             command_selection: 0,
             command_menu_dismissed: false,
@@ -869,6 +877,7 @@ impl App {
         // Its height is capped so the pane keeps a stable size while a turn
         // streams; growth would scroll the tail into scrollback.
         let live_rows = if self.view().live.is_some()
+            || self.view().running_tool.is_some()
             || self
                 .view()
                 .live_thinking
@@ -947,6 +956,7 @@ impl App {
     /// bottom-anchored: the newest text is what the reader is watching.
     fn inline_live_tail(&self, width: usize, max_rows: usize) -> Vec<Line<'static>> {
         let view = self.view();
+        let thinking_expanded = self.show_thinking || self.verbose;
         // While reasoning with nothing visible yet, show the thinking tail.
         let thinking_only = view.live.as_ref().is_some_and(String::is_empty)
             && view
@@ -954,16 +964,27 @@ impl App {
                 .as_ref()
                 .is_some_and(|text| !text.is_empty());
         let rows = if thinking_only {
-            if self.show_thinking {
+            if thinking_expanded {
+                let frame = chat::SPINNER[self.tick % chat::SPINNER.len()];
                 view.live_thinking
                     .as_ref()
-                    .map(|text| chat::thinking_lines(text, width, self.busy))
+                    .map(|text| chat::thinking_live_lines(text, width, true, frame))
             } else {
-                Some(vec![Line::from(Span::styled(
-                    "✻ thinking…",
-                    Style::default().fg(theme::DIM),
-                ))])
+                let frame = chat::SPINNER[self.tick % chat::SPINNER.len()];
+                Some(chat::thinking_live_lines("", width, false, frame))
             }
+        } else if let Some(running) = &view.running_tool {
+            // A tool is executing: its live card fills the tail until the
+            // completion event settles it into history.
+            let elapsed = chat::format_duration(running.started_at.elapsed().as_millis() as u64);
+            let frame = chat::SPINNER[self.tick % chat::SPINNER.len()];
+            Some(chat::running_tool_lines(
+                &running.name,
+                &running.arguments,
+                &elapsed,
+                frame,
+                width,
+            ))
         } else {
             view.live.as_ref().map(|live| {
                 let (lines, settled) = chat::assistant_lines_tracked(live, width, self.busy);
@@ -981,7 +1002,13 @@ impl App {
     /// active session's view is flushed; a background view catches up when it
     /// becomes active again.
     fn take_inline_pending(&mut self, width: usize) -> Vec<Line<'static>> {
-        let thinking_expanded = self.show_thinking;
+        // The fold flags freeze per frame: a card flushes once, folded or
+        // expanded as the toggles stand right now — scrollback cannot be
+        // rewritten to honor a later Ctrl+O.
+        let display = chat::CardDisplay {
+            thinking: self.show_thinking || self.verbose,
+            tool_detail: self.verbose,
+        };
         let view = self.view_mut();
         // Inline mode has no viewport to park: the history goes to the
         // terminal's own scrollback, where a report is readable in full.
@@ -999,7 +1026,7 @@ impl App {
 
         // Transcript cells that have not been written to scrollback yet.
         while view.printed_cells < view.history.len() {
-            pending.extend(view.history[view.printed_cells].lines(width, thinking_expanded));
+            pending.extend(view.history[view.printed_cells].lines(width, &display));
             pending.push(Line::from(""));
             view.printed_cells += 1;
         }
@@ -1198,6 +1225,18 @@ impl App {
 
         match key.code {
             KeyCode::Char('c') if ctrl => self.on_ctrl_c(),
+            // Ctrl+O (the cordis convention): expand every card — thinking
+            // bodies and full tool output — or fold them all back.
+            KeyCode::Char('o') if ctrl => {
+                self.verbose = !self.verbose;
+                let notice = if self.verbose {
+                    "cards expanded"
+                } else {
+                    "cards folded"
+                };
+                let view = self.view_mut();
+                view.history.push(HistoryCell::Notice(notice.to_string()));
+            }
             KeyCode::Char('d') if ctrl => {
                 if self.composer.is_empty() {
                     self.quit = true;
@@ -2293,9 +2332,7 @@ impl App {
         let has_transcript = self.view().history.iter().any(|cell| {
             matches!(
                 cell,
-                HistoryCell::User(_)
-                    | HistoryCell::Assistant(_)
-                    | HistoryCell::ToolCall { .. }
+                HistoryCell::User(_) | HistoryCell::Assistant(_) | HistoryCell::ToolCall { .. }
             )
         });
         if !has_transcript {
@@ -2434,29 +2471,35 @@ impl App {
         self.enabled_tools_vec = self.enabled_tools.iter().cloned().collect();
     }
 
-    /// `/thinking`: fold or unfold the model's thinking output. A global
+    /// `/thinking`: fold or unfold the model's thinking cards. A global
     /// display flag — committed Thinking cells in every session re-render
-    /// with it on the next frame.
+    /// with it on the next frame. Ctrl+O additionally expands everything
+    /// ([`Self::verbose`]), folded or not.
     fn toggle_thinking(&mut self) {
         self.show_thinking = !self.show_thinking;
         let state = if self.show_thinking {
             "expanded"
         } else {
-            "collapsed"
+            "folded"
         };
         let view = self.view_mut();
         view.history
-            .push(HistoryCell::Notice(format!("thinking output {state}")));
+            .push(HistoryCell::Notice(format!("thinking cards {state}")));
     }
 
     /// Commit streamed thinking as a history cell, keeping it above the
     /// assistant message it precedes. Called when visible content starts and
-    /// when the turn finalizes; blank thinking produces no cell.
+    /// when the turn finalizes; blank thinking produces no cell. The stream's
+    /// wall-clock time rides along for the card's duration chip.
     fn commit_thinking(&mut self) {
+        let started = self.thinking_started.take();
         if let Some(text) = self.view_mut().live_thinking.take()
             && !text.trim().is_empty()
         {
-            self.view_mut().history.push(HistoryCell::Thinking(text));
+            let duration_ms = started.map(|at| at.elapsed().as_millis() as u64);
+            self.view_mut()
+                .history
+                .push(HistoryCell::Thinking { text, duration_ms });
         }
     }
 
@@ -2602,8 +2645,12 @@ impl App {
                     .push_str(&delta);
             }
             EventMsg::AgentThinkingDelta { delta } => {
-                self.view_mut()
-                    .live_thinking
+                // The duration chip is measured from the first visible delta.
+                if self.view().live_thinking.is_none() {
+                    self.thinking_started = Some(Instant::now());
+                }
+                let view = self.view_mut();
+                view.live_thinking
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
             }
@@ -2645,24 +2692,37 @@ impl App {
             EventMsg::AgentMessage { message } => {
                 self.view_mut().live = Some(message);
             }
+            EventMsg::AgentToolCallStarted { name, arguments } => {
+                // Any text streamed before the calls is complete by now:
+                // commit it so the running card renders below it. The card
+                // lives in the transcript tail (spinner + elapsed) until the
+                // completion event settles it into history.
+                self.finalize_live();
+                self.view_mut().running_tool = Some(crate::tui::session::RunningTool {
+                    name,
+                    arguments,
+                    started_at: Instant::now(),
+                });
+            }
             EventMsg::AgentToolCall {
                 name,
                 arguments,
                 result,
                 error,
+                duration_ms,
             } => {
-                // Any text streamed before the calls is complete by now:
-                // commit it so the tool activity renders below it, then show
-                // the call. The next round's deltas start a fresh live buffer.
                 self.finalize_live();
+                self.view_mut().running_tool = None;
                 self.view_mut().history.push(HistoryCell::ToolCall {
                     name,
                     arguments,
                     result,
                     error,
+                    duration_ms: Some(duration_ms),
                 });
             }
             EventMsg::TurnAborted { .. } => {
+                self.settle_running_tool("interrupted");
                 self.finalize_live();
                 self.view_mut().history.push(HistoryCell::Interrupted);
             }
@@ -2673,6 +2733,7 @@ impl App {
                     view.set_error(message);
                     return;
                 }
+                self.settle_running_tool("interrupted");
                 self.finalize_live();
                 self.view_mut().history.push(HistoryCell::Error(message));
             }
@@ -2714,6 +2775,22 @@ impl App {
             EventMsg::ShutdownComplete => {
                 self.quit = true;
             }
+        }
+    }
+
+    /// Turn a still-running tool card into a settled error card so an
+    /// interrupted turn keeps the record of what was executing. A no-op when
+    /// no card is live.
+    fn settle_running_tool(&mut self, reason: &str) {
+        if let Some(running) = self.view_mut().running_tool.take() {
+            let duration_ms = Some(running.started_at.elapsed().as_millis() as u64);
+            self.view_mut().history.push(HistoryCell::ToolCall {
+                name: running.name,
+                arguments: running.arguments,
+                result: String::new(),
+                error: Some(reason.to_string()),
+                duration_ms,
+            });
         }
     }
 
@@ -2940,11 +3017,7 @@ impl App {
             let window = command_menu_window(menu.items.len(), menu.selected, height);
             return window
                 .map(|index| {
-                    effort_menu_line(
-                        index + 1,
-                        &menu.items[index],
-                        index == menu.selected,
-                    )
+                    effort_menu_line(index + 1, &menu.items[index], index == menu.selected)
                 })
                 .collect();
         }
@@ -2997,8 +3070,12 @@ impl App {
             return;
         }
 
+        let display = chat::CardDisplay {
+            thinking: self.show_thinking || self.verbose,
+            tool_detail: self.verbose,
+        };
         let busy = self.busy;
-        let thinking_expanded = self.show_thinking;
+        let spinner = chat::SPINNER[self.tick % chat::SPINNER.len()];
         let view = self.view_mut();
 
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -3011,11 +3088,25 @@ impl App {
             if matches!(cell, HistoryCell::Report(_)) {
                 last_report_start = Some(lines.len());
             }
-            lines.extend(cell.lines(width, thinking_expanded));
+            lines.extend(cell.lines(width, &display));
             let has_more = index + 1 < view.history.len() || view.live.is_some();
             if has_more {
                 lines.push(Line::from(""));
             }
+        }
+
+        // The tool call currently executing, between the committed history
+        // and whatever the next round streams.
+        if let Some(running) = &view.running_tool {
+            let elapsed = chat::format_duration(running.started_at.elapsed().as_millis() as u64);
+            lines.extend(chat::running_tool_lines(
+                &running.name,
+                &running.arguments,
+                &elapsed,
+                spinner,
+                width,
+            ));
+            lines.push(Line::from(""));
         }
 
         // The thinking block still streaming for this turn, above the
@@ -3023,14 +3114,12 @@ impl App {
         if let Some(thinking) = &view.live_thinking
             && !thinking.is_empty()
         {
-            if thinking_expanded {
-                lines.extend(chat::thinking_lines(thinking, width, busy));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    "✻ thinking…",
-                    Style::default().fg(theme::DIM),
-                )));
-            }
+            lines.extend(chat::thinking_live_lines(
+                thinking,
+                width,
+                display.thinking,
+                spinner,
+            ));
             lines.push(Line::from(""));
         }
 
@@ -3153,7 +3242,7 @@ impl App {
             return;
         }
 
-        let spinner = SPINNER[self.tick % SPINNER.len()];
+        let spinner = chat::SPINNER[self.tick % chat::SPINNER.len()];
         let state = if self.busy {
             format!("{spinner} working · Esc interrupt")
         } else {
@@ -3194,8 +3283,8 @@ impl App {
             ),
         };
         let left_width = (display_width(&left_plain) as u16 + 1).min(area.width);
-        let hint_width = (display_width(hints) as u16 + 1)
-            .min(area.width.saturating_sub(left_width));
+        let hint_width =
+            (display_width(hints) as u16 + 1).min(area.width.saturating_sub(left_width));
         let parts =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(hint_width)]).split(area);
 
@@ -3262,10 +3351,12 @@ fn wizard_rows(wizard: &crate::tui::provider_wizard::Wizard) -> usize {
         Step::Configured => wizard.row_count().max(1),
         _ => 1,
     };
-    if wizard.status.is_some() && !matches!(
-        wizard.step,
-        Step::AddConfirm | Step::AddProbe | Step::SignInRunning
-    ) {
+    if wizard.status.is_some()
+        && !matches!(
+            wizard.step,
+            Step::AddConfirm | Step::AddProbe | Step::SignInRunning
+        )
+    {
         rows + 1
     } else {
         rows
@@ -3646,10 +3737,7 @@ fn model_menu_line(number: usize, item: &ModelMenuItem, selected: bool) -> Line<
     let mut spans = vec![
         Span::styled(marker, marker_style),
         Span::styled(format!("{number} · "), number_style),
-        Span::styled(
-            truncated(&item.selection.as_str(), 48),
-            text_style,
-        ),
+        Span::styled(truncated(&item.selection.as_str(), 48), text_style),
     ];
     if let Some(window) = item.context_window {
         spans.push(Span::styled(
@@ -3862,9 +3950,9 @@ fn ansi_foreground(color: Color) -> String {
 mod tests {
     use super::*;
     use crate::core::config::ModelInfo;
-    use crate::plugins::Plugin;
     use crate::core::config::ProviderInstance;
     use crate::core::providers::ProviderRegistry;
+    use crate::plugins::Plugin;
     use ratatui::backend::TestBackend;
 
     /// A pool over the built-in `test` protocol with two selectable models.
@@ -4287,7 +4375,10 @@ mod tests {
         // An unknown name: an error cell, no switch.
         app.composer.set_text("/profile nope".to_string());
         app.try_submit();
-        assert!(matches!(app.view().history.last(), Some(HistoryCell::Error(_))));
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Error(_))
+        ));
         assert_eq!(app.active_profile, None);
 
         // A known name: the optimistic notice goes out and the op follows.
@@ -4441,26 +4532,31 @@ mod tests {
         let saved = vec![saved_session(Some("test/two"))];
 
         // A plain startup keeps the configured selection.
-        assert_eq!(            restore_model_selection(&pool, selection.clone(), &saved, true),
+        assert_eq!(
+            restore_model_selection(&pool, selection.clone(), &saved, true),
             selection
         );
         // A restore adopts the session's last used model…
-        assert_eq!(            restore_model_selection(&pool, selection.clone(), &saved, false),
+        assert_eq!(
+            restore_model_selection(&pool, selection.clone(), &saved, false),
             Some(Selection::new("test", "two"))
         );
         // …keeps it when it already matches…
         let already = Some(Selection::new("test", "two"));
-        assert_eq!(            restore_model_selection(&pool, already, &saved, false),
+        assert_eq!(
+            restore_model_selection(&pool, already, &saved, false),
             Some(Selection::new("test", "two"))
         );
         // …falls back when the saved provider is gone…
         let gone = vec![saved_session(Some("ghost/model"))];
-        assert_eq!(            restore_model_selection(&pool, selection.clone(), &gone, false),
+        assert_eq!(
+            restore_model_selection(&pool, selection.clone(), &gone, false),
             selection
         );
         // …and when the session never recorded a model.
         let unnamed = vec![saved_session(None)];
-        assert_eq!(            restore_model_selection(&pool, selection, &unnamed, false),
+        assert_eq!(
+            restore_model_selection(&pool, selection, &unnamed, false),
             None
         );
     }
@@ -4652,7 +4748,9 @@ mod tests {
             .view()
             .history
             .iter()
-            .filter(|cell| matches!(cell, HistoryCell::Notice(text) if text.contains("switched to")))
+            .filter(
+                |cell| matches!(cell, HistoryCell::Notice(text) if text.contains("switched to")),
+            )
             .count();
         assert_eq!(notices, 1);
     }
@@ -4922,7 +5020,11 @@ mod tests {
         // selection starts on the `off` entry.
         assert_eq!(menu.items.len(), 5);
         assert_eq!(menu.selected, 4);
-        assert!(menu.items.last().is_some_and(|item| item.current && item.level.is_none()));
+        assert!(
+            menu.items
+                .last()
+                .is_some_and(|item| item.current && item.level.is_none())
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -4974,20 +5076,39 @@ mod tests {
     #[tokio::test]
     async fn thinking_command_toggles_the_fold_flag() {
         let mut app = test_app();
-        assert!(app.show_thinking);
-
-        app.composer.set_text("/thinking".to_string());
-        app.try_submit();
+        // Cards fold when settled; /thinking makes them expand by default.
         assert!(!app.show_thinking);
-        assert!(
-            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("collapsed"))
-        );
 
         app.composer.set_text("/thinking".to_string());
         app.try_submit();
         assert!(app.show_thinking);
         assert!(
             matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("expanded"))
+        );
+
+        app.composer.set_text("/thinking".to_string());
+        app.try_submit();
+        assert!(!app.show_thinking);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("folded"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_expands_and_folds_every_card() {
+        let mut app = test_app();
+        assert!(!app.verbose);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(app.verbose);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("expanded"))
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(!app.verbose);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("folded"))
         );
     }
 
@@ -5001,8 +5122,12 @@ mod tests {
             delta: "pondering".to_string(),
         }));
         assert_eq!(app.view().live_thinking.as_deref(), Some("pondering"));
+        assert!(app.thinking_started.is_some(), "the stream is timed");
         assert!(
-            app.view().history.iter().all(|cell| !matches!(cell, HistoryCell::Thinking(_))),
+            app.view()
+                .history
+                .iter()
+                .all(|cell| !matches!(cell, HistoryCell::Thinking { .. })),
             "nothing commits while only thinking has streamed"
         );
 
@@ -5011,8 +5136,9 @@ mod tests {
             delta: "answer".to_string(),
         }));
         assert_eq!(app.view().live_thinking, None);
+        assert!(app.thinking_started.is_none(), "the clock rode along");
         assert!(
-            matches!(&app.view().history[3], HistoryCell::Thinking(text) if text == "pondering"),
+            matches!(&app.view().history[3], HistoryCell::Thinking { text, .. } if text == "pondering"),
             "{:?}",
             app.view().history
         );
@@ -5029,16 +5155,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tool_call_cards_run_and_settle() {
+        let mut app = test_app();
+        let event = |msg| crate::core::Event::new("sub-1", msg);
+
+        app.handle_agent_event(event(EventMsg::TurnStarted));
+        app.handle_agent_event(event(EventMsg::AgentToolCallStarted {
+            name: "bash".to_string(),
+            arguments: r#"{"command": "ls"}"#.to_string(),
+        }));
+        let running = app.view().running_tool.as_ref().expect("live card");
+        assert_eq!(running.name, "bash");
+        assert!(
+            app.view()
+                .history
+                .iter()
+                .all(|cell| !matches!(cell, HistoryCell::ToolCall { .. })),
+            "the running card is not history yet"
+        );
+
+        // Completion settles the card into history with its measured time.
+        app.handle_agent_event(event(EventMsg::AgentToolCall {
+            name: "bash".to_string(),
+            arguments: r#"{"command": "ls"}"#.to_string(),
+            result: "file".to_string(),
+            error: None,
+            duration_ms: 4200,
+        }));
+        assert!(app.view().running_tool.is_none());
+        assert!(
+            matches!(
+                app.view().history.last(),
+                Some(HistoryCell::ToolCall { name, duration_ms: Some(4_200), .. }) if name == "bash"
+            ),
+            "{:?}",
+            app.view().history.last()
+        );
+
+        app.handle_agent_event(event(EventMsg::TurnComplete));
+        assert!(!app.busy);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_tool_settles_as_an_error_card() {
+        let mut app = test_app();
+        let event = |msg| crate::core::Event::new("sub-1", msg);
+
+        app.handle_agent_event(event(EventMsg::TurnStarted));
+        app.handle_agent_event(event(EventMsg::AgentToolCallStarted {
+            name: "bash".to_string(),
+            arguments: r#"{"command": "sleep 99"}"#.to_string(),
+        }));
+        app.handle_agent_event(event(EventMsg::TurnAborted {
+            reason: "esc".to_string(),
+        }));
+        assert!(app.view().running_tool.is_none());
+        assert!(
+            matches!(
+                app.view().history.get(app.view().history.len() - 2),
+                Some(HistoryCell::ToolCall { error: Some(reason), duration_ms: Some(_), .. }) if reason == "interrupted"
+            ),
+            "{:?}",
+            app.view().history
+        );
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Interrupted)),
+            "{:?}",
+            app.view().history.last()
+        );
+    }
+
     /// An app whose view mirrors one completed user turn (the worker keeps
     /// running for real; its events just sit unread in the channel).
     fn app_with_transcript() -> App {
         let mut app = test_app();
         app.composer.set_text("hello".to_string());
         app.try_submit();
-        app.handle_agent_event(crate::core::Event::new(
-            "sub-1",
-            EventMsg::TurnComplete,
-        ));
+        app.handle_agent_event(crate::core::Event::new("sub-1", EventMsg::TurnComplete));
         app
     }
 
@@ -5201,7 +5395,10 @@ mod tests {
         app.composer.set_text("/context".to_string());
         app.try_submit();
         assert!(app.context_view.is_some());
-        app.handle_agent_event(crate::core::Event::new("sub-c", EventMsg::ConversationCleared));
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-c",
+            EventMsg::ConversationCleared,
+        ));
         assert!(app.context_view.is_none());
     }
 
@@ -5219,36 +5416,147 @@ mod tests {
         }));
 
         assert!(
-            matches!(&app.view().history[3], HistoryCell::Thinking(text) if text == "silent reasoning"),
+            matches!(&app.view().history[3], HistoryCell::Thinking { text, .. } if text == "silent reasoning"),
             "{:?}",
             app.view().history
         );
-        assert!(matches!(app.view().history.last(), Some(HistoryCell::Interrupted)));
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Interrupted)
+        ));
         assert_eq!(app.view().live_thinking, None);
     }
 
     #[tokio::test]
     async fn thinking_cells_render_folded_and_expanded() {
         let mut app = test_app();
-        app.view_mut()
-            .history
-            .push(HistoryCell::Thinking("long thoughts".to_string()));
+        app.view_mut().history.push(HistoryCell::Thinking {
+            text: "long thoughts".to_string(),
+            duration_ms: Some(4_200),
+        });
 
-        // Expanded (the default): header over the dim body.
+        // Expanded (/thinking on): header over the dim body.
+        app.show_thinking = true;
         let lines = render_lines(&mut app, 60, 20);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("✻ thinking"), "{rendered}");
+        assert!(rendered.contains("✻ thinking · 4.2s"), "{rendered}");
         assert!(rendered.contains("long thoughts"), "{rendered}");
 
-        // Folded: a single marker line, no body.
+        // Folded (the default): a single marker line naming the expand key.
         app.show_thinking = false;
         let lines = render_lines(&mut app, 60, 20);
         let rendered = lines.join("\n");
         assert!(
-            rendered.contains("✻ thinking (hidden · /thinking to expand)"),
+            rendered.contains("✻ thinking · 4.2s (ctrl+o to expand)"),
             "{rendered}"
         );
         assert!(!rendered.contains("long thoughts"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn tool_cards_render_a_preview_and_expand_with_ctrl_o() {
+        let mut app = test_app();
+        app.view_mut().history.push(HistoryCell::ToolCall {
+            name: "bash".to_string(),
+            arguments: r#"{"command": "cargo build"}"#.to_string(),
+            result: "a\nb\nc\nd\ne".to_string(),
+            error: None,
+            duration_ms: Some(4_200),
+        });
+
+        // Folded (the default): the head preview plus the fold hint.
+        let lines = render_lines(&mut app, 80, 20);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("● bash cargo build · 4.2s")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("⎿ a")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|line| line.trim_end() == "    e"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("… +1 line (ctrl+o to expand)")),
+            "{lines:?}"
+        );
+
+        // Ctrl+O: the whole output, hint gone.
+        app.verbose = true;
+        let lines = render_lines(&mut app, 80, 20);
+        assert!(
+            lines.iter().any(|line| line.trim_end() == "    e"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("ctrl+o to expand")),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_tool_renders_a_live_card() {
+        let mut app = test_app();
+        app.view_mut().running_tool = Some(crate::tui::session::RunningTool {
+            name: "bash".to_string(),
+            arguments: r#"{"command": "cargo build"}"#.to_string(),
+            started_at: Instant::now(),
+        });
+        app.busy = true;
+
+        let lines = render_lines(&mut app, 80, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("bash cargo build"), "{rendered}");
+        assert!(rendered.contains("Running… ("), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn inline_live_tail_shows_the_running_tool_card() {
+        let mut app = test_app();
+        app.view_mut().running_tool = Some(crate::tui::session::RunningTool {
+            name: "bash".to_string(),
+            arguments: r#"{"command": "cargo build"}"#.to_string(),
+            started_at: Instant::now(),
+        });
+        app.busy = true;
+
+        let rows = app.inline_live_tail(80, 10);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text.len(), 2, "header + elapsed row, not bottom-cropped");
+        assert!(text[0].contains("bash cargo build"), "{text:?}");
+        assert!(text[1].contains("Running… ("), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn inline_flush_prints_thinking_cards_folded_by_default() {
+        let mut app = test_app();
+        app.view_mut().history.push(HistoryCell::Thinking {
+            text: "deep reasoning".to_string(),
+            duration_ms: Some(4_200),
+        });
+
+        // Scrollback is immutable, so the flush bakes in the current fold
+        // state: folded by default, compact and permanent.
+        let pending = app.take_inline_pending(60);
+        let text: Vec<String> = pending
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert!(
+            text.iter()
+                .any(|row| row.contains("✻ thinking · 4.2s (ctrl+o to expand)")),
+            "{text:?}"
+        );
+        assert!(
+            !text.iter().any(|row| row.contains("deep reasoning")),
+            "{text:?}"
+        );
     }
 
     #[tokio::test]
@@ -5394,7 +5702,8 @@ mod tests {
 
         app.composer.set_text("/re".to_string());
         let matches = app.command_matches();
-        assert_eq!(            matches.len(),
+        assert_eq!(
+            matches.len(),
             2,
             "`/re` offers the /rename and /resume aliases"
         );

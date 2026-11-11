@@ -12,6 +12,19 @@ use crate::core::rollout::LoadedSession;
 use crate::tui::TuiMode;
 use crate::tui::chat::HistoryCell;
 use crate::tui::wrap::char_width;
+use std::time::Instant;
+
+/// A tool call that is executing right now, rendered as a live card (spinner
+/// header and an elapsed row) in the transcript tail until the matching
+/// completion event turns it into a settled [`HistoryCell::ToolCall`].
+/// Tools run sequentially, so at most one is ever live.
+#[derive(Debug, Clone)]
+pub struct RunningTool {
+    pub name: String,
+    pub arguments: String,
+    /// When the call started, for the live elapsed readout.
+    pub started_at: Instant,
+}
 
 /// Rendered state of one recorded conversation.
 pub struct SessionView {
@@ -22,6 +35,10 @@ pub struct SessionView {
     /// committed as a [`HistoryCell::Thinking`] when visible content arrives
     /// or the turn ends, and never enters the conversation or the rollout.
     pub live_thinking: Option<String>,
+    /// The tool call currently executing (its live card renders in the
+    /// transcript tail). `None` between calls; settled cards live in
+    /// `history`.
+    pub running_tool: Option<RunningTool>,
     /// Explicit session name set by `/rename`; when unset the session is
     /// named after its first user message.
     pub name: Option<String>,
@@ -107,6 +124,9 @@ impl SessionView {
                             arguments: call.arguments.clone(),
                             result: String::new(),
                             error: None,
+                            // Rollouts record messages, not timings; a
+                            // restored card simply carries no duration chip.
+                            duration_ms: None,
                         });
                         call_cells.insert(call.id.clone(), view.history.len() - 1);
                     }
@@ -139,6 +159,7 @@ impl SessionView {
             history: Vec::new(),
             live: None,
             live_thinking: None,
+            running_tool: None,
             name: None,
             follow: true,
             scroll: 0,

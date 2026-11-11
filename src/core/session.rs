@@ -1200,6 +1200,17 @@ async fn execute_tool_call(
     deps: &TurnContext,
     call: ToolCall,
 ) -> bool {
+    // The running card goes out before anything else, so the front-end shows
+    // the invocation while a slow tool (a long bash command, typically) is
+    // still executing.
+    let _ = tx.send(Event::new(
+        turn.id.clone(),
+        EventMsg::AgentToolCallStarted {
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+        },
+    ));
+    let started_at = std::time::Instant::now();
     let outcome = if !deps.enabled.contains(&call.name) {
         // Two distinct cases, answered differently: a tool nobody declares
         // (a hallucinated name) versus one this session switched off.
@@ -1249,6 +1260,7 @@ async fn execute_tool_call(
             arguments: call.arguments,
             result,
             error,
+            duration_ms: started_at.elapsed().as_millis() as u64,
         },
     ));
     conversation.push_message(Message::tool_result(&call.id, content.clone()));
@@ -1625,6 +1637,7 @@ mod tests {
                 EventMsg::TurnStarted,
                 EventMsg::AgentMessageDelta { .. },
                 EventMsg::AgentMessage { message },
+                EventMsg::AgentToolCallStarted { .. },
                 EventMsg::AgentToolCall { name, result, error: None, .. },
                 EventMsg::AgentMessageDelta { .. },
                 EventMsg::AgentMessage { .. },
@@ -1797,12 +1810,18 @@ mod tests {
         release.store(true, Ordering::SeqCst);
 
         let events = collect_turn(&mut session).await;
-        // The abandoned call leaves no trace: no tool-call event, no result,
-        // and no follow-up round against the model.
+        // The abandoned call never completes: no result event, no follow-up
+        // round against the model — only the started event (the call did
+        // begin executing) and the abort.
         let messages: Vec<&EventMsg> = events.iter().map(|event| &event.msg).collect();
         assert!(matches!(
             messages.as_slice(),
-            [EventMsg::TurnStarted, EventMsg::TurnAborted { .. }, EventMsg::TurnComplete]
+            [
+                EventMsg::TurnStarted,
+                EventMsg::AgentToolCallStarted { .. },
+                EventMsg::TurnAborted { .. },
+                EventMsg::TurnComplete
+            ]
         ));
         assert_eq!(seen.lock().expect("lock").len(), 1);
     }

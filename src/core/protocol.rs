@@ -84,6 +84,10 @@ pub enum EventMsg {
     /// The complete assistant text for the turn. Sent once, after streaming —
     /// and once per tool round that streamed text before its calls.
     AgentMessage { message: String },
+    /// A tool call the model asked for is about to execute. The front-end
+    /// renders a live "running" card that [`EventMsg::AgentToolCall`]
+    /// settles.
+    AgentToolCallStarted { name: String, arguments: String },
     /// One tool call the model asked for has been executed (or failed).
     /// Display-only: tool activity never surfaces as agent text.
     AgentToolCall {
@@ -94,6 +98,9 @@ pub enum EventMsg {
         /// Why the call failed, when it did. The model receives the failure
         /// as the tool message content and may react to it.
         error: Option<String>,
+        /// Wall-clock time the call took, in milliseconds. A disabled or
+        /// unknown tool completes instantly, so small values are honest.
+        duration_ms: u64,
     },
     /// Token usage for a completed turn, right before its `TurnComplete`.
     TurnUsage { input: u64, output: u64 },
