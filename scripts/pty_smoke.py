@@ -38,6 +38,10 @@ from pathlib import Path
 ROWS = 24
 COLS = 100
 ESC_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# The settled tool card's header, `● <name>(<args>)` (see `chat::tool_card_lines`).
+# The status dot is distinct from the `•` assistant gutter and the `⚓` thinking
+# marker, so the needle cannot match a plain transcript row.
+TOOL_CARD_MARKER = "● ping("
 
 
 def pump(master: int, out: bytearray, seconds: float) -> bool:
@@ -589,13 +593,13 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         os.write(master, b"use the ping tool @tool")
         pump(master, output, 0.4)
         os.write(master, b"\r")
-        # Snapshot the moment the ⚙ tool cell renders (it scrolls off as the
+        # Snapshot the moment the tool card renders (it scrolls off as the
         # summary reply streams in), then wait for the idle footer: the round
         # spans two streamed requests, so durations are unreliable.
         deadline = time.time() + 10
         tool_end = 0
         while time.time() < deadline:
-            if "⚙" in output[turn_start:].decode("utf-8", "replace"):
+            if TOOL_CARD_MARKER in output[turn_start:].decode("utf-8", "replace"):
                 tool_end = len(output)
                 break
             if not pump(master, output, 0.2):
@@ -675,7 +679,7 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         for path in Path(home).glob("sessions/*/rollout-*.jsonl")
     )
     checks = {
-        "tool call rendered": '⚙ ping {"note":"called by the test server"}' in screen_tool,
+        "tool call rendered": '● ping({"note":"called by the test server"})' in screen_tool,
         "unknown tool surfaced": "unknown tool `ping`" in screen_turn,
         "round trip reply": "tool-calling round trip of the test server" in screen_turn,
         # The report is taller than the grid, so these read the transcript

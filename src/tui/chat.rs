@@ -5,13 +5,28 @@
 //! error, notice, and an interruption marker — plus the tool-activity and
 //! plugin-report cells the tool loop and `/context` introduced.
 //!
-//! Thinking and tool calls render as foldable cards (the cordis-harness-tui
-//! convention): a status-glyph header with the tool name and an argument
-//! summary, the body hanging under a `⎿` gutter, and a dim `… +N lines` hint
-//! naming the expand key when folded. Which cards show their body is decided
-//! per frame by [`CardDisplay`], resolved from the global toggles — cells
-//! themselves stay stateless.
+//! Thinking and tool calls render as foldable cards, styled the way
+//! cordis-harness-tui styles its transcript so they cannot be mistaken for
+//! ordinary output. Each card is a header in its own color plus a body that
+//! hangs from a spine:
+//!
+//! ```text
+//! ⚓ thinking · 4.2s
+//!   │ dim italic reasoning…
+//!
+//! ● bash(cargo build) · 4.2s
+//!  ⎿  Compiling codest
+//!     … +3 lines (ctrl+o to expand)
+//! ```
+//!
+//! The tool header is `● name(args) · duration` with the name in the tool's
+//! category color and the `⎿` spine tinted to match; the thinking header is
+//! `⚓ thinking · duration` in the thinking color over a `│` rail. Folded, each
+//! card is that one header line plus a dim hint naming the expand key. Which
+//! cards show their body is decided per frame by [`CardDisplay`], resolved
+//! from the global toggles — cells themselves stay stateless.
 
+use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -29,8 +44,16 @@ use crate::tui::wrap::wrap_str;
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// How many result lines a folded tool card previews before the `… +N lines`
-/// hint.
-const TOOL_BODY_MAX_LINES: usize = 4;
+/// hint — cordis caps a folded text body at three rows.
+const TOOL_BODY_MAX_LINES: usize = 3;
+
+/// Body spine of a tool card: the `⎿` bracket on the first row, blank indent
+/// under it afterwards (both four columns wide, so rows align).
+const BRACKET_FIRST: &str = " ⎿  ";
+const BRACKET_REST: &str = "    ";
+/// Body spine of a thinking card: a continuous vertical rail on every row,
+/// so an expanded block reads as one hanging unit.
+const RAIL: &str = "  │ ";
 
 /// Per-cell display flags, resolved by the front-end from its global toggles
 /// (`/thinking` and Ctrl+O) before rendering. Cells stay stateless: folding
@@ -129,11 +152,12 @@ impl HistoryCell {
     }
 }
 
-/// Render one executed tool call as a card: the status glyph and bold tool
-/// name over the argument summary, with the output hanging under a `⎿`
-/// gutter. Folded (`expanded == false`) the output shows a head preview and
-/// a dim `… +N lines` hint; errors ride outside the preview, in the error
-/// color.
+/// Render one executed tool call as a card: the status glyph, the bold
+/// category-colored tool name with its argument summary in parentheses, and
+/// the duration chip on the header row; the output then hangs under a `⎿`
+/// spine tinted like the header. Folded (`expanded == false`) the output shows
+/// a head preview and a dim `… +N lines` hint; a failure rides in the body, in
+/// the error color.
 fn tool_card_lines(
     name: &str,
     arguments: &str,
@@ -145,6 +169,7 @@ fn tool_card_lines(
 ) -> Vec<Line<'static>> {
     let width = width.max(4);
     let category = tool_category_color(name);
+    let gutter = Gutter::bracket(category);
     let glyph_style = Style::default().fg(if error.is_some() {
         theme::ERROR
     } else {
@@ -155,10 +180,11 @@ fn tool_card_lines(
     let glyph = if error.is_some() { "✗" } else { "●" };
 
     // The duration chip rides at the end of the header; the argument summary
-    // bows out early enough to keep it visible.
+    // bows out early enough to keep it visible. The parentheses wrapping the
+    // summary cost two more columns.
     let chip = duration_ms.map(format_duration).map(|d| format!(" · {d}"));
     let chip_width = chip.as_ref().map(|c| display_width(c)).unwrap_or(0);
-    let spent = display_width(glyph) + 1 + display_width(name) + 1 + chip_width;
+    let spent = display_width(glyph) + 1 + display_width(name) + 2 + chip_width;
     let args = {
         let budget = width.saturating_sub(spent).max(1);
         tool_summary(arguments, budget)
@@ -170,8 +196,7 @@ fn tool_card_lines(
         Span::styled(name.to_string(), name_style),
     ];
     if has_summary {
-        header.push(Span::raw(" ".to_string()));
-        header.push(Span::styled(args.summary, text_style));
+        header.push(Span::styled(format!("({})", args.summary), text_style));
     }
     if let Some(chip) = chip {
         // The chip carries its own ` · ` separator.
@@ -182,17 +207,15 @@ fn tool_card_lines(
     // An expanded card keeps the full arguments above the output when the
     // header had to fold them (a multi-line bash command, typically).
     if expanded && args.folded && has_summary {
-        lines.extend(gutter_lines(&args.full, width, text_style));
+        lines.extend(gutter_lines(&args.full, width, text_style, &gutter));
     }
 
     if let Some(message) = error {
-        lines.extend(prefixed(
-            "! ",
-            theme::ERROR,
-            false,
+        lines.extend(gutter_lines(
             message,
-            Style::default().fg(theme::ERROR),
             width,
+            Style::default().fg(theme::ERROR),
+            &gutter,
         ));
     } else if !result.trim().is_empty() {
         let (mut body, hidden) = capped_gutter_lines(
@@ -203,27 +226,30 @@ fn tool_card_lines(
             } else {
                 TOOL_BODY_MAX_LINES
             },
+            text_style,
+            &gutter,
         );
         if hidden > 0 {
             let noun = if hidden == 1 { "line" } else { "lines" };
             body.push(Line::from(Span::styled(
-                format!("  ⎿ … +{hidden} {noun} (ctrl+o to expand)"),
+                format!(" … +{hidden} {noun} (ctrl+o to expand)"),
                 text_style,
             )));
         }
         lines.extend(body);
     } else {
-        lines.push(Line::from(Span::styled(
-            "  ⎿ (no output)".to_string(),
-            text_style,
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(gutter.first.to_string(), gutter.style),
+            Span::styled("(no output)".to_string(), text_style),
+        ]));
     }
     lines
 }
 
 /// The live stand-in shown while a tool executes: the braille spinner in the
-/// status-glyph slot, the invocation in the header, and a dim elapsed row.
-/// [`tool_card_lines`] replaces it once the call completes.
+/// status-glyph slot, the invocation in the header, and the elapsed row
+/// hanging under the body spine. [`tool_card_lines`] replaces it once the call
+/// completes.
 pub fn running_tool_lines(
     name: &str,
     arguments: &str,
@@ -236,26 +262,23 @@ pub fn running_tool_lines(
     let name_style = Style::default().fg(category).add_modifier(Modifier::BOLD);
     let text_style = Style::default().fg(theme::DIM);
 
-    let spent = display_width(spinner_frame) + 1 + display_width(name) + 1;
+    let spent = display_width(spinner_frame) + 1 + display_width(name) + 2;
     let budget = width.saturating_sub(spent).max(1);
     let summary = tool_summary(arguments, budget).summary;
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("{spinner_frame} "),
-            Style::default().fg(theme::ACCENT),
-        ),
+    let mut header = vec![
+        Span::styled(spinner_frame.to_string(), Style::default().fg(category)),
+        Span::raw(" ".to_string()),
         Span::styled(name.to_string(), name_style),
-    ])];
+    ];
     if !summary.is_empty() {
-        let last = lines.last_mut().expect("just pushed");
-        last.spans.push(Span::raw(" ".to_string()));
-        last.spans.push(Span::styled(summary, text_style));
+        header.push(Span::styled(format!("({summary})"), text_style));
     }
-    lines.push(Line::from(Span::styled(
-        format!("  Running… ({elapsed})"),
-        text_style,
-    )));
+    let mut lines = vec![Line::from(header)];
+    lines.push(Line::from(vec![
+        Span::styled(BRACKET_FIRST.to_string(), Style::default().fg(category)),
+        Span::styled(format!("Running… ({elapsed})"), text_style),
+    ]));
     lines
 }
 
@@ -319,7 +342,7 @@ fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
 
 /// A card's category color: the status glyph and tool name carry what the
 /// tool *is*, not how it ended (the glyph itself reports success/failure).
-fn tool_category_color(name: &str) -> ratatui::style::Color {
+fn tool_category_color(name: &str) -> Color {
     match name {
         "bash" => theme::TOOL_EXEC,
         "read" => theme::TOOL_READ,
@@ -340,52 +363,81 @@ pub fn format_duration(ms: u64) -> String {
     }
 }
 
-/// Wrap `text` under the card body gutter (`  ⎿ ` on the first row, blank
-/// indent after).
-fn gutter_lines(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
-    const GUTTER_FIRST: &str = "  ⎿ ";
-    const GUTTER_REST: &str = "    ";
-    let available = width.saturating_sub(display_width(GUTTER_FIRST)).max(1);
+/// A card's body spine: the chrome prefixing its first row, the indent that
+/// keeps every later row aligned, and the style the spine carries — tinted
+/// like the card's header, so a card body reads as part of the card rather
+/// than as loose transcript text.
+struct Gutter {
+    first: &'static str,
+    rest: &'static str,
+    style: Style,
+}
+
+impl Gutter {
+    /// The tool card's ` ⎿  ` bracket, in the tool's category color.
+    fn bracket(color: Color) -> Self {
+        Self {
+            first: BRACKET_FIRST,
+            rest: BRACKET_REST,
+            style: Style::default().fg(color),
+        }
+    }
+
+    /// The thinking card's `  │ ` rail, in the thinking color.
+    fn rail() -> Self {
+        Self {
+            first: RAIL,
+            rest: RAIL,
+            style: Style::default().fg(theme::THINKING),
+        }
+    }
+}
+
+/// Wrap `text` under `gutter`, styling the body with `style`.
+fn gutter_lines(text: &str, width: usize, style: Style, gutter: &Gutter) -> Vec<Line<'static>> {
+    let available = width.saturating_sub(display_width(gutter.first)).max(1);
     let mut lines = Vec::new();
     for (logical_index, logical) in normalize(text).split('\n').enumerate() {
         for (row_index, row) in wrap_str(logical, available).into_iter().enumerate() {
-            let gutter = if logical_index == 0 && row_index == 0 {
-                GUTTER_FIRST
+            let spine = if logical_index == 0 && row_index == 0 {
+                gutter.first
             } else {
-                GUTTER_REST
+                gutter.rest
             };
             lines.push(Line::from(vec![
-                Span::raw(gutter.to_string()),
+                Span::styled(spine.to_string(), gutter.style),
                 Span::styled(row, style),
             ]));
         }
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::raw(GUTTER_FIRST.to_string())));
+        lines.push(Line::from(Span::styled(
+            gutter.first.to_string(),
+            gutter.style,
+        )));
     }
     lines
 }
 
 /// [`gutter_lines`] limited to `max` logical lines (trailing blanks are not
 /// counted); returns the lines and how many logical lines were hidden.
-fn capped_gutter_lines(text: &str, width: usize, max: usize) -> (Vec<Line<'static>>, usize) {
+fn capped_gutter_lines(
+    text: &str,
+    width: usize,
+    max: usize,
+    style: Style,
+    gutter: &Gutter,
+) -> (Vec<Line<'static>>, usize) {
     let mut logical: Vec<String> = normalize(text).split('\n').map(str::to_owned).collect();
     while logical.last().is_some_and(|line| line.trim().is_empty()) {
         logical.pop();
     }
     if max >= logical.len() {
-        return (
-            gutter_lines(&logical.join("\n"), width, Style::default().fg(theme::DIM)),
-            0,
-        );
+        return (gutter_lines(&logical.join("\n"), width, style, gutter), 0);
     }
     let hidden = logical.len() - max;
     (
-        gutter_lines(
-            &logical[..max].join("\n"),
-            width,
-            Style::default().fg(theme::DIM),
-        ),
+        gutter_lines(&logical[..max].join("\n"), width, style, gutter),
         hidden,
     )
 }
@@ -510,46 +562,63 @@ pub fn assistant_lines_tracked(
     (lines, settled)
 }
 
-/// The settled thinking card: a dim `✻ thinking` header (with the duration
-/// chip when the stream was timed) over the dim italic body, or — folded — a
-/// one-line marker naming the expand key.
+/// The settled thinking card: a `⚓ thinking` header in the thinking color
+/// (with the duration chip when the stream was timed) over the dim italic
+/// body hanging under the thinking rail, or — folded — a one-line marker
+/// naming the expand key.
 pub fn thinking_card_lines(
     text: &str,
     width: usize,
     expanded: bool,
     duration_ms: Option<u64>,
 ) -> Vec<Line<'static>> {
-    let mut label = "✻ thinking".to_string();
-    if let Some(ms) = duration_ms {
-        label.push_str(&format!(" · {}", format_duration(ms)));
-    }
+    let mut header = thinking_header(duration_ms);
     if !expanded {
-        return vec![Line::from(Span::styled(
-            format!("{label} (ctrl+o to expand)"),
+        header.push(Span::styled(
+            " (ctrl+o to expand)".to_string(),
             Style::default().fg(theme::DIM),
-        ))];
+        ));
+        return vec![Line::from(header)];
     }
-    let mut lines = vec![Line::from(Span::styled(
-        label,
-        Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD),
-    ))];
-    lines.extend(prefixed(
-        "  ",
-        theme::DIM,
-        false,
+    let mut lines = vec![Line::from(header)];
+    lines.extend(gutter_lines(
         text,
+        width,
         Style::default()
             .fg(theme::DIM)
             .add_modifier(Modifier::ITALIC),
-        width,
+        &Gutter::rail(),
     ));
     lines
 }
 
+/// The `⚓ thinking` header spans, with the duration chip when the stream was
+/// timed. The glyph is bold so the card keeps an anchor even when the rest of
+/// the row recedes.
+fn thinking_header(duration_ms: Option<u64>) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            "⚓".to_string(),
+            Style::default()
+                .fg(theme::THINKING)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".to_string()),
+        Span::styled("thinking".to_string(), Style::default().fg(theme::THINKING)),
+    ];
+    if let Some(ms) = duration_ms {
+        spans.push(Span::styled(
+            format!(" · {}", format_duration(ms)),
+            Style::default().fg(theme::DIM),
+        ));
+    }
+    spans
+}
+
 /// The thinking card while its stream is live (the transcript tail): a
-/// braille spinner header with the dim italic body underneath and the block
-/// cursor riding the last row. The body shows only when `expanded`; the
-/// spinner alone still signals that reasoning is happening.
+/// braille spinner header with the dim italic body on the rail underneath and
+/// the block cursor riding the last row. The body shows only when `expanded`;
+/// the spinner alone still signals that reasoning is happening.
 pub fn thinking_live_lines(
     text: &str,
     width: usize,
@@ -558,26 +627,25 @@ pub fn thinking_live_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            format!("{spinner_frame} "),
-            Style::default().fg(theme::ACCENT),
+            spinner_frame.to_string(),
+            Style::default().fg(theme::THINKING),
         ),
+        Span::raw(" ".to_string()),
         Span::styled(
-            "thinking…",
+            "thinking…".to_string(),
             Style::default()
-                .fg(theme::DIM)
+                .fg(theme::THINKING)
                 .add_modifier(Modifier::ITALIC),
         ),
     ])];
     if expanded {
-        let mut body = prefixed(
-            "  ",
-            theme::DIM,
-            false,
+        let mut body = gutter_lines(
             text,
+            width,
             Style::default()
                 .fg(theme::DIM)
                 .add_modifier(Modifier::ITALIC),
-            width,
+            &Gutter::rail(),
         );
         if let Some(last) = body.last_mut() {
             last.spans
@@ -596,7 +664,7 @@ fn normalize(text: &str) -> String {
 
 fn prefixed(
     prefix: &'static str,
-    prefix_color: ratatui::style::Color,
+    prefix_color: Color,
     bold: bool,
     text: &str,
     content_style: Style,
@@ -718,7 +786,29 @@ mod tests {
         };
         assert_eq!(
             plain(&cell.lines(20, &expanded_all())),
-            vec!["✻ thinking", "  reasoning hard"]
+            vec!["⚓ thinking", "  │ reasoning hard"]
+        );
+
+        // The rail is the thinking card's own color, so the body reads as part
+        // of the card; the text itself stays dim italic.
+        let rendered = cell.lines(20, &expanded_all());
+        assert_eq!(rendered[0].spans[0].style.fg, Some(theme::THINKING));
+        assert_eq!(
+            rendered[1].spans[0].style.fg,
+            Some(theme::THINKING),
+            "the `│` spine carries the card color"
+        );
+        assert_eq!(
+            rendered[1].spans[1].style.fg,
+            Some(theme::DIM),
+            "and the reasoning text stays dim italic"
+        );
+        assert!(
+            rendered[1]
+                .spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
         );
     }
 
@@ -730,14 +820,23 @@ mod tests {
         };
         assert_eq!(
             plain(&cell.lines(60, &folded_all())),
-            vec!["✻ thinking · 4.2s (ctrl+o to expand)"]
+            vec!["⚓ thinking · 4.2s (ctrl+o to expand)"]
+        );
+
+        // Even folded the header is the thinking color, not the notice gray.
+        let rendered = cell.lines(60, &folded_all());
+        assert_eq!(rendered[0].spans[2].style.fg, Some(theme::THINKING));
+        assert_eq!(
+            rendered[0].spans[4].style.fg,
+            Some(theme::DIM),
+            "the expand hint recedes"
         );
     }
 
     #[test]
     fn thinking_live_card_spins_and_cursor_marks_the_tail() {
         let lines = thinking_live_lines("deep thought", 20, true, "⠹");
-        assert_eq!(plain(&lines), vec!["⠹ thinking…", "  deep thought▌"]);
+        assert_eq!(plain(&lines), vec!["⠹ thinking…", "  │ deep thought▌"]);
 
         // Folded, the spinner header alone keeps signaling that reasoning is
         // happening.
@@ -754,24 +853,23 @@ mod tests {
             error: None,
             duration_ms: Some(4_200),
         };
-        // Folded: header, the four-line head preview, then the hint.
+        // Folded: header, the three-line head preview, then the hint.
         assert_eq!(
             plain(&cell.lines(60, &folded_all())),
             vec![
-                "● bash ls -la · 4.2s",
-                "  ⎿ a",
+                "● bash(ls -la) · 4.2s",
+                " ⎿  a",
                 "    b",
                 "    c",
-                "    d",
-                "  ⎿ … +1 line (ctrl+o to expand)",
+                " … +2 lines (ctrl+o to expand)",
             ]
         );
         // Expanded: the whole output, no hint.
         assert_eq!(
             plain(&cell.lines(60, &expanded_all())),
             vec![
-                "● bash ls -la · 4.2s",
-                "  ⎿ a",
+                "● bash(ls -la) · 4.2s",
+                " ⎿  a",
                 "    b",
                 "    c",
                 "    d",
@@ -789,11 +887,15 @@ mod tests {
             error: Some("unknown tool".to_string()),
             duration_ms: None,
         };
-        // The failure rides outside any cap, in the error style; no preview
-        // follows a failed call.
+        // The failure rides in the card body, outside any cap, in the error
+        // style; no preview follows a failed call.
         assert_eq!(
             plain(&cell.lines(40, &expanded_all())),
-            vec![r#"✗ echo { "x": 1 }"#, "! unknown tool"]
+            vec![r#"✗ echo({ "x": 1 })"#, " ⎿  unknown tool"]
+        );
+        assert_eq!(
+            cell.lines(40, &expanded_all())[1].spans[1].style.fg,
+            Some(theme::ERROR)
         );
 
         let cell = HistoryCell::ToolCall {
@@ -805,7 +907,7 @@ mod tests {
         };
         assert_eq!(
             plain(&cell.lines(40, &expanded_all())),
-            vec!["● ping", "  ⎿ pong"]
+            vec!["● ping", " ⎿  pong"]
         );
     }
 
@@ -820,17 +922,17 @@ mod tests {
         };
         // The header carries the command's first row only.
         let folded = cell.lines(60, &folded_all());
-        assert_eq!(plain(&folded)[0], "● bash echo one · 120ms");
+        assert_eq!(plain(&folded)[0], "● bash(echo one) · 120ms");
         assert_eq!(folded.len(), 3, "header + two output rows, no args block");
 
-        // Expanded, the full command rides above the output under the gutter.
+        // Expanded, the full command rides above the output under the spine.
         assert_eq!(
             plain(&cell.lines(60, &expanded_all())),
             vec![
-                "● bash echo one · 120ms",
-                "  ⎿ echo one",
+                "● bash(echo one) · 120ms",
+                " ⎿  echo one",
                 "    echo two",
-                "  ⎿ one",
+                " ⎿  one",
                 "    two",
             ]
         );
@@ -864,11 +966,27 @@ mod tests {
     }
 
     #[test]
+    fn tool_card_spine_is_tinted_like_its_header() {
+        let cell = HistoryCell::ToolCall {
+            name: "read".to_string(),
+            arguments: r#"{"path": "src/main.rs"}"#.to_string(),
+            result: "fn main() {}".to_string(),
+            error: None,
+            duration_ms: None,
+        };
+        let lines = cell.lines(40, &expanded_all());
+        // The `⎿` spine takes the read category color, the body stays dim.
+        assert_eq!(lines[1].spans[0].content.as_ref(), BRACKET_FIRST);
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme::TOOL_READ));
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme::DIM));
+    }
+
+    #[test]
     fn running_tool_card_spins_with_an_elapsed_row() {
         let lines = running_tool_lines("bash", r#"{"command": "cargo build"}"#, "12s", "⠸", 60);
         assert_eq!(
             plain(&lines),
-            vec!["⠸ bash cargo build", "  Running… (12s)"]
+            vec!["⠸ bash(cargo build)", " ⎿  Running… (12s)"]
         );
     }
 

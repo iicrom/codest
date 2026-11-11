@@ -5517,7 +5517,10 @@ mod tests {
         app.show_thinking = true;
         let lines = render_lines(&mut app, 60, 20);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("✻ thinking · 4.2s"), "{rendered}");
+        // `⚓` is a double-width cell, so the framebuffer pads it; ask for the
+        // label and the chip, and check the marker separately.
+        assert!(rendered.contains("thinking · 4.2s"), "{rendered}");
+        assert!(lines.iter().any(|line| line.starts_with('⚓')), "{rendered}");
         assert!(rendered.contains("long thoughts"), "{rendered}");
 
         // Folded (the default): a single marker line naming the expand key.
@@ -5525,7 +5528,7 @@ mod tests {
         let lines = render_lines(&mut app, 60, 20);
         let rendered = lines.join("\n");
         assert!(
-            rendered.contains("✻ thinking · 4.2s (ctrl+o to expand)"),
+            rendered.contains("thinking · 4.2s (ctrl+o to expand)"),
             "{rendered}"
         );
         assert!(!rendered.contains("long thoughts"), "{rendered}");
@@ -5547,10 +5550,10 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("● bash cargo build · 4.2s")),
+                .any(|line| line.contains("● bash(cargo build) · 4.2s")),
             "{lines:?}"
         );
-        assert!(lines.iter().any(|line| line.contains("⎿ a")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("⎿  a")), "{lines:?}");
         assert!(
             !lines.iter().any(|line| line.trim_end() == "    e"),
             "{lines:?}"
@@ -5558,7 +5561,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("… +1 line (ctrl+o to expand)")),
+                .any(|line| line.contains("… +2 lines (ctrl+o to expand)")),
             "{lines:?}"
         );
 
@@ -5587,7 +5590,7 @@ mod tests {
 
         let lines = render_lines(&mut app, 80, 20);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("bash cargo build"), "{rendered}");
+        assert!(rendered.contains("bash(cargo build)"), "{rendered}");
         assert!(rendered.contains("Running… ("), "{rendered}");
     }
 
@@ -5607,7 +5610,7 @@ mod tests {
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect();
         assert_eq!(text.len(), 2, "header + elapsed row, not bottom-cropped");
-        assert!(text[0].contains("bash cargo build"), "{text:?}");
+        assert!(text[0].contains("bash(cargo build)"), "{text:?}");
         assert!(text[1].contains("Running… ("), "{text:?}");
     }
 
@@ -5628,7 +5631,7 @@ mod tests {
             .collect();
         assert!(
             text.iter()
-                .any(|row| row.contains("✻ thinking · 4.2s (ctrl+o to expand)")),
+                .any(|row| row.contains("⚓ thinking · 4.2s (ctrl+o to expand)")),
             "{text:?}"
         );
         assert!(

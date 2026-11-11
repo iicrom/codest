@@ -197,8 +197,8 @@ pub trait Plugin: Sync {
 `tools` 字段 → 模型流式返回 `tool_calls` → worker 按名字派发到声明该工具的
 插件 → 结果作为 `role: "tool"` 消息回传 → 继续本轮对话（上限
 `MAX_TOOL_ROUNDS = 8` 轮，可被用户中断）。执行失败也回传给模型（内容为
-`error: …`），模型可以选择重试或换路；transcript 上每次调用渲染为一个
-`⚙` 单元。
+`error: …`），模型可以选择重试或换路；transcript 上每次调用渲染为一张
+工具卡片（表头 `● bash(cargo build) · 4.2s`，输出挂在 `⎿` 沟下）。
 
 `PluginHost` 在构建时校验工具名不重复（重复 → `PluginHostError::DuplicateTool`，
 启动失败），并实现 core 的 `ToolExecutor` trait 作为 worker 的执行入口。
@@ -311,8 +311,8 @@ pub struct PluginInfo<'a> {
 
 - `Plugin::run_command` 返回 `Err(PluginError)` → host 转成
   `PluginEffect::Error`，用户能看到，但不会中断应用。`run_tool` 的 `Err`
-  同样不会中断：错误文本作为 tool 结果回传给模型，同时显示在 transcript 的
-  `⚙` 单元里。
+  同样不会中断：错误文本作为 tool 结果回传给模型，同时以错误色显示在
+  transcript 的工具卡片正文里。
 - 注册表错误（重复 id、重复命令、重复工具、非法名）→ `PluginHostError`，
   启动失败。
 - 插件 panic **不会**被捕获：静态插件是可信代码，和主程序其他模块同级；

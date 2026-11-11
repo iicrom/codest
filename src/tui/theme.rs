@@ -13,6 +13,10 @@ pub const WARNING: Color = Color::Yellow;
 /// section markers without shouting.
 pub const SUBTLE: Color = Color::Gray;
 pub const DIM: Color = Color::DarkGray;
+/// Thinking cards' identity color. Purple is far from the cyan accent, the
+/// green assistant bullet, and the dark-gray notice text, so a thinking card —
+/// folded to a single line by default — never reads as ordinary output.
+pub const THINKING: Color = Color::LightMagenta;
 
 // Tool-card category colors (the cordis-harness-tui convention: the card's
 // status dot and tool name carry the tool's category, not its outcome — the
