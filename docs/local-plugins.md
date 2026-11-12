@@ -1,155 +1,87 @@
-# 本地插件(第三方 provider 的接入方式)
+# External plugins
 
-> 状态:已实现。`codest plugin install|uninstall|list|build` 是唯一入口,`crates/cst-plugin-api` 承载契约类型。
->
-> 关键词:**编译期链接、契约 crate、仓库外的生成 crate、一条命令装完且不脏 git**。
+English | [简体中文](zh/local-plugins.md)
 
-## 1. 为什么仍然不是动态加载
+An external plugin is a plugin maintained outside this repository and linked
+into the binary at build time. `codest plugin install` is the only entry
+point: one command records the plugin, generates a wrapper crate *outside*
+the checkout, and builds a codest binary with the plugin linked in — the
+repository itself stays untouched. The plugin contract itself is covered in
+[plugins.md](plugins.md).
 
-`docs/plugins.md` §10 把"运行时加载 `.so`/`.dylib`"列为非目标,这条结论没有变。动态加载需要自建 C ABI、版本协商、流式回调与取消的跨 FFI 桥接,还要面对 panic 跨边界与二进制兼容问题;对当前规模的项目,收益远小于风险。
+## 1. How linking works without a dependency cycle
 
-但"改宿主源码才能加插件"有真实缺陷:**接入点住在被 git 跟踪的文件里**。旧方案要 `cargo add --path`(改 `Cargo.toml`,写 `Cargo.lock`)再取消 `src/plugins/local.rs` 里一行注释,于是文档只能建议 `git update-index --skip-worktree`。那是个会反噬的技巧:文件一旦被跳过,升级本地插件列表时很容易忘掉,`git stash`/`checkout` 也会出错。
+Something in the source must reference `&SOME_PLUGIN` for it to end up in
+the binary — plugins are compile-time linked, and that does not change for
+external ones. What changes is *where* that something lives: a generated
+wrapper crate under `~/.codest/`, not your checkout.
 
-现在把"哪些插件被链接"从源码里挪出去。插件仍是编译期链接,所以必须**某处**的代码引用 `&PLUGIN` 静态值——但那份代码不必住在仓库里:
-
-```
-codest ──depends on──▶ cst-provider-qoder ──depends on──▶ cst-plugin-api
-   ▲                                                          ▲
-   └──────── ~/.codest/plugins/crate 依赖宿主 + 插件 ──────────┘
-```
-
-三个角色:
-
-- **`cst-plugin-api`**(本仓库 `crates/cst-plugin-api`):只有契约类型 `Plugin`、`ProtocolFactory`、`ModelClient`、`Message`、`ToolSpec`、`SseDecoder`、`AuthProvider` 等,没有 HTTP、没有终端、没有配置加载。它随 codest 一起发布,是插件的唯一依赖。
-- **插件仓库**(例如 `cst-provider-qoder`):独立维护,依赖 `cst-plugin-api`,导出若干 `static`。
-- **宿主**:`PluginHost::with_local(local, filter)` 是注入点,`codest::cli::run_with` / `run_blocking` 把它接进启动流程。**codest 从不被插件依赖**,所以没有 Cargo 循环依赖。
-
-宿主把 `cst-plugin-api` 的每个模块重新导出到原来的路径(`codest::core::model`、`codest::core::commands`、`codest::plugins::Plugin` …),因此这次拆分对既有代码与内置插件零破坏。
-
-## 2. 安装:一条命令
-
-```bash
-cd ../cst
-cargo build                                  # 只需要本体,不需要动 Cargo.toml
-./target/debug/codest plugin install ../cst-provider-qoder
-```
-
-`plugin install` 做四件事:
-
-1. 读插件清单,拿到**包名**、**crate 标识**和**导出符号**(默认 `PLUGIN`,可用 `[package.metadata.codest] plugins` 或 `--symbol` 覆盖);
-2. 把条目写进 `~/.codest/plugins.toml`(原子替换);
-3. 生成 `~/.codest/plugins/crate/`(独立的 Cargo 包);
-4. 在那里 `cargo build`,打印产出的二进制路径。
-
-产物:
+The contract types (`Plugin`, `ProtocolFactory`, `ModelClient`, `ToolSpec`,
+`AuthProvider`, …) live in the standalone crate
+[`cst-plugin-api`](../crates/cst-plugin-api/README.md), which is what makes a
+separate plugin repository possible:
 
 ```text
-~/.codest/plugins.toml               已装插件列表(机器管理)
-~/.codest/plugins/crate/
-    Cargo.toml                       codest + 每个插件一行依赖
-    src/main.rs                      static LOCAL_PLUGINS: &[&dyn Plugin] = &[&…::PLUGIN];
-    src/bin/cst.rs                   同一个列表的 cst 别名
-    target/debug/codest              带插件的二进制
+codest ──depends on──▶ your-plugin ──depends on──▶ cst-plugin-api
+   └──────────────────── depends on ──────────────────┘
 ```
 
-其余子命令:
+The host depends on the plugin (to link it), the plugin depends on the
+contract crate (to implement the trait), and codest is never a dependency of
+a plugin — so Cargo sees no cycle. The host re-exports every contract module
+under its historical paths (`codest::core::model`, `codest::plugins::Plugin`,
+…), so the split renamed nothing.
 
-| 命令 | 作用 |
-|---|---|
-| `codest plugin list` | 列出已装插件、来源与符号,以及链接用的宿主路径 |
-| `codest plugin uninstall <name>` | 从列表删掉并重建(插件没了,其他插件还在) |
-| `codest plugin build [--release]` | 只重建(改了插件源码、或换了宿主路径) |
-| `codest plugin build --install` | 用 `cargo install` 覆盖已安装的 `codest`/`cst` |
+**Versioning.** `PLUGIN_API_VERSION` is `1`. There is no runtime handshake:
+the host and a plugin agree through **Cargo versions**, and an incompatible
+contract fails to **compile**, not to start — which is the better failure.
+Adding a trait method with a default implementation does not bump the
+version; changing an existing signature or its meaning does. Depend on a
+range (`cst-plugin-api = "0.1"`), not an exact pin.
 
-`--no-build` 只重写列表与生成物,不跑 cargo(适合脚本里批量改)。
-
-### 三种来源
+## 2. Installing
 
 ```bash
-codest plugin install ../my-plugin                            # 本地 checkout(未知目录也会当作 path)
-codest plugin install my-plugin --git https://host/r.git --tag v1
-codest plugin install my-plugin --version '^0.1'               # crates.io
+codest plugin install ../my-plugin                                    # local checkout
+codest plugin install my-plugin --git https://host/my-plugin.git --tag v1
+codest plugin install my-plugin --version '^0.1'                      # crates.io
 ```
 
-git 源可加 `--rev` / `--branch` / `--tag`(互斥);`--package` 用于包名无法从 URL 推断时;`--crate-name` 覆盖生成的 Rust 标识。
+| Flag | Meaning |
+| --- | --- |
+| target (positional) | Checkout path, crates.io package name, or a git URL |
+| `--git <url>` | Install the named package from this repository |
+| `--package <name>` | Package name when it cannot be inferred from the target |
+| `--rev` / `--branch` / `--tag` | Pin the git source (mutually exclusive) |
+| `--version <req>` | Version requirement for a crates.io install (default `*`) |
+| `--symbol <name>` | Exported `static` to link; repeatable. Default `PLUGIN`, or the plugin's `[package.metadata.codest] plugins` |
+| `--crate-name <name>` | Rust identifier override (default: package name with `-` → `_`; keywords rejected) |
+| `--codest-src <path>` | The codest checkout to link against (see below) |
+| `--no-build` | Rewrite the list and wrapper only; skip cargo |
 
-### git / crates.io 来源的前提
+A bare git URL passed as the target also works; `--package` supplies the
+name when the URL does not end in a package name. Installing the same
+package name again replaces the entry.
 
-这两条路径要求插件**按版本**依赖契约:
+### What happens under the hood
 
-```toml
-cst-plugin-api = "0.1"     # 可以 clone 下来独立构建
-```
+1. The plugin entry is recorded in `~/.codest/plugins.toml` (replaced
+   atomically; on any later failure the previous state is restored).
+2. A wrapper crate is regenerated at `~/.codest/plugins/crate/` — outside
+   the repository, so `git status` stays clean and tricks like
+   `git update-index --skip-worktree` are never needed.
+3. The wrapper is built there with `cargo build`, and the binary paths are
+   printed.
 
-而不是:
-
-```toml
-cst-plugin-api = { path = "../cst/crates/cst-plugin-api" }   # 只在本地并列目录里成立
-```
-
-第二种是本地开发的自然写法(插件仓库自己 `cargo test` 需要它),但克隆到别处后那个相对路径就不存在了;`[patch.crates-io]` 也救不了,因为它是 `path` 依赖而不是 registry 依赖。所以:
-
-- **本地并列目录里开发** → 用 `path` 依赖,`codest plugin install <path>` 安装;
-- **发布给别人从 git/crates.io 装** → 用 `version` 依赖(需要 `cst-plugin-api` 已发布),安装器会自动补 `[patch.crates-io]` 让两边的契约同源。
-
-装错来源时 cargo 会报 `no matching package named cst-plugin-api found`,安装器在此之上补一行提示,并**不改动** `plugins.toml`。
-
-### `--codest-src`:wrapper 链接哪个宿主
-
-生成的 crate 必须 `path` 依赖一个 codest 源码树。解析顺序:
-
-1. `--codest-src`;
-2. `$CODEST_SRC`;
-3. **编译该二进制时的源码目录**(`env!("CARGO_MANIFEST_DIR")` 固化进二进制);
-4. `plugins.toml` 里上次记录的值。
-
-每个候选都验证过(`Cargo.toml` 里 `package.name == "codest"` 且存在 `crates/cst-plugin-api`),不合格就降级到下一个。所以用 `cargo install` 装好的二进制仍能安装插件——它记着安装时的源码路径;源码被挪走时,显式传 `--codest-src` 即可。
-
-### 为什么路径来源不需要 `[patch.crates-io]`
-
-契约一致性是这套方案唯一的硬约束:宿主与插件必须解析到**同一个** `cst-plugin-api`,否则 `&QoderPlugin` 不会被当成 `&dyn Plugin`(编译期就报错,不会到运行时才炸)。
-
-- 插件用 `path` 依赖契约 → 安装器把它解析成绝对路径,并**校验**它就是宿主那份(`ContractMismatch` 直接拒绝)。三方自动统一,无需 patch。
-- 插件用 version/git 依赖契约 → 会解析成第二份 crate,于是生成物带:
-
-  ```toml
-  [patch.crates-io]
-  cst-plugin-api = { path = "<codest-src>/crates/cst-plugin-api" }
-  ```
-
-Cargo 允许 patch 后未被使用(比如全是 path 来源),但会打印警告,所以只在需要时才生成。
-
-## 3. 生成物长什么样
-
-```toml
-# ~/.codest/plugins/crate/Cargo.toml(开头是 GENERATED 注释)
-[package]
-name = "codest-local"
-version = "0.0.0"
-edition = "2024"
-publish = false
-
-[workspace]                      # 自成 workspace 根:不被 $CODEST_HOME 的祖先吸走
-
-[[bin]]
-name = "codest"
-path = "src/main.rs"
-
-[[bin]]
-name = "cst"
-path = "src/bin/cst.rs"
-
-[dependencies]
-codest = { path = "/Volumes/Untitled/Projects/cst" }
-cst-provider-qoder = { path = "/Volumes/Untitled/Projects/cst-provider-qoder" }
-```
+The wrapper is a plain Cargo package (`codest-local`) with two binaries and
+one dependency line per plugin:
 
 ```rust
-// ~/.codest/plugins/crate/src/main.rs
+// ~/.codest/plugins/crate/src/main.rs (generated — do not edit)
 use codest::plugins::Plugin;
 
 static LOCAL_PLUGINS: &[&dyn Plugin] = &[
-    &cst_provider_qoder::PLUGIN,
+    &my_plugin::PLUGIN,
 ];
 
 fn main() {
@@ -157,91 +89,151 @@ fn main() {
 }
 ```
 
-`run_blocking` 让生成物不需要 `tokio`/`anyhow` 依赖:它自建 runtime、跑 `run_with`、出错时打印并 `exit(1)`。别名 `cst` 只差第一个参数。
+`src/bin/cst.rs` is the same list under the `cst` alias. The source of truth
+is `~/.codest/plugins.toml`; the generated files are rewritten wholesale on
+every `install`/`uninstall`/`build`, so edit the state file and rebuild
+instead of hand-editing the wrapper. Concurrent `codest plugin` invocations
+are rejected outright (a lock file, not a queue).
 
-**不要手改生成物**:每次 install/uninstall/build 都会整体重写。要改就改 `~/.codest/plugins.toml` 再 `codest plugin build`。
+### `--codest-src`: which host the wrapper links
 
-## 4. 注册表语义
+The wrapper `path`-depends on a codest checkout. Candidates are tried in
+order, each verified (`Cargo.toml` declares package `codest` and
+`crates/cst-plugin-api` exists); a failing candidate degrades to the next:
 
-`PluginHost::with_local` 把内置组与注入组拼在一起(`[BUILTIN_PLUGINS, local]`),按组顺序、组内顺序拼接。由此得到:
+1. explicit `--codest-src` (a bad explicit path is a hard error, not a
+   degradation);
+2. `$CODEST_SRC`;
+3. the source tree this binary was compiled from
+   (`CARGO_MANIFEST_DIR`, baked in at compile time);
+4. the checkout recorded in `~/.codest/plugins.toml`.
 
-- 插件 id、命令名/别名、工具名在**两组之间**统一校验,重复即启动失败——本地插件不能覆盖内置插件;
-- 本地插件的 id 自动出现在 `plugin_ids` 里,所以 profile 的 `tools` 过滤、`/help`、`/status`、`/context` 都能看到它;
-- `PluginHost::shipped()` 只返回内置插件,是测试与诊断用的稳定表(装了什么插件都不会让它变化);
-- 不带 wrapper 的普通 `cargo build` 产物传空切片,行为与之前完全一致。
+So a binary installed with `cargo install` can still install plugins — it
+remembers the source path from its build. If that tree has moved, pass
+`--codest-src` explicitly.
 
-## 5. 一个外部插件能贡献什么
+### Contract identity
 
-全部通过 `cst-plugin-api::Plugin` 的默认方法,只实现需要的部分:
+The one hard constraint: the host and every plugin must resolve
+`cst-plugin-api` to the **same** crate, or `&MyPlugin` is not a
+`&dyn Plugin` (a compile error, never a runtime surprise).
 
-| 扩展点 | 方法 | 典型用途 |
-|---|---|---|
-| provider 协议 | `protocols()` | 线协议与厂商 API 不同时实现 `ProtocolFactory`(Qoder 的 COSY 签名、置换 base64) |
-| 登录入口 | `auth_providers()` / `auth_status()` / `begin_sign_in()` | 给 `/provider` 提供"登录到这个 provider"的能力 |
-| 命令 | `commands()` / `run_command()` | 插件自己的斜杠命令 |
-| 工具 | `tools()` / `run_tool()` | 提供给模型调用的工具 |
-| 系统提示词 | `system_prompt()` | 注入一段上下文 |
-| 生命周期 | `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` | 观察与副作用 |
+- Plugin depends on the contract by `path` → the installer checks that the
+  path is exactly the host's copy and rejects a mismatch.
+- Plugin depends by version/git (required for git and crates.io sources) →
+  the generated manifest carries
+  `[patch.crates-io] cst-plugin-api = { path = "<codest-src>/crates/cst-plugin-api" }`
+  so both sides unify on the host's copy. It is emitted only when needed.
 
-### 两条 provider 接入路径,先试便宜的那条
+A checkout that only builds next to this repository (relative `path` dep on
+the contract) must therefore be installed from its local path; cloned
+elsewhere it fails with `no matching package named cst-plugin-api found`,
+and the installer appends that explanation to the error without touching
+`plugins.toml`.
 
-| 路径 | 何时用 | 成本 |
-|---|---|---|
-| **只写配置**:`openai-compat` 实例 + `headers` / `body_overrides` / `[providers.wire]` | 端点说 OpenAI 方言,只是要加头、改体、换 URL | 零代码 |
-| **插件协议**:`protocols()` 贡献 `ProtocolFactory` | 请求体结构、流格式、签名机制不同(如 Qoder) | 一个工厂 + 一个 client |
+## 3. Managing
 
-先试配置路径。只有当协议本身不同时才值得写插件。
+| Command | Effect |
+| --- | --- |
+| `codest plugin list` | Installed plugins, sources, symbols, and the linked codest source |
+| `codest plugin uninstall <name>` | Remove one entry and rebuild (other plugins survive); `--no-build` skips the build |
+| `codest plugin build` | Regenerate the wrapper from the saved list and build it |
+| `codest plugin build --release` | Same, with optimizations |
+| `codest plugin build --install` | `cargo install --path … --force` the result instead of only building it |
+| `codest plugin build --codest-src <path>` | Relink against another checkout |
 
-## 6. 契约版本
+`--release` and `--install` are mutually exclusive: `cargo install` always
+builds optimized, so asking for both would silently ignore one flag — codest
+rejects the combination instead.
 
-`cst-plugin-api::PLUGIN_API_VERSION` 当前是 `1`。
+The build never removes plugins from the binary implicitly: a plugin that is
+absent is simply not in the binary, because the list drives the wrapper.
 
-兼容规则:
+## 4. Writing an installable plugin
 
-- **加一个带默认实现的方法**:不升版本,插件无需改动;
-- **改已有签名或语义**:升主版本,插件必须跟着更新;
-- 宿主与插件通过 **Cargo 版本**达成一致,没有运行时握手:契约不兼容时插件直接编译失败,这比启动时才发现要好。
+A plugin is an ordinary library crate that depends on the contract and
+exports `static` values implementing `Plugin`:
 
-插件的 `Cargo.toml` 应写 `version = "0.1"` 这类范围,而不是精确版本。
+```toml
+# Cargo.toml
+[package]
+name = "my-plugin"
+version = "0.1.0"
+edition = "2024"
 
-## 7. 契约里有什么、没有什么
-
-**有**(插件需要,宿主也需要的纯数据与 trait):
-
-- `Message` / `Role`、`TurnOptions` / `StreamItem` / `ModelClient` / `ModelError`
-- `ProviderInstance` / `ModelInfo` / `WireQuirks`(含 `[providers.options]` 口袋)
-- `CommandSpec` / `CommandTable` / `Invocation`
-- `ToolSpec` / `ToolCall` / `ToolCallAccumulator`
-- `SseDecoder`(插件协议不应自带 SSE 解析)
-- `Plugin` / `PluginEffect` / `PluginInfo` / `PluginContext`
-- `AuthProvider` / `AuthMethod` / `AuthStatus` / `SignInFuture` / `SignInNotifier`
-
-**没有**(留在宿主,插件不该碰):
-
-- `providers.toml` 的读写、配置路径、`codest_home()`
-- 会话、rollout、TUI、`ModelPool` 的注册与缓存
-- 插件安装器本身(`plugins.toml` 与生成的 crate 只由宿主读写)
-- 任何 HTTP 客户端或终端代码
-
-`ProviderInstance` 里的 `[providers.options]` 是插件私有配置:宿主只解析成 `serde_json::Map` 原样传下去,从不解释任何键。因此插件加一个开关不需要宿主改 schema;未知**顶层**键仍然是启动错误。
-
-## 8. 测试
-
-```bash
-cargo test --workspace              # 宿主 + 契约 crate,全部离线
-cargo clippy --workspace --all-targets -- -D warnings
-python3 scripts/plugin_smoke.py     # 真实安装 → 带插件的二进制 → 卸载,13 项检查
+[dependencies]
+cst-plugin-api = "0.1"          # a range, so the host's copy can unify
 ```
 
-`plugin_smoke.py` 会真的跑一次 `plugin install ../cst-provider-qoder`,用生成的二进制在伪终端里执行 `/status` 与 `/help`,断言插件 id 与命令出现,再 `uninstall` 并断言重建的二进制里已没有该插件;最后核对 `git status --porcelain` 前后一致。
+```rust
+use cst_plugin_api::plugin::{Plugin, PluginContext, PluginError};
 
-`src/plugins/install.rs` 的单测覆盖:三种来源的清单渲染、`needs_patch` 的两种分支、路径来源的契约同源校验(不同副本直接拒绝)、符号覆盖、crate 名规范化与保留字拒绝、状态 TOML 往返、重复安装幂等、卸载后重新生成、缺 `Cargo.toml` 的目录、`--codest-src` 解析顺序。
+pub static PLUGIN: MyPlugin = MyPlugin;
 
-## 9. 已知限制
+pub struct MyPlugin;
 
-- 本地插件与主程序**同生命周期**:改插件必须重新编译。这是编译期链接的代价,不是 bug——`codest plugin build` 只是一条包装命令。
-- 没有沙箱与崩溃隔离:插件 panic 会带下整个进程。
-- 生成物固定在 `~/.codest/plugins/crate/`,共享一个 `target/`:换 `--release` 或换宿主路径会重新编译依赖,但不会丢缓存。
-- 一次只有一个 `codest plugin` 能改状态(`~/.codest/plugins.lock`);并发调用直接报错而不是排队。
-- crates.io 来源要求 `cst-plugin-api` 已发布,否则 `[patch.crates-io]` 指向的路径依赖仍然生效——能编过,但语义上等于"本地契约 + 远端插件",版本漂移由 Cargo 报错兜底。git 来源的插件也必须按版本依赖契约(见 §2),相对 `path` 依赖的插件只能从本地目录安装。
-- 写回 `plugins.toml` 与生成物都会**丢掉手写注释**(机器管理文件,不做保格式写回)。
+impl Plugin for MyPlugin {
+    fn id(&self) -> &'static str {
+        "my-plugin"
+    }
+
+    fn system_prompt(&self) -> Option<&'static str> {
+        Some("Always answer in bullet points.")
+    }
+}
+```
+
+If the plugin exports more than one `static`, declare them once in the
+manifest so installers do not need `--symbol`:
+
+```toml
+[package.metadata.codest]
+plugins = ["PLUGIN", "TOOL_PLUGIN"]
+```
+
+Everything a plugin can contribute — commands, hooks, tools, protocol
+factories, sign-in entries — is the same contract the built-ins implement;
+see [plugins.md](plugins.md) for the trait reference and
+[multi-provider.md](multi-provider.md) for the protocol/auth path. Test the
+crate standalone with `cargo test`; it needs nothing from the host.
+
+## 5. Limitations and design notes
+
+- **Rebuild to change.** Plugin edits require `codest plugin build` — that
+  is the compile-time linking trade-off, not a bug.
+- **No sandbox, no isolation.** Plugins run with host privileges and a panic
+  takes down the process. Static plugins are trusted code; isolation belongs
+  in a separate process, not here.
+- **No signature verification yet.** Nothing authenticates where a plugin
+  came from; git/crates.io sources inherit the supply-chain posture of the
+  registry they point at.
+- **Generated files are machine-managed.** Rewrites drop manual comments;
+  `plugins.toml` and the wrapper are overwritten wholesale.
+- **One writer at a time.** Concurrent `codest plugin` commands fail with a
+  lock error rather than queueing.
+- **crates.io sources need the contract published.** Until `cst-plugin-api`
+  is on crates.io, a registry install resolves the contract through the
+  generated `[patch.crates-io]` to the local checkout — it builds, but the
+  effective contract is the local copy's.
+
+## 6. Reference implementation
+
+`cst-provider-qoder` is the reference external plugin: a Qoder wire-protocol
+provider contributing a `ProtocolFactory` plus browser and
+personal-access-token sign-in through the auth contract. It lives in a
+separate repository, published alongside codest. The smoke script
+[../scripts/plugin_smoke.py](../scripts/plugin_smoke.py) exercises the real
+install path against it: install, run `/status` and `/help` in the built
+binary under a pseudo-terminal, verify the plugin id and commands appear,
+uninstall, verify the rebuilt binary no longer contains them, and check that
+`git status` is unchanged throughout.
+
+## 7. Related docs
+
+- [plugins.md](plugins.md) — the plugin contract and built-in plugins
+- [multi-provider.md](multi-provider.md) — provider instances, wire quirks, custom protocols
+- [profiles.md](profiles.md) — profile presets and the `tools` filter
+- [../README.md](../README.md) — getting started
+- Design notes (Chinese): [provider.md](provider.md), [session-id.md](session-id.md),
+  [session-continue.md](session-continue.md)
+- Contract crate reference: [../crates/cst-plugin-api/README.md](../crates/cst-plugin-api/README.md)

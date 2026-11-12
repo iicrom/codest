@@ -1,0 +1,141 @@
+# Configuration
+
+English | [简体中文](zh/configuration.md)
+
+Everything codest stores lives under `~/.codest` (override the root with `CODEST_HOME`). All files are optional; a file that exists but fails to parse — including unknown fields — is a startup error. Secret values accept a `$VAR` template so keys never have to be written to disk. This page is the file-and-key reference; the deep dives for provider instances and profiles are linked, not duplicated, here.
+
+## Configuration files
+
+| Path | Purpose |
+| --- | --- |
+| `config.toml` | Global settings: `default = "provider/model"`, `max_tool_rounds`. |
+| `providers.toml` | Provider instances (endpoints, keys, models). |
+| `profiles.toml` | Named session presets. |
+| `plugins.toml` | Installed external plugins (machine-managed). |
+| `model-cache.json` | Cache of discovered model lists. |
+| `sessions/<workspace-hash>/rollout-<uuid>.jsonl` | Session rollouts (append-only JSONL). |
+
+Parsing is strict everywhere (`deny_unknown_fields`): a typo is a startup error naming the file, rather than a silently disabled setting. `$VAR` templates are expanded at use time and trimmed; an unset or empty variable resolves to nothing, which fails the turn — never startup.
+
+Three of the files are machine-managed and you normally do not edit them by hand:
+
+| File | Written by | Consequence |
+| --- | --- | --- |
+| `plugins.toml` | `codest plugin install` / `uninstall` | Holds the external plugin list plus the codest checkout the wrapper crate links against. |
+| `model-cache.json` | Startup discovery | Preloaded so `/model` is instant and a failed refresh never empties the menu. |
+| `providers.toml` | `/provider` wizard (only on confirm) | A wizard write is atomic but machine-formatted: hand comments and layout are lost. |
+
+Only `config.toml`, `providers.toml`, and `profiles.toml` are meant to be hand-edited, and each is optional — a missing file simply contributes nothing.
+
+## `config.toml`
+
+The global file currently holds two keys:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `default` | string | — | Initial model selection, `"provider/model"`. |
+| `max_tool_rounds` | integer | absent | Optional cap on model → tool → model rounds per user turn. |
+
+```toml
+# ~/.codest/config.toml
+default = "openai/gpt-4o-mini"
+# max_tool_rounds = 64
+```
+
+`max_tool_rounds` is **unbounded by default**, following codex: the turn ends when the model stops calling tools, errors, or you press `Esc`. Set a value to re-enable the runaway guard — the turn then ends with a `tool round limit reached` error once that many rounds have completed. `64` is the commonly used guardrail.
+
+`default` is the third step of the startup selection chain: `--provider`/`--model` > active profile's `default` > `config.toml` `default` > first model of first instance. It names one model of one instance as `"provider/model"`, parsed at the first slash, so model ids may themselves contain `/`.
+
+## Provider instances
+
+`providers.toml` is optional. A missing file contributes no instances; if flags or env then name an endpoint, codest synthesizes a single `openai-compat` instance for that run, and with nothing at all the route is empty and the TUI guides you to add a provider.
+
+```toml
+# ~/.codest/providers.toml
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "$OPENAI_API_KEY"        # $VAR template — the key stays in your environment
+fetch_models = true                # discover the model list from GET /models
+
+  [[providers.models]]             # or declare models explicitly (takes precedence)
+  id = "gpt-4o-mini"
+
+[[providers]]
+name = "local"
+base_url = "http://127.0.0.1:8080/v1"
+api_key = "test"
+headers = { "X-Custom" = "v" }     # static headers / body overrides: most "special endpoints"
+body_overrides = { temperature = 0.5 }   # need no plugin at all
+
+  [providers.wire]                 # field-spelling-level quirks
+  thinking_fields = ["reasoning"]  # thinking text field (default: reasoning_content)
+  effort_field = "none"            # request field for /effort; "none" = never send it
+```
+
+See [multi-provider.md](multi-provider.md) for the full field reference: every `[[providers]]` and `[[providers.models]]` key, `$VAR` templates, discovery and the `/model` menu, the `/provider` wizard, and the `wire` quirks table.
+
+## Profiles
+
+```toml
+# ~/.codest/profiles.toml — named presets of model + effort + tools + prompt
+[profiles.code]
+default = "openai/gpt-4o-mini"     # initial selection
+effort = "high"                    # initial /effort ("off" = never send the effort field)
+tools = ["fs"]                     # plugin ids; absent = all tools, [] = none
+
+  [profiles.code.prompt]
+  append = "You are a senior Rust engineer..."   # appended to the system prompt
+
+[profiles.fast]
+default = "local/qwen2.5"
+effort = "low"
+```
+
+Profiles are *presets*, not a second config layer: CLI flags still win, and tool/prompt bindings are assembly-time (applied at startup only). Startup selection precedence: `--provider`/`--model` > active profile's `default` > `config.toml` `default` > first model of first instance.
+
+See [profiles.md](profiles.md) for the full field reference, lifecycle semantics (session-time vs assembly-time), the tools binding, and effort handling.
+
+## Session header
+
+Endpoints that route or cache per session recognize the `session-id` header (codex's spelling). `wire.session_header` (default `"session-id"`) controls it per instance — `"none"` opts out, and a custom spelling is used verbatim:
+
+```toml
+[[providers]]
+name = "strict-endpoint"
+base_url = "https://example.test/v1"
+wire = { session_header = "none" }          # this endpoint rejects unknown headers
+
+[[providers]]
+name = "gateway"
+base_url = "https://gateway.test/v1"
+wire = { session_header = "x-session-id" }  # use the gateway's spelling
+```
+
+A model-level `session_header` in `[[providers.models]]` overrides the instance's, including `"none"`. The header is applied after static `headers`, so the live session id wins over a hand-written same-name entry; the value sent is the active session's UUIDv7.
+
+## Environment variables
+
+| Variable | Meaning |
+| --- | --- |
+| `CST_MODEL` | Model id to start with (the `model` half of a selection). |
+| `CST_PROVIDER` | Provider instance to start with. |
+| `CST_BASE_URL` | OpenAI-compatible base URL, or a full `/chat/completions` URL; overrides the selected instance. |
+| `CST_API_KEY` | API key for the endpoint; overrides the selected instance. |
+| `CST_PROFILE` | Profile from `~/.codest/profiles.toml` to start with. |
+| `CST_TUI_MODE` | `fullscreen` (default) or `inline`. |
+| `CODEST_HOME` | Root directory for all state, replacing `~/.codest`. |
+| `CODEST_SRC` | codest checkout used by `codest plugin install`/`build` to link the wrapper crate against. |
+| `OPENAI_API_KEY` | Fallback for `CST_API_KEY` when the synthesized single endpoint is in use. |
+| `OPENAI_BASE_URL` | Fallback for `CST_BASE_URL` when the synthesized single endpoint is in use. |
+
+`CODEST_SRC` is consulted by the installer after an explicit `--codest-src` and before the directory the binary was compiled from and the path recorded in `plugins.toml`; each candidate is verified to be a codest checkout, and a stale one degrades to the next. See [local-plugins.md](local-plugins.md).
+
+## Next steps
+
+- [getting-started.md](getting-started.md) — installation, quick start, the full CLI table.
+- [multi-provider.md](multi-provider.md) — provider instances, wire quirks, discovery, the `/provider` wizard.
+- [profiles.md](profiles.md) — presets, selection precedence, assembly-time vs session-time values.
+- [local-plugins.md](local-plugins.md) — installed plugins and the wrapper crate.
+
+[← Back to the README](../README.md)

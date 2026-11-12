@@ -1,219 +1,216 @@
-# codest 多 Provider 支持设计
+# Multi-provider framework
 
-> 状态：已实现（`src/core/providers.rs`、`src/core/config.rs`），`/model` 菜单、
-> models API 发现、插件协议钩子均可用。
->
-> 关键词：**kind/instance 分离、具名线协议、模型目录、回合边界切换、数据化配置**。
+English | [简体中文](zh/multi-provider.md)
 
-## 1. 目标
+codest talks to any number of model endpoints at once: what you can
+configure, what the TUI commands do, and how a contributor adds a wire
+protocol.
 
-codest 原本只支持单一 OpenAI 兼容端点：client 在 `cli.rs` 由 flag/env 硬编码组装，
-worker 启动时吃掉一个 `Arc<dyn ModelClient>` 直到退出。多 Provider 支持要解决的是：
-**在不动 `ModelClient` 契约和 worker 循环骨架的前提下，让"新增一个端点"变成改配置、
-让"新增一种线协议"变成写一个插件。**
+## 1. Overview
 
-| 目标 | 做法 |
-| --- | --- |
-| 一个 provider 挂多个模型 | 实例声明 `models` 数组；选择 id 统一为 `provider/model` |
-| models API 发现 | 协议工厂可选实现 `list_models`；拉取结果与声明做增量合并 |
-| 配置文件声明端点 | `~/.codest/providers.toml`（实例）+ `~/.codest/config.toml`（全局设置） |
-| 运行时切换模型 | `Op::SwitchModel`，只在回合边界生效（op FIFO 保证） |
-| 插件贡献自定义协议 | `Plugin::protocols()` 返回 `ProtocolFactory`（编译期）+ 实例（配置期） |
-| 单一 `ModelClient` 缝隙 | 一切最终仍构造为 `Arc<dyn ModelClient>`；worker 只认这个 trait |
-| 可测试 | 注册表、配置、目录合并、切换全部离线可测；`test` 协议内置 echo 后端 |
+Two concepts, deliberately separated:
 
-非目标（v1 明确不做）：
+| Concept | What it is | Where it lives |
+| --- | --- | --- |
+| **Protocol kind** | A compile-time `ProtocolFactory` — a `'static` value that knows one wire protocol and builds a client from instance config | Code: built-ins `openai-compat` and `test`, plus plugin-contributed factories |
+| **Provider instance** | Pure configuration data naming a protocol kind by its `protocol` id | `~/.codest/providers.toml` (or the `/provider` wizard) |
 
-- usage 的 UI 渲染（数据通道已打通，见 §7；thinking 渲染与 `/effort`、
-  `/thinking` 已落地——见 §7 与 `core::reasoning`）；
-- OAuth / 凭据存储 / token 刷新（工厂的 `create()` 边界内自行解决）；
-- 模型添加向导 / `$EDITOR` 编辑（手改 providers.toml）；
-- 后台定时刷新、自适应探针、外部元数据源（models.dev 之类）——DSH 需要它们是因为
-  长驻多进程宿主与免费通道，codest 是单进程交互式 TUI，菜单打开即现值；
-- `context_window` 等模型元数据的消费（等 compaction 落地）。
+- **A "custom endpoint" is not a special concept.** It is an `openai-compat`
+  instance whose `base_url` points somewhere else.
+- **Most "special endpoints" need no code at all.** `headers` covers
+  disguises and auth variants, `body_overrides` fixes request-body fields,
+  `wire` quirks rename the field spellings providers disagree on (Section
+  5), and a different wire protocol is a plugin `ProtocolFactory` (Section
+  6). All of it ends behind one trait, `ModelClient` — the worker only
+  knows `stream_chat`; auth complexity stays inside `create()`.
+- A **selection** names one model of one instance: `"provider/model"`,
+  parsed at the *first* slash, so model ids may themselves contain `/`
+  (e.g. `gateway/deepseek/deepseek-r1`).
 
-## 2. kind / instance 分离
+## 2. Configuration reference
 
-这是整个设计的核心，它解决了静态插件系统的 `&'static` 契约与运行期配置的冲突：
+All files live under `~/.codest` (override the root with `CODEST_HOME`).
+Every file is optional; a file that **exists but fails to parse — including
+unknown fields** (`deny_unknown_fields`) — is a startup error naming the
+file. Global settings live in `config.toml` (`default`, `max_tool_rounds`),
+the instances below in `providers.toml`; `model-cache.json` is machine-managed.
 
-```text
-ProtocolFactory（kind，编译期，'static）        ProviderInstance（instance，配置期，String）
-┌──────────────────────────────┐              ┌─────────────────────────────────┐
-│ id: "openai-compat" | "test" │   1 : N      │ name / protocol / base_url      │
-│ display_name                 │ ◀──protocol──│ api_key($VAR) / headers         │
-│ create(instance, model)      │              │ models[] / fetch_models         │
-│ list_models(instance)?       │              │ body_overrides                  │
-└──────────────────────────────┘              └─────────────────────────────────┘
-        内置 2 个 + 插件贡献                          providers.toml 或 TUI 产生
-```
+### 2.1 `[[providers]]`
 
-- **协议种类**是 `ProtocolFactory`——一个 `'static` 值，知道一种线协议，能从实例配置
-  构造 `Arc<dyn ModelClient>`。内置 `openai-compat`（`openai_compat.rs`）与 `test`
-  （进程内 echo）；插件经 `Plugin::protocols()` 贡献更多。
-- **实例**是 `ProviderInstance`——纯配置数据，来自 `providers.toml`（将来可由 TUI
-  表单产生），用 `protocol` 字段按 id 引用一种协议。"自定义端点"不是一个特殊概念，
-  只是一个 `base_url` 不同的 `openai-compat` 实例。
-- **选择**是 `Selection`——`"provider/model"` 字符串，**在第一个 `/` 处切分**，因此
-  模型 id 本身可以含 `/`（如 `gateway/deepseek/deepseek-r1`）。
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `name` | string | required | Unique instance name; also the `provider` half of a selection. Must not contain `/` and must not repeat. |
+| `protocol` | string | `"openai-compat"` | Protocol kind id. Built-ins: `openai-compat`, `test`; plugins contribute more. |
+| `base_url` | string | — | API root. Requests go to `{base_url}/chat/completions`; discovery to `{base_url}/models`. |
+| `api_key` | string | — | Literal secret or a `$VAR` template (2.3). Unresolved, it fails the turn — never startup. |
+| `models` | array of tables | `[]` | Explicit model declarations (2.2). |
+| `fetch_models` | bool | `true` when no `models` are declared, `false` otherwise | Discover the list from the models API (Section 3). |
+| `headers` | table | `{}` | Static headers sent with every request. |
+| `body_overrides` | table | `{}` | JSON fields merged over the request body; overrides win over standard fields. |
+| `wire` | table | — | `openai-compat` wire quirks (Section 5). |
+| `options` | table | `{}` | Protocol-private pocket, handed to the factory verbatim (`option_str` / `option_u64` / `option_bool`). Unknown *top-level* keys are still rejected. |
 
-这样划分后，auth 的任意复杂度（多源 token、401 热切换、签名）都被关进
-`create(&self, instance, model)` 的边界里——core 永远不需要知道它们的存在，与
-pi-ai 用 fetch wrapper 覆盖同类需求的经验一致。
+### 2.2 `[[providers.models]]`
 
-## 3. 配置文件
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `id` | string | required | Model id sent to the endpoint; unique within the instance, non-empty. |
+| `name` | string | — | Display name (menus, status). |
+| `context_window` | integer | — | Advisory: footer usage readout and `/model` rows. |
+| `reasoning` | string array | — | Effort levels the model accepts, **lowest first**; feeds `/effort` (Section 5). |
+| `default_level` | string | — | Effort adopted when this model is selected, until `/effort` overrides it. |
+| `session_header` | string | — | Per-model override of `wire.session_header`; `"none"` sends no header for this model. |
 
-两个文件，职责分离（都在 `codest_home()` 下，尊重 `CODEST_HOME`）：
+Declared entries win over discovered twins, but fields a declaration leaves
+unset are filled from discovery — a sparse `id`-only entry still gets the
+context window the models API reports.
+
+### 2.3 `$VAR` secret templates
+
+A value starting with `$` names an environment variable, expanded at use
+time and trimmed; a literal passes through. Unset or empty variables
+resolve to nothing — the turn then fails with guidance; startup proceeds.
+
+### 2.4 Flags, env, and startup rules
+
+Flags and env: `--provider` / `CST_PROVIDER` (instance to start with),
+`--model` / `CST_MODEL` (model id), `--base-url` / `CST_BASE_URL`
+(OpenAI-compatible base URL, or a full `/chat/completions` URL), and
+`--api-key` / `CST_API_KEY` (hidden in `--help`; `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` are further fallbacks).
+
+- **No built-in default provider.** Only when `providers.toml` is
+  empty/missing **and** flags/env actually name an endpoint does codest
+  synthesize a single `openai-compat` instance (named `untitled`); with
+  nothing at all the route is empty and the TUI guides you to add one.
+- `--base-url` and `--api-key` are a **pair**: either alone synthesizes an
+  *incomplete* instance gated at first use with a prompt naming the missing
+  half, instead of sending a doomed request.
+- A synthesized instance never invents a model id: without `--model` the
+  list comes from discovery and `/model` picks one; with `--model` the
+  selection is pinned but discovery still fills the menu. With
+  `providers.toml` present, the flags **override the selected instance**.
+- Validation is strict: unknown fields, duplicate names, a name containing
+  `/`, an unknown `protocol` id, or empty/duplicate model ids all fail
+  startup (the protocol error lists the known ids). An unknown **provider**
+  in the selection is a hard error; an undeclared **model id** proceeds
+  with a warning — the endpoint answers for whether a model exists.
+
+### 2.5 Annotated example
 
 ```toml
-# ~/.codest/config.toml —— 全局设置（本轮仅一项）
-default = "openai/gpt-4o-mini"     # 初始 selection
-```
-
-```toml
-# ~/.codest/providers.toml —— provider 实例
+# ~/.codest/providers.toml
 [[providers]]
-name = "openai"                      # 唯一；不能含 '/'
-protocol = "openai-compat"           # 缺省值
+name = "openai"                        # unique, no '/' — the provider half of "openai/gpt-4o-mini"
 base_url = "https://api.openai.com/v1"
-api_key = "$OPENAI_API_KEY"          # $VAR 模板；未解析按空 key 处理（回合报错，不阻塞启动）
-fetch_models = true                  # 缺省规则：未声明 models 视为 true，已声明视为 false
-
-  [[providers.models]]               # 显式声明（静态路径，优先）
+api_key = "$OPENAI_API_KEY"            # $VAR template: the key stays in your environment
+fetch_models = true                    # list comes from GET /models
+  [[providers.models]]                 # explicit declarations take precedence...
   id = "gpt-4o-mini"
-  name = "GPT-4o mini"               # context_window 驱动 footer / /status 的
-  context_window = 128000            # 用量显示；reasoning / default_level 供 /effort 使用
-  reasoning = ["low", "medium", "high"]
-  default_level = "medium"           # 选中该模型时自动作为初始推理等级
-                                     # 声明里缺的字段（如不写 context_window）会由
-                                     # models API 的发现结果补齐，声明值优先
+  context_window = 128000              # footer usage + /model rows
+  reasoning = ["low", "medium", "high"]  # /effort vocabulary, lowest first
+  default_level = "medium"             # adopted on selection until /effort overrides
 
 [[providers]]
-name = "glm-local"
+name = "local"                         # a keyless local server needs no plugin
 base_url = "http://127.0.0.1:8080/v1"
-api_key = "test"
-headers = { "X-Custom-Header" = "value" }      # 静态请求头：多数"特殊端点"免插件
-body_overrides = { temperature = 0.5 }          # 请求体字段覆盖（覆盖标准字段）
-
-[[providers]]
-name = "opencode-go"
-base_url = "https://opencode.ai/inference/go/v1"
-api_key = "$OPENCODE_KEY"
-wire = { session_header = "session-id" }        # 缺省值，写出来只是显式
-
+headers = { "X-Custom-Header" = "value" }      # static headers
+body_overrides = { temperature = 0.5 }          # merged over the request body
+wire = { effort_field = "none" }                # endpoint rejects unknown request fields
   [[providers.models]]
-  id = "opencode-go/gpt-5"
-  session_header = "none"                       # 只对这个模型关闭 session 头
+  id = "qwen2.5"
+  session_header = "none"                       # per-model override: no session header for this model
 ```
 
-会话头（`wire.session_header` / `models.session_header`）：
+## 3. Model discovery and the `/model` menu
 
-| 配置 | 效果 |
-| --- | --- |
-| 都不写 | 每个请求带 `session-id: <会话 uuid>`——**缺省即发送**，codex 的拼写，OpenCode 的 console 与网关认这个头 |
-| `wire = { session_header = "x-session-id" }` | 该实例改用别的头名（有的网关只认自己的拼写） |
-| `wire = { session_header = "none" }` | 该实例完全不发 session 头（端点拒绝未知头时用） |
-| 单个 `[[providers.models]]` 写 `session_header` | 覆盖实例设置；写 `"none"` 只关掉这一个模型 |
+- At startup the last discovered lists are preloaded from
+  `~/.codest/model-cache.json`, so the menu is instant and a failed refresh
+  never empties it. `fetch_models` instances are then fetched in the
+  background: `GET {base_url}/models` (OpenAI shape `{data: [{id, ...}]}`),
+  entries without an id skipped, duplicates collapsed, 5-second timeout.
+  Success and failure each produce one transcript notice — never a fatal
+  error — and success writes the cache back. Both context-window spellings
+  in the wild are accepted: `context_length` (OpenRouter) and
+  `context_window`.
+- The merged view per instance: declared models first (declaration order),
+  then discovered models the config does not already declare; declared
+  entries keep precedence but unset fields are filled from discovery.
+- `/model` opens a picker with one row per `provider/model` selection —
+  models of the same instance stay together, in declaration order — each
+  row showing the context window when known and a marker on the active
+  model. Keys: `↑`/`↓` move, `Enter` switch, `r` re-run discovery for the
+  selected item's provider, `Esc` close. A switch applies at the **turn
+  boundary** (ops are FIFO, never interrupting a stream): the footer label
+  updates optimistically, the worker's `ModelSwitched` event is the
+  authoritative confirmation, and a failed switch keeps the current model.
+  Clients are built per turn, not cached: switching changes what the next
+  turn's client reads, and the session id is never baked into a client.
 
-头的**取值**是当前会话的 id，随会话切换而变，所以不能写死在 `headers` 里；`headers` 里手写的同名项会被它覆盖（与 `/effort` 覆盖 `body_overrides` 的优先级一致）。设计背景见 [`session-id.md`](session-id.md)。
+## 4. The `/provider` wizard
 
-规则：
+`/provider` opens a wizard with three flows:
 
-- **没有内置默认 provider/base_url/model**:仅当 `providers.toml` 为空/缺失 **且**
-  flag/env 提供了端点时才合成临时单端点实例。`base_url` 与 `api_key` **成对**要求:
-  只给其一时实例照常创建,但发送消息与 `/model` 获取列表会被拦截,提示补全另一半
-  (config 声明的实例不受此约束——免 key 端点是合法配置)。不指定 model 时实例
-  不带模型列表,由 `/model` 从 `base_url` 的 models API 发现(启动即后台拉取,
-  发现完成前发送消息提示先选模型);
-- **都不可用 = 空路由**:注册表为空、无活动选择、无 client。发送消息时前端给出
-  添加指引(`NO_MODEL_GUIDANCE`,输入内容保留);worker 侧同样有守卫,非 TUI
-  前端也不会发出必败请求;`Op::SwitchModel` 可从空路由直接迁移到有路由;
-- **解析错误启动即失败**，错误信息带文件路径与细节；未知字段同样报错（抓手误）；
-- **优先级**：CLI flag > 环境变量 > config.toml `default` > 第一个实例的第一个模型。
-  有 providers.toml 时 `--base-url` / `--api-key` 变为"覆盖所选实例字段"。
+1. **Add an OpenAI-compatible endpoint.** Name → base URL → API key (`$VAR`
+   template or literal; empty means keyless) → model ids (comma-separated;
+   empty means discover them) → a one-shot background probe of `GET /models`
+   (failure is not fatal; a note on confirm) → confirm. The instance is
+   written to `providers.toml` and installed into the pool, selectable.
+2. **Sign in.** Listed only when a plugin contributes sign-in entries.
+   Pick a target (a configured instance of the plugin's protocol, or the
+   plugin's default route) and a method — browser authorization or a secret
+   prompt (e.g. a PAT); `Esc` cancels. Success on a not-yet-configured
+   route installs the plugin's defaults; the credential lives in the
+   plugin's own store.
+3. **Configured providers.** A read-only list: name, protocol, base URL,
+   model count, sign-in badge.
 
-## 4. 模型目录与 models API
+Write-back: the new instance set is validated exactly like startup, then
+written **atomically** (temporary sibling file + rename). One consequence:
+**comments and layout are lost** — there is no `toml_edit` dependency, so
+after the first wizard write the file is machine-formatted. Keep
+hand-formatted files hand-edited; the wizard only writes when you confirm.
 
-每个实例对外的模型列表 = **声明（静态）∪ 发现（增量）**：
+## 5. Wire quirks reference
 
-1. 启动时从 `~/.codest/model-cache.json` 预载上次发现的结果——菜单即时可用，
-   断网也不空转；
-2. 对 `fetch_models` 生效的实例后台拉取（`openai-compat` 工厂实现
-   `GET {base_url}/models`，OpenAI 形状 `{data:[{id}]}`；5s 超时）；
-3. **合并规则：声明的排前且不被覆盖，发现结果只做增量**；
-4. 发现完成/失败都只产生一条 transcript 通知（`Notice`），绝不报错打断会话；
-5. 成功后写回缓存。
+`[providers.wire]` covers exactly the three wire-shape points that have no
+safe fallback; everything else (usage token spellings, context-window
+spellings, body fixes) is tolerated in code or expressible via `body_overrides`.
 
-`/model` 菜单里按 `r` 可手动重跑当前选中项所属 provider 的发现。
+| Quirk | Default | Meaning | Opt-out |
+| --- | --- | --- | --- |
+| `thinking_fields` | `["reasoning_content"]` | Delta fields tried in order as thinking text; first hit wins. | Empty list disables thinking parsing. |
+| `effort_field` | `"reasoning_effort"` | Top-level request field carrying the `/effort` value. | `"none"` never sends the field. |
+| `session_header` | `"session-id"` | Header carrying the session id (the value is the active session's UUIDv7, passed per turn). | `"none"` sends no header. |
 
-## 5. 注册与校验
+- A model's own `models.session_header` overrides the instance's; `"none"`
+  at either level suppresses the header (per model, or per instance).
+- Field names are **data, not logic**: any spelling is allowed on purpose;
+  only empty names are rejected, at startup.
+- Merge order on the wire: standard fields < `body_overrides` < per-turn
+  effort — an interactive `/effort` beats a static `body_overrides` value
+  for that one field. Session headers are applied after `headers`, so the
+  live session id wins over a hand-written same-name entry.
 
-`ProviderRegistry::build(extra_factories, instances)` 是唯一的校验点（延续
-`PluginHost::new` 的"构造时校验"哲学）：
+### `/effort` interplay
 
-- 实例 name 非空、唯一、不含 `/`；
-- `protocol` 必须能解析到工厂（错误列出全部已知协议 id）；
-- 声明的模型 id 非空、实例内唯一；
-- 工厂 id（内置 + 插件贡献）不重复。
+- `/effort [level]` sets the per-session effort, sent under the instance's
+  `effort_field`. `off` is always valid and clears the override (no field
+  is sent at all). An endpoint that rejects unknown request fields: set
+  `effort_field = "none"` (and `thinking_fields = []` if it also chokes on
+  thinking deltas you do not need).
+- The level vocabulary comes from the **active model**: its declared
+  `reasoning` list (its `default_level` always selectable even when the
+  list omits it), falling back to the built-in
+  `["minimal", "low", "medium", "high"]`. Selecting a model adopts its
+  `default_level` until `/effort` (or a profile, see
+  [profiles.md](profiles.md)) overrides it.
 
-选择解析（`parse_selection`）的失败分两档：**未知 provider 是硬错误**（启动失败）；
-未知 model 只告警——client 把 model 当纯字符串发送，是否有效由端点回答，且发现
-可能稍后补全目录。
+## 6. Custom wire protocols via plugins
 
-## 6. 运行时切换
-
-worker 侧引入 `ModelBackend`：
-
-```rust
-enum ModelBackend {
-    Fixed(Arc<dyn ModelClient>),                     // 测试与简化宿主用
-    Pooled { pool, current: Selection, client },     // 多 provider,已有活动选择
-    Empty { pool: Arc<ModelPool> },                  // 什么都没配置:空路由
-}
-```
-
-- `Op::SwitchModel { selection }` 完全镜像 `Op::SwitchSession`：成功则换
-  `current` + `client` 并发 `EventMsg::ModelSwitched`，失败（未知 provider、工厂
-  报错）发 `EventMsg::Error` 且**保持现状**；**从 `Empty` 出发的首次成功切换会把
-  状态迁移为 `Pooled`**；
-- op 队列 FIFO 保证切换只在回合边界生效，绝不断流；
-- **空路由的回合守卫**：`Op::UserTurn` 在 `Empty` 下直接回 `EventMsg::Error`
-  （`NO_MODEL_GUIDANCE`），不构造请求；TUI 在提交入口先拦一步——给出同样的指引且
-  **保留输入框内容**，两道防线共用一个文案常量；
-- `ModelPool` 按 selection 懒建并缓存 client——切换是缓存命中，配置里再多的模型
-  也不会预建连接；
-- 切换与初始选择都记进 rollout：`SessionMeta.provider/model` 记初始值，
-  `RolloutItem::ModelSwitched` 逐次追加。两者都带 serde default/skip——旧文件
-  照常加载，旧版本读新文件天然跳过未知 item。空路由会话的 meta 不含
-  provider/model 字段（`None` 跳过序列化）。
-
-TUI 侧 `/model` 完全复用 `/sessions` picker 的模式（`MODEL_COMMAND` 进命令表、
-`run_command` 拦截、模态 ↑↓/Enter/Esc/`r`、复用窗口渲染），Enter 乐观更新
-footer 的 `provider/model` 标签，事件到达时权威回填。
-
-## 7. 流层：StreamItem 与共享 SSE
-
-为让多 provider 不锁死数据通道，两处基础设施先行：
-
-- **`ModelStream` 条目从 `String` 改为 `#[non_exhaustive] enum StreamItem`**：
-  `Delta`（正文）、`Thinking`（`delta.reasoning_content`，reasoning 模型的思考
-  增量）、`Usage`（token 计数）。worker 把 Thinking 转成
-  `EventMsg::AgentThinkingDelta`（TUI 以暗色渲染、`/thinking` 可折叠），并且
-  只作为**显示元数据**记进 rollout（`assistant_reasoning`，写在其对应的
-  assistant 消息之前），回放时还原成 thinking 卡片；它始终不进模型上下文——
-  模型不该看到自己被回放的思考。Usage 在完整结束时以
-  `EventMsg::TurnUsage` 发出。渲染策略可以后补，通道先通——enum 后加 variant
-  是破坏性变更，实现方会全体返工；
-- **per-turn 请求选项**：`ModelClient::stream_chat` 增加 `TurnOptions`
-  （当前含 `effort`，`/effort` → `Op::SetReasoningEffort` 设定、FIFO 生效），
-  `openai-compat` 把它作为请求体的 `reasoning_effort` 字段发送——合并顺序为
-  标准字段 < `body_overrides` < effort（交互式设置赢过静态覆盖）。
-- **SSE 帧解析提取为 `core::sse`**：按规范实现（帧以空行结束、同帧多行 `data:`
-  以 `\n` 连接、`event:` 字段、单空格剥离、CRLF/UTF-8 跨块容错）。`openai-compat`
-  消费它；插件协议不应自带 SSE 解析，直接复用。
-
-## 8. 插件协议（自定义 provider）
-
-插件对多 Provider 的贡献点只有一种：**新的协议种类**。
+The built-ins are `openai-compat` and `test` — an in-process echo backend,
+fully offline, for demos and tests (`protocol = "test"`). A plugin
+contributes a new protocol kind through `Plugin::protocols()`:
 
 ```rust
 struct VendorFactory;
@@ -221,10 +218,15 @@ struct VendorFactory;
 impl ProtocolFactory for VendorFactory {
     fn id(&self) -> &'static str { "vendor-protocol" }
     fn display_name(&self) -> &'static str { "Vendor" }
+
+    // Per-instance state (URL, key, headers, options) arrives through
+    // `instance`; auth, signing, retries live behind this boundary.
     fn create(&self, instance: &ProviderInstance, model: &str)
-        -> Result<Arc<dyn ModelClient>, ModelError> { /* 自定义线协议 */ }
-    // 可选：models API 发现
-    // fn list_models<'a>(&'a self, instance: &'a ProviderInstance, cancel) -> Option<...>
+        -> Result<Arc<dyn ModelClient>, ModelError> { /* build the client */ }
+
+    // optional: models discovery (GET /models for openai-compat)
+    // fn list_models<'a>(&'a self, instance: &'a ProviderInstance, cancel)
+    //     -> Option<ListModelsFuture<'a>>
 }
 
 impl Plugin for Vendor {
@@ -236,72 +238,45 @@ impl Plugin for Vendor {
 }
 ```
 
-两条扩展路径（同 pi 生态的经验）：
+An instance of it is then plain TOML:
 
-| 路径 | 何时用 | 成本 |
-| --- | --- | --- |
-| **只写配置**：`openai-compat` 实例 + `headers` / `body_overrides` | 端点说 OpenAI 方言，只是要加头/改体/换 URL | 零代码 |
-| **插件协议**：`Plugin::protocols()` 贡献 `ProtocolFactory` | 请求体结构、流格式、签名机制不同 | 实现一个工厂 + client |
-
-要诚实的边界：静态插件体系下，协议插件给的是**维护者的模块化**（vendor 协议代码
-不进 core、可按 feature 裁剪），不是最终用户的可扩展性——第三方仍需重新编译。
-
-不过“第三方要重新编译”已经变成**一条命令**，而不是“改宿主源码”：
-
-- 契约类型（`ProtocolFactory`、`ModelClient`、`ProviderInstance`、`SseDecoder` …）
-  拆到了独立的 `cst-plugin-api` crate。插件仓库依赖它，宿主依赖插件，因此没有
-  Cargo 循环依赖（§8 的 `VendorFactory` 例子现在写在插件仓库里）；
-- 宿主侧只需要 `codest plugin install <path|--git|name>`：它把插件记进
-  `~/.codest/plugins.toml`，在 `~/.codest/plugins/crate/` 生成一个依赖宿主与插件
-  的独立 crate，并在那里 `cargo build`。仓库本身零改动。详见
-  `docs/local-plugins.md`。
-
-`ProviderInstance` 为此新增了一个通用口袋 `[providers.options]`：插件私有配置原样
-传给 `ProtocolFactory`，宿主从不解释任何键。守住的底线是——未知的**顶层**键仍然
-是启动错误，配置文件继续是面向用户的扩展面。
-
-运行时新增 provider 也已落地：`ModelPool` 的注册表由不可变字段改为
-`RwLock<Arc<ProviderRegistry>>`，`install_instance()` 复用启动时的校验并逐出该
-provider 的 client 缓存（旧 client 烘焙着旧 `base_url`/`api_key`）。`/provider`
-向导是它的唯一调用方，见 `docs/provider.md`。
-
-## 9. 测试策略
-
-全部离线，与既有分层一致：
-
-1. `core::config`：两文件解析、缺文件、解析错误带路径、`fetch_models` 缺省规则、
-   `$VAR` 模板（字面量/未设/空值）、TOML→JSON 覆盖；
-2. `core::providers`：Selection 切分（含模型 id 带 `/`）、注册表五类校验、默认选择、
-   池的懒建与缓存、发现合并与 model-cache.json 落盘回载、OpenAI 目录解析去重；
-3. `core::sse`：空行分帧、多行 data、CRLF、UTF-8 跨块、`finish` 容错；
-4. `core::openai_compat`：content/reasoning_content/usage 解析、body 覆盖、空 key；
-5. `core::session`：SwitchModel 成功/失败保持/固定后端拒绝/从空路由迁移、FIFO 边界、
-   空路由回合得到指引、rollout 元数据落盘；
-6. `tui::app`：`/model` 菜单开关、导航、切换、busy 拒绝、事件回填 label、渲染行、
-   空路由提交（提示 + 输入保留 + effect 守卫）；
-7. `scripts/pty_smoke.py`：每模式四组——flag/env 兼容路径 + providers.toml 全路径
-   （发现通知、菜单列出 fetch 到的模型、切换、切后对话）+ 空路由路径（`no model`
-   footer、指令照常、发送得指引、输入保留）+ 单边端点路径（提示补全另一半）。
-
-```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-python3 scripts/pty_smoke.py
+```toml
+[[providers]]
+name = "vendor"
+protocol = "vendor-protocol"     # resolved against built-in + plugin factories
+[providers.options]              # protocol-private pocket
+endpoint = "https://vendor.example/api"   # read via option_str
+max_output_tokens = 131072       # option_u64; option_bool too
 ```
 
-## 10. 边界与演进
+The contract (`ProtocolFactory`, `ModelClient`, `ProviderInstance`, the SSE
+decoder) lives in the separate `crates/cst-plugin-api` crate, so a plugin
+depends on the contract, not the host binary. To be honest: protocol
+plugins give **maintainer modularity** — vendor code stays out of core,
+feature-trimmable — not end-user runtime extensibility. Third parties do
+recompile, but that is one command (`codest plugin install …`), not a host
+patch; the registry and pool internals live in `src/core/providers.rs`.
+See [plugins.md](plugins.md) / [local-plugins.md](local-plugins.md).
 
-- client 不做重试、代理、认证刷新（与单端点时代一致）；`ModelError::NotConfigured`
-  仍是"回合报错"而非启动失败，部分配置的 providers.toml 不影响其他实例；
-- `/model` 添加端点的表单向导、`$EDITOR` 流程留待后续（先手改 providers.toml）；
-- `Usage` 的消费已落地：footer 常显上下文窗口与用量（窗口总长始终显示，最后一轮
-  `input + output` 对无状态 chat-completions 即下一轮请求的近似大小；测量前为
-  `—/100.0k` 占位）、`/model` 菜单每行列出各自的窗口长度、`/status` 输出窗口
-  占用与会话累计；每轮的模型与 usage 以 `turn_usage` 变体进 rollout，恢复时回放
-  为初始统计并恢复最后使用的模型选择（`--continue` 启动即采用；会话间切换尽力
-  恢复，选择已不存在时保持当前模型）；models API 的 `context_length` /
-  `context_window` 字段自动填充 `ModelInfo::context_window`。按 `context_window`
-  自动压缩仍是现成的下一步；thinking 的暗色渲染与折叠（`/thinking`）、推理等级
-  （`/effort`）已落地；
-- 想要 anthropic-messages 之类第二协议时，写一个内置工厂或示范插件即可，注册表
-  无需改动。
+## 7. Design notes
+
+- **Why no default provider:** a default `api.openai.com` or fallback model
+  id would send your key and prompts somewhere you did not choose; an empty
+  route that explains itself is cheaper. The synthesized `untitled`
+  instance exists only because flags/env *explicitly* name an endpoint.
+- **Why the protocol/instance split:** a `'static` plugin contract cannot
+  carry runtime configuration, and per-vendor auth must not leak into core.
+  Compile-time factories × config-data instances pin both: one factory
+  serves every instance of its protocol, and per-instance state arrives
+  through `create()`. Background reading (design notes, Chinese):
+  [provider.md](provider.md) — the `/provider` wizard — and
+  [session-id.md](session-id.md) — the session id and its header.
+
+## 8. Related docs
+
+| Doc | Content |
+| --- | --- |
+| [profiles.md](profiles.md) | Named presets of model + effort + tools + prompt. |
+| [plugins.md](plugins.md) | The static plugin system and its contracts. |
+| [local-plugins.md](local-plugins.md) | `codest plugin install` and third-party providers. |
+| [../README.md](../README.md) | Install, CLI reference, configuration overview. |
