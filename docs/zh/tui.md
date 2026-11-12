@@ -33,7 +33,7 @@ CST_TUI_MODE=inline codest
 - **Transcript。** 用户回合带 `› ` 前缀；助手回答首行是 `• `，后续行缩进在正文下；错误用 `! `；通知是暗色、无前缀；被中断的回合留下 `■ interrupted` 标记。thinking 卡片、工具卡片以及 `/context` 这类插件报告都是这份列表里的单元格。transcript 按会话保存：切换会话即切换渲染的视图，后台会话重新激活时补上差距。
 - **菜单带。** slash 指令候选弹窗，或打开中的某个选择器（`/sessions`、`/model`、`/effort`、`/tools`）。没有内容需要它时收缩为零行。
 - **输入框。** 多行编辑器，只有一条上边框，`› ` 提示符占自己的两列 gutter，最多显示八行；更长的输入在内部滚动。开启了 bracketed paste，多行粘贴作为文本落入，而不是一串按键。
-- **Footer。** 左侧是 `codest · <provider/model> · effort <等级> · <上下文>`，然后一个 `│` 和状态词——`ready`，或回合进行中的转轮加 `working · Esc interrupt`。上下文读数在两值都已知时是 `used/window (n%)`，首回合尚未测量前是 `—/window`，不知道窗口时是 `used tok`。右侧是当前情境的提示行；`thinking expanded` 这类短暂反馈会临时占位两秒左右。
+- **Footer。** 左侧是 `codest · <provider/model> · effort <等级> · <上下文>`，然后一个 `│` 和状态词——`ready`，或回合进行中的转轮加 `working · Esc interrupt`。上下文读数始终存在：两值都已知时是 `used/window (n%)`，只知道窗口时是 `—/window`，只知道用量时是 `used tok`，两者都未知时是 `—`。它随每个流式回合报出的 usage 更新，长工具轮次期间也不会停在旧值，回合结束后由完成的那次 usage 定稿。右侧是当前情境的提示行；`thinking expanded` 这类短暂反馈会临时占位两秒左右。
 
 终端 resize 在下一帧重绘；`fullscreen` 下全部按新宽度重新换行，`inline` 下只有尚未进入 scrollback 的行会重排（见[已知边界](development.md#已知边界)）。
 

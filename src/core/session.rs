@@ -427,10 +427,12 @@ pub struct SessionBootstrap {
     /// The profile this run started with, recorded in new sessions' rollout
     /// metadata. Run-scoped: switching sessions does not restore it.
     pub profile: Option<String>,
-    /// The startup effort preset (the active profile's `effort`), seeded
-    /// before the first turn and over the model's `default_level`. `None`
-    /// keeps the model-derived seeding.
-    pub initial_effort: Option<String>,
+    /// The startup effort preset (the active profile's `effort`); it seeds
+    /// sessions that have not chosen an effort themselves and is overridden
+    /// by the model's `default_level` otherwise. Already normalized. The
+    /// outer `Option` distinguishes "no preset" (`None`) from an explicit
+    /// `off` preset (`Some(None)`, from a profile's `effort = "off"`).
+    pub initial_effort: Option<Option<String>>,
     /// Optional cap on model → tool → model rounds per user turn
     /// (`config.toml`'s `max_tool_rounds`). `None` leaves the turn loop
     /// unbounded, matching codex: it ends when the model stops calling
@@ -629,6 +631,13 @@ async fn run_worker(
     // The tool set each session last ran with (`/tools`). Per session, like
     // the model: switching restores the session's own set.
     let mut session_tools: Vec<BTreeSet<String>> = Vec::new();
+    // The reasoning effort each session last ran with. Per session, like the
+    // model and the tool set, so switching back sends the level that session
+    // was left on instead of whatever the session just left was using. The
+    // outer `Option` is "this session never chose one" (seed from the
+    // model's `default_level`), the inner one is the level (`None` = an
+    // explicit `off`, which must not be re-seeded).
+    let mut session_efforts: Vec<Option<Option<String>>> = Vec::new();
 
     for loaded in &bootstrap.loaded {
         // The replay includes the `/context` checkpoint stack, so an undo
@@ -669,6 +678,7 @@ async fn run_worker(
         slots.push(slot);
         session_models.push(loaded.model.clone());
         session_tools.push(enabled);
+        session_efforts.push(loaded.effort.clone());
     }
 
     // Plain startup opens one fresh session on top of the restored ones; the
@@ -678,6 +688,9 @@ async fn run_worker(
         slots.push(RolloutSlot::inactive(new_session_id()));
         session_models.push(None);
         session_tools.push(default_enabled(&tools));
+        // A fresh session has chosen nothing yet: its effort seeds from the
+        // startup preset (below) or the model's `default_level`.
+        session_efforts.push(None);
     }
 
     let mut rollouts = Rollouts {
@@ -690,22 +703,14 @@ async fn run_worker(
     let mut current = sessions.len() - 1;
     let mut active: Option<ActiveTurn> = None;
     // Reasoning effort for the next turn (`Op::SetReasoningEffort`,
-    // `/effort`). Worker-level rather than backend-level, so it also applies
-    // to fixed/test backends (which simply ignore it). A startup preset (the
-    // active profile's `effort`) wins outright — including an explicit
-    // `off`, which clears the override; otherwise it is seeded from the
-    // initial model's `default_level` when it declares one.
-    let mut effort =
-        match bootstrap.initial_effort.take().map(|value| normalize_effort(&value)) {
-            Some(applied) => applied,
-            None => {
-                backend
-                    .selection()
-                    .cloned()
-                    .and_then(|selection| backend.model_info(&selection))
-                    .and_then(|model| model.default_level)
-            }
-        };
+    // `/effort`). Tracked per session in `session_efforts`; this scalar is the
+    // active session's mirror, so a turn's `TurnOptions` and the `/effort`
+    // op read one place. The active session's own choice wins outright —
+    // including an explicit `off`, which must not be re-seeded; an untouched
+    // session falls back to the startup preset (the active profile's
+    // `effort`) and then to its model's `default_level`.
+    let startup_effort = bootstrap.initial_effort.take();
+    let mut effort = resolve_session_effort(&backend, &session_efforts[current], &startup_effort);
 
     loop {
         if let Some(mut turn) = active.take() {
@@ -895,6 +900,9 @@ async fn run_worker(
                 current = sessions.len() - 1;
                 rollouts.push_slot(new_session_id());
                 session_tools.push(default_enabled(&tools));
+                // A new session has chosen no effort yet, so it seeds from
+                // the startup preset or its model's `default_level`.
+                session_efforts.push(None);
                 // A fresh session starts with every tool enabled. The
                 // front-end's mirror still shows the previous session's set,
                 // so resync it only when that differs — sent before the
@@ -905,6 +913,20 @@ async fn run_worker(
                         EventMsg::ToolsSwitched {
                             enabled: session_tools[current].iter().cloned().collect(),
                         },
+                    ));
+                }
+                // The effort is per session too, so the footer must follow
+                // the session just entered: a new one has no choice of its
+                // own and reverts to the seed, which the front-end cannot
+                // compute (it does not know `default_level` after a `/model`
+                // switch). Announced only when it actually changes, and
+                // before the confirmation to keep `SessionStarted` last.
+                let seeded = resolve_session_effort(&backend, &None, &startup_effort);
+                if seeded != effort {
+                    effort = seeded.clone();
+                    let _ = tx.send(Event::new(
+                        submission.id.clone(),
+                        EventMsg::ReasoningEffortSwitched { effort: seeded },
                     ));
                 }
                 let _ = tx.send(Event::new(
@@ -921,6 +943,8 @@ async fn run_worker(
                     // the next turn pick up where the session left off.
                     // Best-effort — a selection that no longer resolves
                     // (provider removed, say) keeps the current model.
+                    // The effort is restored explicitly below, so the model
+                    // switch does not reseed it.
                     if let Some(saved) = session_models[session].clone()
                         && !backend
                             .selection()
@@ -931,11 +955,30 @@ async fn run_worker(
                             current,
                             &tx,
                             &mut effort,
+                            &mut session_efforts,
                             &saved,
                             &submission.id,
+                            false,
                         )
                     {
                         session_models[current] = Some(parsed.as_str().to_string());
+                    }
+                    // The effort this session last ran with — its own choice
+                    // including an explicit `off`, else the startup preset,
+                    // else its (possibly newly restored) model's
+                    // `default_level`. Announced only when it changes, so a
+                    // session switch does not spam the footer.
+                    let restored = resolve_session_effort(
+                        &backend,
+                        &session_efforts[current],
+                        &startup_effort,
+                    );
+                    if restored != effort {
+                        effort = restored.clone();
+                        let _ = tx.send(Event::new(
+                            submission.id.clone(),
+                            EventMsg::ReasoningEffortSwitched { effort: restored },
+                        ));
                     }
                     // The tool set is per session; the front-end's mirror
                     // still shows the session just left. Resync only when the
@@ -990,8 +1033,10 @@ async fn run_worker(
                     current,
                     &tx,
                     &mut effort,
+                    &mut session_efforts,
                     &selection,
                     &submission.id,
+                    true,
                 ) {
                     Ok(parsed) => {
                         session_models[current] = Some(parsed.as_str().to_string());
@@ -1003,6 +1048,10 @@ async fn run_worker(
             }
             Op::SetReasoningEffort { effort: new_effort } => {
                 effort = new_effort.clone();
+                // The choice belongs to this session: replaying it on a
+                // restart and on a switch back must send the same level,
+                // including an explicit `off` (`Some(None)`).
+                session_efforts[current] = Some(new_effort.clone());
                 rollouts.append(
                     current,
                     RolloutItem::ReasoningEffortSwitched { effort: new_effort.clone() },
@@ -1034,8 +1083,10 @@ async fn run_worker(
                         current,
                         &tx,
                         &mut effort,
+                        &mut session_efforts,
                         selection,
                         &submission.id,
+                        true,
                     ) {
                         Ok(parsed) => {
                             session_models[current] = Some(parsed.as_str().to_string());
@@ -1053,6 +1104,7 @@ async fn run_worker(
                     // `off` clears the override, anything else is the level.
                     let applied = normalize_effort(level);
                     effort = applied.clone();
+                    session_efforts[current] = Some(applied.clone());
                     rollouts.append(
                         current,
                         RolloutItem::ReasoningEffortSwitched { effort: applied.clone() },
@@ -1257,6 +1309,15 @@ async fn run_turn(
                         }
                         Some(Ok(StreamItem::Usage { input, output })) => {
                             turn.usage = Some((input, output));
+                            // The context readout should track a long turn,
+                            // not wait for its end: this round's usage is
+                            // already the transcript size the next request
+                            // will carry. Display-only — persistence and the
+                            // session totals still come from `TurnUsage`.
+                            let _ = tx.send(Event::new(
+                                turn.id.clone(),
+                                EventMsg::ContextUsage { input, output },
+                            ));
                         }
                         // `StreamItem` is `#[non_exhaustive]` and lives in the
                         // contract crate, so a plugin protocol adding a variant
@@ -1461,19 +1522,54 @@ async fn execute_tool_call(
     true
 }
 
+/// The effort one session should run with.
+///
+/// A session that chose one keeps it — including an explicit `off`
+/// (`Some(None)`), which must not be re-seeded from the model. A session that
+/// never chose one falls back to the startup preset (the active profile's
+/// `effort`), then to its model's `default_level`.
+fn resolve_session_effort(
+    backend: &ModelBackend,
+    chosen: &Option<Option<String>>,
+    startup_effort: &Option<Option<String>>,
+) -> Option<String> {
+    match chosen {
+        Some(level) => level.clone(),
+        None => startup_effort.clone().unwrap_or_else(|| {
+            backend
+                .selection()
+                .cloned()
+                .and_then(|selection| backend.model_info(&selection))
+                .and_then(|model| model.default_level)
+        }),
+    }
+}
+
 /// Switch the backend to `selection` and record it everywhere: the rollout
 /// item, the `ModelSwitched` event, the model's `default_level` seeding the
 /// effort, and the returned selection for the caller's bookkeeping. Shared
 /// by `Op::SwitchModel` and the per-session model restore on
 /// `Op::SwitchSession`.
+///
+/// A reseed writes both the active mirror (`effort`) and the session's own
+/// record (`session_efforts[current]`), so switching to another session and
+/// back replays this model's seeding rather than leaking a neighbour's level.
+///
+/// `reseed_effort` is `false` only on the per-session restore path: there the
+/// target session's own recorded effort (or, when it has none, the startup
+/// preset) has the final say, and a model's `default_level` must not silently
+/// overwrite a choice the user made in that session.
+#[allow(clippy::too_many_arguments)]
 fn apply_model_switch(
     backend: &mut ModelBackend,
     rollouts: &mut Rollouts,
     current: usize,
     tx: &mpsc::UnboundedSender<Event>,
     effort: &mut Option<String>,
+    session_efforts: &mut [Option<Option<String>>],
     selection: &str,
     submission_id: &str,
+    reseed_effort: bool,
 ) -> Result<Selection, String> {
     let parsed = backend.switch(selection)?;
     rollouts.selection = Some(parsed.clone());
@@ -1496,8 +1592,9 @@ fn apply_model_switch(
     let default_effort = backend
         .model_info(&parsed)
         .and_then(|model| model.default_level);
-    if default_effort.is_some() && default_effort != *effort {
+    if reseed_effort && default_effort.is_some() && default_effort != *effort {
         *effort = default_effort.clone();
+        session_efforts[current] = Some(effort.clone());
         rollouts.append(
             current,
             RolloutItem::ReasoningEffortSwitched { effort: effort.clone() },
@@ -1838,17 +1935,21 @@ mod tests {
         let events = collect_turn(&mut session).await;
 
         // The pre-call text commits as its own message before the tool
-        // activity, then the second round answers.
+        // activity, then the second round answers. Each round's usage is
+        // announced as it streams (`ContextUsage`) for the footer, while only
+        // the completed turn records `TurnUsage`.
         let messages: Vec<&EventMsg> = events.iter().map(|event| &event.msg).collect();
         assert!(matches!(
             messages.as_slice(),
             [
                 EventMsg::TurnStarted,
                 EventMsg::AgentMessageDelta { .. },
+                EventMsg::ContextUsage { input: 10, output: 2 },
                 EventMsg::AgentMessage { message },
                 EventMsg::AgentToolCallStarted { .. },
                 EventMsg::AgentToolCall { name, result, error: None, .. },
                 EventMsg::AgentMessageDelta { .. },
+                EventMsg::ContextUsage { input: 20, output: 4 },
                 EventMsg::AgentMessage { .. },
                 EventMsg::TurnUsage { input: 20, output: 4 },
                 EventMsg::TurnComplete,
@@ -3149,6 +3250,7 @@ mod tests {
             },
             path: std::path::PathBuf::from("/tmp/saved.jsonl"),
             model: Some("test/two".to_string()),
+            effort: None,
             last_usage: None,
             total_input: 0,
             total_output: 0,
@@ -3223,6 +3325,139 @@ mod tests {
         }
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(matches!(&events[0].msg, EventMsg::SessionSwitched { session: 0 }));
+    }
+
+    /// Drain events up to (and including) the one matching `done`.
+    async fn drain_until(
+        session: &mut AgentSession,
+        done: impl Fn(&EventMsg) -> bool,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().await {
+            let finished = done(&event.msg);
+            events.push(event);
+            if finished {
+                break;
+            }
+        }
+        events
+    }
+
+    /// The effort a session runs with: its own choice first (including an
+    /// explicit `off`), then the startup preset, then the model's
+    /// `default_level`. A fixed backend exposes no model metadata, so those
+    /// cases isolate the preset and the recorded choice.
+    #[tokio::test]
+    async fn resolve_session_effort_ranks_choice_preset_and_model() {
+        let fixed = || ModelBackend::Fixed(Arc::new(RecordingClient::new()));
+
+        // A recorded choice wins outright.
+        let recorded = Some(Some("low".to_string()));
+        assert_eq!(
+            resolve_session_effort(&fixed(), &recorded, &Some(Some("high".to_string()))),
+            Some("low".to_string())
+        );
+        // An explicit `off` is a choice too: nothing re-seeds it.
+        assert_eq!(
+            resolve_session_effort(&fixed(), &Some(None), &Some(Some("high".to_string()))),
+            None
+        );
+        // No choice: the startup preset applies, `off` included.
+        assert_eq!(
+            resolve_session_effort(&fixed(), &None, &Some(Some("high".to_string()))),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            resolve_session_effort(&fixed(), &None, &Some(None)),
+            None,
+            "a profile's explicit off preset is honored"
+        );
+        // Nothing anywhere: no effort field is sent.
+        assert_eq!(resolve_session_effort(&fixed(), &None, &None), None);
+    }
+
+    /// The TUI's startup seeding mirrors the worker's: a recorded value is
+    /// used as-is, and only an unset session falls back to the model.
+    #[tokio::test]
+    async fn switching_sessions_restores_each_ones_own_effort() {
+        let client = RecordingClient::new();
+        let options = client.turn_options();
+        let mut session = AgentSession::spawn(Arc::new(client));
+
+        // Session 0: low.
+        session.set_reasoning_effort(Some("low".to_string()));
+        drain_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ReasoningEffortSwitched { .. })
+        })
+        .await;
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+
+        // Session 1: high.
+        session.new_session();
+        drain_until(&mut session, |msg| {
+            matches!(msg, EventMsg::SessionStarted { .. })
+        })
+        .await;
+        session.set_reasoning_effort(Some("high".to_string()));
+        drain_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ReasoningEffortSwitched { .. })
+        })
+        .await;
+        session.submit_user_turn("second");
+        collect_turn(&mut session).await;
+
+        // Back to session 0: its own `low` comes back.
+        session.switch_session(0);
+        let events = drain_until(&mut session, |msg| {
+            matches!(msg, EventMsg::SessionSwitched { .. })
+        })
+        .await;
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.msg,
+                EventMsg::ReasoningEffortSwitched { effort } if effort.as_deref() == Some("low")
+            )),
+            "the switch announces the session's own level: {events:?}"
+        );
+        session.submit_user_turn("third");
+        collect_turn(&mut session).await;
+
+        let sent = options.lock().expect("lock");
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0].effort.as_deref(), Some("low"));
+        assert_eq!(sent[1].effort.as_deref(), Some("high"));
+        assert_eq!(
+            sent[2].effort.as_deref(),
+            Some("low"),
+            "returning to a session restores its own effort"
+        );
+    }
+
+    /// Entering a `/new` session reverts the announced effort to the seed,
+    /// so the footer cannot keep showing the session just left.
+    #[tokio::test]
+    async fn a_new_session_announces_the_seeded_effort() {
+        let mut session = AgentSession::spawn(Arc::new(RecordingClient::new()));
+
+        session.set_reasoning_effort(Some("low".to_string()));
+        drain_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ReasoningEffortSwitched { .. })
+        })
+        .await;
+
+        session.new_session();
+        let events = drain_until(&mut session, |msg| {
+            matches!(msg, EventMsg::SessionStarted { .. })
+        })
+        .await;
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.msg,
+                EventMsg::ReasoningEffortSwitched { effort: None }
+            )),
+            "a fresh session has chosen nothing: {events:?}"
+        );
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ Three of the files are machine-managed and you normally do not edit them by hand
 | File | Written by | Consequence |
 | --- | --- | --- |
 | `plugins.toml` | `codest plugin install` / `uninstall` | Holds the external plugin list plus the codest checkout the wrapper crate links against. |
-| `model-cache.json` | Startup discovery | Preloaded so `/model` is instant and a failed refresh never empties the menu. |
+| `model-cache.json` | Startup discovery | Preloaded so `/model` is instant and a failed refresh never empties the menu. Each entry records the endpoint it came from and is used only while that endpoint is still the configured one; entries for providers that are no longer configured are pruned on write. A file from an older codest (untagged entries) cannot be validated and is refetched once. |
 | `providers.toml` | `/provider` wizard (only on confirm) | A wizard write is atomic but machine-formatted: hand comments and layout are lost. |
 
 Only `config.toml`, `providers.toml`, and `profiles.toml` are meant to be hand-edited, and each is optional — a missing file simply contributes nothing.
@@ -120,14 +120,14 @@ A model-level `session_header` in `[[providers.models]]` overrides the instance'
 | --- | --- |
 | `CST_MODEL` | Model id to start with (the `model` half of a selection). |
 | `CST_PROVIDER` | Provider instance to start with. |
-| `CST_BASE_URL` | OpenAI-compatible base URL, or a full `/chat/completions` URL; overrides the selected instance. |
+| `CST_BASE_URL` | OpenAI-compatible base URL, or a full `/chat/completions` URL. Runs its own `untitled` instance instead of rewriting a configured one. |
 | `CST_API_KEY` | API key for the endpoint; overrides the selected instance. |
 | `CST_PROFILE` | Profile from `~/.codest/profiles.toml` to start with. |
 | `CST_TUI_MODE` | `fullscreen` (default) or `inline`. |
 | `CODEST_HOME` | Root directory for all state, replacing `~/.codest`. |
 | `CODEST_SRC` | codest checkout used by `codest plugin install`/`build` to link the wrapper crate against. |
 | `OPENAI_API_KEY` | Fallback for `CST_API_KEY` when the synthesized single endpoint is in use. |
-| `OPENAI_BASE_URL` | Fallback for `CST_BASE_URL` when the synthesized single endpoint is in use. |
+| `OPENAI_BASE_URL` | Fallback for `CST_BASE_URL`, consulted only when `providers.toml` is empty — exporting it never re-points a configured instance. |
 
 `CODEST_SRC` is consulted by the installer after an explicit `--codest-src` and before the directory the binary was compiled from and the path recorded in `plugins.toml`; each candidate is verified to be a codest checkout, and a stale one degrades to the next. See [local-plugins.md](local-plugins.md).
 

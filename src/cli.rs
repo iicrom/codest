@@ -214,9 +214,15 @@ pub async fn run_with(
     )?);
     let global = config::load_global(&config::config_path())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let pool = build_pool(&plugins, &global, &args)?;
+    let (pool, pinned) = build_pool(&plugins, &global, &args)?;
     let registry = pool.registry();
-    let selection = initial_selection(&registry, &global, &args, active.map(|(_, p)| p))?;
+    let selection = initial_selection(
+        &registry,
+        &global,
+        &args,
+        active.map(|(_, p)| p),
+        pinned.as_deref(),
+    )?;
 
     // Fail fast on an unusable selection rather than at the first turn.
     if let Some(selection) = &selection {
@@ -456,34 +462,95 @@ fn note_missing_profile(name: &str, profiles: &config::ProfileSet) {
 /// `OPENAI_BASE_URL` — local test servers need no key, so a lone base URL
 /// counts). With nothing configured at all the pool starts empty and the
 /// front-end guides the user to add a provider.
+///
+/// The second element of the pair is the provider name this run's flags
+/// pinned (see [`resolve_instances`]); the startup selection honours it over
+/// any configured default.
 fn build_pool(
     plugins: &PluginHost,
     global: &config::GlobalConfig,
     args: &Args,
-) -> anyhow::Result<Arc<ModelPool>> {
-    let mut instances = config::load_providers(&config::providers_path())
+) -> anyhow::Result<(Arc<ModelPool>, Option<String>)> {
+    let loaded = config::load_providers(&config::providers_path())
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let (instances, pinned) = resolve_instances(loaded, global, args)?;
 
-    let mut synthesized = false;
-    if instances.is_empty() {
-        match synthesized_openai_instance(args) {
-            Some(instance) => {
-                instances.push(instance);
-                synthesized = true;
-            }
-            None => {
-                let factories = plugins.protocol_factories();
-                return Ok(Arc::new(
-                    ModelPool::new(ProviderRegistry::build(&factories, Vec::new())?)
-                        .with_cache(config::model_cache_path()),
-                ));
-            }
+    let factories = plugins.protocol_factories();
+    let registry = ProviderRegistry::build(&factories, instances)
+        .map_err(|error: RegistryError| anyhow::anyhow!("{error}"))?;
+    Ok((
+        Arc::new(ModelPool::new(registry).with_cache(config::model_cache_path())),
+        pinned,
+    ))
+}
+
+/// The provider name a `--base-url` endpoint always runs under.
+///
+/// A flag-named endpoint is a route of its own, not a rewrite of somebody
+/// else's: the model cache is keyed by provider name, so borrowing a
+/// configured instance's name would make two different endpoints share one
+/// cached model list.
+const UNTITLED_PROVIDER: &str = "untitled";
+
+/// Apply the flag/env endpoint rules to the configured instances.
+///
+/// * `--base-url` (or `CST_BASE_URL`) names its own endpoint: a throwaway
+///   `untitled` instance is appended to the configured ones, which stay
+///   selectable through `/model`. `--provider` cannot apply at the same time
+///   and is noted as ignored. This is also what keeps a one-off endpoint from
+///   overwriting a configured provider's `base_url`, and therefore from
+///   polluting that provider's cached model list. `OPENAI_BASE_URL` is
+///   deliberately not consulted here: it is a fallback for the
+///   *nothing-configured* path, so exporting it must not hijack a normal run.
+/// * Otherwise, with nothing configured, the historical flag/env synthesis
+///   applies unchanged.
+/// * Otherwise only `--api-key` can still act: it completes the instance this
+///   run selects without renaming or re-pointing it.
+///
+/// The returned name is the provider this run pinned, if any.
+fn resolve_instances(
+    mut instances: Vec<config::ProviderInstance>,
+    global: &config::GlobalConfig,
+    args: &Args,
+) -> anyhow::Result<(Vec<config::ProviderInstance>, Option<String>)> {
+    let configured = !instances.is_empty();
+    if args
+        .base_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        if args.provider.is_some() {
+            eprintln!(
+                "codest: note: --provider ignored: --base-url runs its own \
+                 `{UNTITLED_PROVIDER}` instance"
+            );
         }
-    } else {
-        // Flags override the instance this run selects (see
-        // `resolve_provider_name` for which one that is).
-        let target = resolve_provider_name(global, args)
-            .unwrap_or_else(|| instances[0].name.clone());
+        let synthesized = synthesized_openai_instance(args)
+            .expect("a non-empty `--base-url` always synthesizes");
+        // A stale same-named entry in providers.toml would collide with it.
+        instances.retain(|instance| instance.name != synthesized.name);
+        instances.push(synthesized);
+        if !configured {
+            note_synthesized_endpoint();
+        }
+        return Ok((instances, Some(UNTITLED_PROVIDER.to_string())));
+    }
+
+    if !configured {
+        return match synthesized_openai_instance(args) {
+            Some(instance) => {
+                note_synthesized_endpoint();
+                Ok((vec![instance], None))
+            }
+            None => Ok((Vec::new(), None)),
+        };
+    }
+
+    // Flags override the instance this run selects (see
+    // `resolve_provider_name` for which one that is).
+    if args.api_key.is_some() {
+        let target =
+            resolve_provider_name(global, args).unwrap_or_else(|| instances[0].name.clone());
         let Some(instance) = instances.iter_mut().find(|i| i.name == target) else {
             return Err(anyhow::anyhow!(
                 "no provider `{target}` in {} (configured: {})",
@@ -495,27 +562,19 @@ fn build_pool(
                     .join(", ")
             ));
         };
-        if args.base_url.is_some() {
-            instance.base_url = args.base_url.clone();
-        }
-        if args.api_key.is_some() {
-            instance.api_key = args.api_key.clone();
-        }
+        instance.api_key = args.api_key.clone();
     }
+    Ok((instances, None))
+}
 
-    let factories = plugins.protocol_factories();
-    let registry = ProviderRegistry::build(&factories, instances)
-        .map_err(|error: RegistryError| anyhow::anyhow!("{error}"))?;
-    if synthesized {
-        eprintln!(
-            "codest: no providers.toml; using the endpoint from flags/env \
-             (create {} to add more)",
-            config::providers_path().display()
-        );
-    }
-    Ok(Arc::new(
-        ModelPool::new(registry).with_cache(config::model_cache_path()),
-    ))
+/// The one-line note for the nothing-configured path: the run is using an
+/// endpoint that only exists in memory.
+fn note_synthesized_endpoint() {
+    eprintln!(
+        "codest: no providers.toml; using the endpoint from flags/env \
+         (create {} to add more)",
+        config::providers_path().display()
+    );
 }
 
 /// The pre-config single endpoint — only when flags/env actually name one.
@@ -547,7 +606,7 @@ fn synthesized_openai_instance(args: &Args) -> Option<config::ProviderInstance> 
         .clone()
         .or_else(|| std::env::var("CST_MODEL").ok());
     Some(config::ProviderInstance {
-        name: "untitled".to_string(),
+        name: UNTITLED_PROVIDER.to_string(),
         protocol: None,
         base_url,
         api_key,
@@ -581,15 +640,17 @@ fn resolve_provider_name(global: &config::GlobalConfig, args: &Args) -> Option<S
 /// The selection this run starts with; `None` means no route at all (the
 /// front-end guides the user to add a provider).
 ///
-/// Precedence: `--provider`/`--model` > the active profile's `default` >
-/// config.toml `default` > the first model of the first instance. A model id
-/// nobody declared yet (it may still arrive through models discovery)
-/// proceeds with a warning; an unknown *provider* is a hard error.
+/// Precedence: a flag-pinned provider (`--base-url`'s `untitled` route) >
+/// `--provider`/`--model` > the active profile's `default` > config.toml
+/// `default` > the first model of the first instance. A model id nobody
+/// declared yet (it may still arrive through models discovery) proceeds with
+/// a warning; an unknown *provider* is a hard error.
 fn initial_selection(
     registry: &ProviderRegistry,
     global: &config::GlobalConfig,
     args: &Args,
     profile: Option<&config::Profile>,
+    pinned: Option<&str>,
 ) -> anyhow::Result<Option<Selection>> {
     // No providers at all: an empty route wins over a stray `default`, so
     // the TUI can still start and guide the user.
@@ -606,7 +667,15 @@ fn initial_selection(
     let preset = profile
         .and_then(config::Profile::default_selection)
         .or(global.default.as_deref());
-    let selection = if let Some(provider) = args.provider.as_deref() {
+    let selection = if let Some(pinned) = pinned {
+        // The endpoint named by `--base-url` is the route this run asked
+        // for; no configured default may redirect it. (`--model` still
+        // supplies the model half, and an empty one waits for discovery.)
+        Some(Selection::new(
+            pinned,
+            args.model.clone().unwrap_or_default(),
+        ))
+    } else if let Some(provider) = args.provider.as_deref() {
         let model = args.model.clone().unwrap_or_else(|| {
             registry
                 .instance(provider)
@@ -732,24 +801,175 @@ mod tests {
         };
 
         // The profile's default beats the global default.
-        let selection = initial_selection(&registry, &global, &args(&[]), Some(&profile)).unwrap();
+        let selection =
+            initial_selection(&registry, &global, &args(&[]), Some(&profile), None).unwrap();
         assert_eq!(selection, Some(Selection::new("p", "m2")));
 
         // `--model` still overrides the preset's model half.
-        let selection =
-            initial_selection(&registry, &global, &args(&["--model", "m1"]), Some(&profile))
-                .unwrap();
+        let selection = initial_selection(
+            &registry,
+            &global,
+            &args(&["--model", "m1"]),
+            Some(&profile),
+            None,
+        )
+        .unwrap();
         assert_eq!(selection, Some(Selection::new("p", "m1")));
 
         // `--provider` wins over the preset outright (first declared model).
-        let selection =
-            initial_selection(&registry, &global, &args(&["--provider", "q"]), Some(&profile))
-                .unwrap();
+        let selection = initial_selection(
+            &registry,
+            &global,
+            &args(&["--provider", "q"]),
+            Some(&profile),
+            None,
+        )
+        .unwrap();
         assert_eq!(selection, Some(Selection::new("q", "m1")));
 
         // Without a profile the global default applies again.
-        let selection = initial_selection(&registry, &global, &args(&[]), None).unwrap();
+        let selection = initial_selection(&registry, &global, &args(&[]), None, None).unwrap();
         assert_eq!(selection, Some(Selection::new("q", "m2")));
+    }
+
+    /// `--base-url` names its own route: the configured instances keep their
+    /// names, URLs, and cached model lists, and the run is pinned to the
+    /// throwaway `untitled` instance.
+    #[test]
+    fn base_url_synthesizes_untitled_alongside_configured_instances() {
+        let configured = |name: &str| config::ProviderInstance {
+            name: name.to_string(),
+            protocol: None,
+            base_url: Some("https://configured.test/v1".to_string()),
+            api_key: Some("k".to_string()),
+            models: vec![config::ModelInfo::from_id("m1")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            wire: None,
+            options: Default::default(),
+            requires_api_key: false,
+        };
+        let global = config::GlobalConfig::default();
+        let loaded = vec![configured("opencode-go")];
+
+        let (instances, pinned) = resolve_instances(
+            loaded.clone(),
+            &global,
+            &args(&[
+                "--base-url",
+                "http://127.0.0.1:9/v1",
+                "--api-key",
+                "one-off",
+            ]),
+        )
+        .expect("resolves");
+
+        assert_eq!(pinned.as_deref(), Some("untitled"));
+        assert_eq!(
+            instances.len(),
+            2,
+            "the configured instance survives and the endpoint joins it"
+        );
+        // The configured endpoint is untouched: no `base_url` rewrite, and so
+        // no cache pollution under its name.
+        let kept = instances
+            .iter()
+            .find(|instance| instance.name == "opencode-go")
+            .expect("configured instance kept");
+        assert_eq!(kept.base_url.as_deref(), Some("https://configured.test/v1"));
+        assert_eq!(kept.api_key.as_deref(), Some("k"));
+        // The endpoint is its own instance.
+        let synthesized = instances
+            .iter()
+            .find(|instance| instance.name == "untitled")
+            .expect("synthesized instance");
+        assert_eq!(synthesized.base_url.as_deref(), Some("http://127.0.0.1:9/v1"));
+        assert_eq!(synthesized.api_key.as_deref(), Some("one-off"));
+
+        // A stale same-named entry would collide, so it is replaced.
+        let with_untitled = {
+            let mut stale = configured("untitled");
+            stale.base_url = Some("https://stale.test/v1".to_string());
+            vec![configured("opencode-go"), stale]
+        };
+        let (instances, _) = resolve_instances(
+            with_untitled,
+            &global,
+            &args(&["--base-url", "http://127.0.0.1:9/v1"]),
+        )
+        .expect("resolves");
+        let untitled: Vec<_> = instances
+            .iter()
+            .filter(|instance| instance.name == "untitled")
+            .collect();
+        assert_eq!(untitled.len(), 1, "exactly one `untitled` instance");
+        assert_eq!(untitled[0].base_url.as_deref(), Some("http://127.0.0.1:9/v1"));
+    }
+
+    /// Only `--api-key` still completes the selected instance in place; it
+    /// must not rename or re-point anything.
+    #[test]
+    fn api_key_alone_overrides_the_selected_instance() {
+        let instance = config::ProviderInstance {
+            name: "p".to_string(),
+            protocol: Some("test".to_string()),
+            base_url: Some("http://127.0.0.1:1/v1".to_string()),
+            api_key: None,
+            models: vec![config::ModelInfo::from_id("m1")],
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            wire: None,
+            options: Default::default(),
+            requires_api_key: false,
+        };
+        let global = config::GlobalConfig {
+            default: Some("p/m1".to_string()),
+            max_tool_rounds: None,
+        };
+
+        let (instances, pinned) =
+            resolve_instances(vec![instance.clone()], &global, &args(&["--api-key", "secret"]))
+                .expect("resolves");
+        assert_eq!(pinned, None, "no endpoint flag, no pinned route");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].name, "p");
+        assert_eq!(instances[0].base_url, instance.base_url);
+        assert_eq!(instances[0].api_key.as_deref(), Some("secret"));
+    }
+
+    /// A pinned route outranks every configured default — including a stale
+    /// `config.toml` default naming a provider that no longer exists.
+    #[test]
+    fn pinned_route_ignores_configured_defaults() {
+        let registry = two_provider_registry();
+        let global = config::GlobalConfig {
+            default: Some("gone/m2".to_string()),
+            max_tool_rounds: None,
+        };
+
+        let selection = initial_selection(
+            &registry,
+            &global,
+            &args(&["--base-url", "http://127.0.0.1:9/v1"]),
+            None,
+            Some("p"),
+        )
+        .expect("a stray default must not fail the run");
+        // No `--model`: the model half waits for discovery.
+        assert_eq!(selection, Some(Selection::new("p", "")));
+
+        // `--model` still supplies the model half.
+        let selection = initial_selection(
+            &registry,
+            &global,
+            &args(&["--base-url", "http://127.0.0.1:9/v1", "--model", "m2"]),
+            None,
+            Some("p"),
+        )
+        .expect("resolves");
+        assert_eq!(selection, Some(Selection::new("p", "m2")));
     }
 
     /// A pool over one synthesized-style instance, for gate assertions.

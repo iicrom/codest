@@ -288,6 +288,15 @@ pub struct LoadedSession {
     /// from the meta line, [`RolloutItem::ModelSwitched`] items, and per-turn
     /// usage records — the model a resumed session starts with.
     pub model: Option<String>,
+    /// The reasoning effort this session last ran with, replayed from its
+    /// [`RolloutItem::ReasoningEffortSwitched`] items.
+    ///
+    /// Three states on purpose: `None` means the session never chose one (so
+    /// a resumed session seeds the effort from the active model's
+    /// `default_level`), `Some(None)` is an explicit `off` (no effort field is
+    /// sent, and it must not be re-seeded), and `Some(Some(level))` is that
+    /// level.
+    pub effort: Option<Option<String>>,
     /// Usage of the last recorded turn; `None` when the rollout predates
     /// usage records or a `/clear` reset them.
     pub last_usage: Option<(u64, u64)>,
@@ -456,6 +465,10 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     let mut last_usage = None;
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
+    // The effort the session last ran with. The outer `Option` tracks
+    // whether any record exists at all; the inner one is the level, with
+    // `None` meaning an explicit `off`.
+    let mut effort: Option<Option<String>> = None;
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -509,13 +522,19 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 total_input = 0;
                 total_output = 0;
             }
-            // The active model selection and the reasoning effort are
-            // metadata for attribution; they do not change the replayed
-            // conversation. The selection still tracks the last used model.
+            // The active model selection tracks the last model used; the
+            // effort is replayed for the same reason — a resumed or re-entered
+            // session must send the level it was left on, including an
+            // explicit `off`. Neither changes the replayed conversation.
             RolloutItem::ModelSwitched { provider, model: switched } => {
                 model = Some(format!("{provider}/{switched}"));
             }
-            RolloutItem::ReasoningEffortSwitched { .. } => {}
+            RolloutItem::ReasoningEffortSwitched { effort: level } => {
+                // `Some(None)` is an explicit `off`, distinct from "never
+                // chosen" — the distinction decides whether a resumed session
+                // re-seeds from the model's `default_level`.
+                effort = Some(level);
+            }
             RolloutItem::TurnUsage { model: served, input, output } => {
                 // A fixed backend reports no model; that cannot clear the
                 // tracked selection.
@@ -615,6 +634,7 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
         undo,
         name,
         model,
+        effort,
         last_usage,
         total_input,
         total_output,
@@ -1075,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_switched_round_trips_and_replay_ignores_it() {
+    fn reasoning_effort_round_trips_and_replays_the_last_one() {
         let dir = tempdir("effort");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
         let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
@@ -1089,13 +1109,49 @@ mod tests {
                 message: "hello".to_string(),
             })
             .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "hello");
+        // The recorded level comes back, so a resumed session sends it.
+        assert_eq!(loaded.effort, Some(Some("high".to_string())));
+    }
+
+    /// An explicit `off` is a choice, not "unset": replay must keep the two
+    /// apart or a resumed session would silently re-seed from the model's
+    /// `default_level`.
+    #[test]
+    fn reasoning_effort_off_round_trips_distinct_from_unset() {
+        let dir = tempdir("effort-off");
+
+        let unset = {
+            let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+            let rollout = writer
+                .start_session(&new_id(), "be brief", None, None, None)
+                .expect("start");
+            load_session(&rollout.path).expect("load").effort
+        };
+        assert_eq!(unset, None, "no record means nothing was chosen");
+
+        let writer = RolloutWriter::new(dir, "/tmp/demo".to_string());
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
+        rollout
+            .append(&RolloutItem::ReasoningEffortSwitched {
+                effort: Some("high".to_string()),
+            })
+            .expect("append");
         rollout
             .append(&RolloutItem::ReasoningEffortSwitched { effort: None })
             .expect("append");
 
         let loaded = load_session(&rollout.path).expect("load");
-        assert_eq!(loaded.messages.len(), 1);
-        assert_eq!(loaded.messages[0].content, "hello");
+        assert_eq!(
+            loaded.effort,
+            Some(None),
+            "an explicit off is remembered as a choice"
+        );
     }
 
     #[test]

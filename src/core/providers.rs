@@ -385,6 +385,12 @@ pub struct ModelPool {
     /// Models discovered through the providers' models APIs, merged over the
     /// declared ones. Keyed by provider name.
     fetched: Mutex<BTreeMap<String, Vec<ModelInfo>>>,
+    /// The endpoint each `fetched` entry was discovered from. A name alone
+    /// cannot identify a model list — the same name may point at a different
+    /// endpoint between runs (`--base-url`, an edited `providers.toml`), and
+    /// reusing the old list under the new URL is exactly the pollution this
+    /// guards against.
+    fetched_from: Mutex<BTreeMap<String, String>>,
     cache_path: Option<PathBuf>,
 }
 
@@ -393,6 +399,7 @@ impl ModelPool {
         Self {
             registry: RwLock::new(Arc::new(registry)),
             fetched: Mutex::new(BTreeMap::new()),
+            fetched_from: Mutex::new(BTreeMap::new()),
             cache_path: None,
         }
     }
@@ -427,37 +434,73 @@ impl ModelPool {
     /// next one already reads the new `base_url`/`api_key`.
     pub fn install_instance(&self, instance: ProviderInstance) -> Result<(), RegistryError> {
         let name = instance.name.clone();
-        let mut guard = self.registry.write().expect("pool lock");
-        let mut instances: Vec<ProviderInstance> = guard
-            .instances()
-            .iter()
-            .filter(|existing| existing.name != name)
-            .cloned()
-            .collect();
-        instances.push(instance);
-        let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
-        *guard = Arc::new(rebuilt);
-        self.fetched.lock().expect("pool lock").remove(&name);
+        {
+            let mut guard = self.registry.write().expect("pool lock");
+            let mut instances: Vec<ProviderInstance> = guard
+                .instances()
+                .iter()
+                .filter(|existing| existing.name != name)
+                .cloned()
+                .collect();
+            instances.push(instance);
+            let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
+            *guard = Arc::new(rebuilt);
+        }
+        // Outside the write guard: `forget` re-reads the registry to prune the
+        // cache file.
+        self.forget(&name);
         Ok(())
     }
 
     /// Drop one instance, plus its fetched models and cached clients. Used by
     /// the wizard's delete action.
     pub fn remove_instance(&self, name: &str) -> Result<bool, RegistryError> {
-        let mut guard = self.registry.write().expect("pool lock");
-        if guard.instance(name).is_none() {
-            return Ok(false);
+        {
+            let mut guard = self.registry.write().expect("pool lock");
+            if guard.instance(name).is_none() {
+                return Ok(false);
+            }
+            let instances: Vec<ProviderInstance> = guard
+                .instances()
+                .iter()
+                .filter(|existing| existing.name != name)
+                .cloned()
+                .collect();
+            let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
+            *guard = Arc::new(rebuilt);
         }
-        let instances: Vec<ProviderInstance> = guard
-            .instances()
-            .iter()
-            .filter(|existing| existing.name != name)
-            .cloned()
-            .collect();
-        let rebuilt = ProviderRegistry::build(&factories_of(&guard), instances)?;
-        *guard = Arc::new(rebuilt);
-        self.fetched.lock().expect("pool lock").remove(name);
+        self.forget(name);
         Ok(true)
+    }
+
+    /// Drop a provider's discovered models in memory *and* on disk: the cache
+    /// file would otherwise resurrect them on the next start.
+    fn forget(&self, provider: &str) {
+        self.fetched.lock().expect("pool lock").remove(provider);
+        self.fetched_from
+            .lock()
+            .expect("pool lock")
+            .remove(provider);
+        self.save_cache();
+    }
+
+    /// Test hook: install a discovered list as if `refresh` had just fetched
+    /// it from the provider's current endpoint.
+    #[cfg(test)]
+    fn stage_fetched(&self, provider: &str, models: Vec<ModelInfo>) {
+        let endpoint = self
+            .registry()
+            .instance(provider)
+            .map(endpoint_of)
+            .unwrap_or_default();
+        self.fetched
+            .lock()
+            .expect("pool lock")
+            .insert(provider.to_string(), models);
+        self.fetched_from
+            .lock()
+            .expect("pool lock")
+            .insert(provider.to_string(), endpoint);
     }
 
     /// The raw missing piece name (`"base_url"` / `"api_key"`), if the
@@ -606,6 +649,11 @@ impl ModelPool {
             let mut fetched = self.fetched.lock().expect("pool lock");
             fetched.insert(provider.to_string(), models);
             drop(fetched);
+            let endpoint = endpoint_of(&instance);
+            self.fetched_from
+                .lock()
+                .expect("pool lock")
+                .insert(provider.to_string(), endpoint);
             // `models_of` re-locks `fetched`, so the guard above must be
             // gone — a lock held across this call would deadlock the menu
             // reading on the other end of the pool.
@@ -631,6 +679,17 @@ impl ModelPool {
             })
     }
 
+    /// Preload the on-disk cache, keeping only entries that still describe a
+    /// configured endpoint.
+    ///
+    /// The cache is keyed by provider name, but a name does not identify a
+    /// model list: `--base-url` or an edited `providers.toml` can point the
+    /// same name at a different endpoint between runs. An entry is therefore
+    /// used only when its recorded endpoint matches the instance's current
+    /// one; untouched entries (the older, untagged format) cannot be checked
+    /// and are dropped — they are rediscovered on this run. A stale entry
+    /// would otherwise merge another endpoint's models into `/model`, which
+    /// is the pollution this rules out.
     fn load_cache(&mut self, path: &PathBuf) {
         let Ok(content) = std::fs::read_to_string(path) else {
             return;
@@ -638,16 +697,59 @@ impl ModelPool {
         let Ok(cache) = serde_json::from_str::<ModelCache>(&content) else {
             return;
         };
-        *self.fetched.lock().expect("pool lock") = cache.providers;
+        let registry = self.registry();
+        let mut fetched = BTreeMap::new();
+        let mut fetched_from = BTreeMap::new();
+        for (provider, cached) in cache.providers {
+            let Some(instance) = registry.instance(&provider) else {
+                continue;
+            };
+            let endpoint = endpoint_of(instance);
+            let CachedModels::Tagged(entry) = cached else {
+                continue;
+            };
+            if entry.base_url.as_deref() != Some(endpoint.as_str()) {
+                continue;
+            }
+            fetched.insert(provider.clone(), entry.models);
+            fetched_from.insert(provider, endpoint);
+        }
+        *self.fetched.lock().expect("pool lock") = fetched;
+        *self.fetched_from.lock().expect("pool lock") = fetched_from;
     }
 
+    /// Write the overlay back, pruning entries that no longer belong to a
+    /// configured endpoint. Without the prune every provider ever configured
+    /// would be re-persisted forever.
     fn save_cache(&self) {
         let Some(path) = &self.cache_path else {
             return;
         };
-        let cache = ModelCache {
-            providers: self.fetched.lock().expect("pool lock").clone(),
-        };
+        let registry = self.registry();
+        let fetched = self.fetched.lock().expect("pool lock");
+        let fetched_from = self.fetched_from.lock().expect("pool lock");
+        let mut providers = BTreeMap::new();
+        for (provider, models) in fetched.iter() {
+            // A candidate whose endpoint moved on is not this run's list;
+            // `refresh` will refill it for the current endpoint.
+            let Some(instance) = registry.instance(provider) else {
+                continue;
+            };
+            let endpoint = endpoint_of(instance);
+            if fetched_from.get(provider) != Some(&endpoint) {
+                continue;
+            }
+            providers.insert(
+                provider.clone(),
+                CachedModels::Tagged(CachedEntry {
+                    base_url: Some(endpoint),
+                    models: models.clone(),
+                }),
+            );
+        }
+        drop(fetched_from);
+        drop(fetched);
+        let cache = ModelCache { providers };
         if let Ok(json) = serde_json::to_string_pretty(&cache)
             && let Err(error) = std::fs::write(path, json + "\n")
         {
@@ -656,10 +758,40 @@ impl ModelPool {
     }
 }
 
+/// The endpoint a provider's models come from, as recorded in the cache:
+/// the instance's `base_url`, trimmed so cosmetic slash edits do not count as
+/// a different endpoint. An instance without one has no cacheable endpoint.
+fn endpoint_of(instance: &ProviderInstance) -> String {
+    instance
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct ModelCache {
     #[serde(default)]
-    providers: BTreeMap<String, Vec<ModelInfo>>,
+    providers: BTreeMap<String, CachedModels>,
+}
+
+/// One cached model list. The tagged form records the endpoint it came from
+/// so a name pointing elsewhere cannot reuse it; the untagged form is the
+/// pre-endpoint-tagging file layout, read only to be discarded.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum CachedModels {
+    Tagged(CachedEntry),
+    Legacy(Vec<ModelInfo>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedEntry {
+    base_url: Option<String>,
+    #[serde(default)]
+    models: Vec<ModelInfo>,
 }
 
 /// Timeout for one models-API request.
@@ -749,7 +881,7 @@ impl ProtocolFactory for OpenAiCompatFactory {
             let base_url = instance.base_url.as_deref().map(str::trim).filter(|url| !url.is_empty()).ok_or_else(|| {
                 ModelError::NotConfigured("base_url is not set; the models API needs one".to_string())
             })?;
-            let url = format!("{}/models", base_url.trim_end_matches('/'));
+            let url = models_url(instance, base_url);
             let api_key = instance.resolved_api_key().unwrap_or_default();
 
             let http = reqwest::Client::builder()
@@ -783,8 +915,42 @@ impl ProtocolFactory for OpenAiCompatFactory {
     }
 }
 
-/// Parse the OpenAI-shaped `{data: [{id, ...}]}` directory. Entries without
-/// an id are skipped, duplicates are collapsed, order is preserved.
+/// The models-API URL for one instance.
+///
+/// `options.models_url` names it explicitly, for endpoints whose models API
+/// does not live at `{base_url}/models`. Validation is codecs-level, not
+/// vendor-level: no host is known here. Without the option the URL is
+/// `{base_url}/models`, exactly as before the option existed.
+fn models_url(instance: &ProviderInstance, base_url: &str) -> String {
+    match instance
+        .option_str(MODELS_URL_OPTION)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        Some(url) => url.to_string(),
+        None => format!("{}/models", base_url.trim_end_matches('/')),
+    }
+}
+
+/// The `options` key naming an explicit models-API URL.
+const MODELS_URL_OPTION: &str = "models_url";
+
+/// Parse a models directory into advisory [`ModelInfo`] records.
+///
+/// Only shapes seen on the wire are handled, never vendor names. The outer
+/// envelope is OpenAI's `{data: [{...}]}`; within an entry the metadata
+/// spellings that vary are read in order of specificity:
+///
+/// * context window — `limit.context` (`{context, output}`), then
+///   `context_length` (OpenRouter), then `context_window`;
+/// * reasoning levels — `capabilities.reasoning.effort` (an ordered list,
+///   lowest first), falling back to a top-level `reasoning` array, else the
+///   `default_level` field;
+/// * default level — `capabilities.reasoning.default`, then `default_level`.
+///
+/// Entries without an id are skipped, duplicates are collapsed, order is
+/// preserved. Unknown fields are ignored: the directory carries far more than
+/// this client consumes.
 pub fn models_from_openai_list(payload: &serde_json::Value) -> Vec<ModelInfo> {
     let mut models = Vec::new();
     let Some(entries) = payload.get("data").and_then(serde_json::Value::as_array) else {
@@ -804,28 +970,56 @@ pub fn models_from_openai_list(payload: &serde_json::Value) -> Vec<ModelInfo> {
             .filter(|name| !name.is_empty())
             .map(str::to_string);
         let default_level = entry
-            .get("default_level")
+            .pointer("/capabilities/reasoning/default")
             .and_then(serde_json::Value::as_str)
+            .or_else(|| entry.get("default_level").and_then(serde_json::Value::as_str))
             .map(str::trim)
             .filter(|level| !level.is_empty())
             .map(str::to_string);
-        // Context window spellings seen in the wild: `context_length`
-        // (OpenRouter) and `context_window`. Both are advisory metadata.
+        let reasoning = reasoning_levels(entry);
+        // The window: a `{context, output}` limits object first, then the
+        // two flat spellings older endpoints use.
         let context_window = entry
-            .get("context_length")
-            .or_else(|| entry.get("context_window"))
-            .and_then(serde_json::Value::as_u64);
+            .pointer("/limit/context")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                entry
+                    .get("context_length")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .or_else(|| {
+                entry
+                    .get("context_window")
+                    .and_then(serde_json::Value::as_u64)
+            });
         models.push(ModelInfo {
             id: id.to_string(),
             name,
             context_window,
-            reasoning: None,
+            reasoning,
             default_level,
             // Models discovery reports no per-model overrides.
             session_header: None,
         });
     }
     models
+}
+
+/// The effort levels one directory entry accepts, lowest first. An absent or
+/// empty list means "unknown", which `/effort` reads as the shared defaults.
+fn reasoning_levels(entry: &serde_json::Value) -> Option<Vec<String>> {
+    let list = entry
+        .pointer("/capabilities/reasoning/effort")
+        .or_else(|| entry.get("reasoning"))
+        .and_then(serde_json::Value::as_array)?;
+    let levels: Vec<String> = list
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+        .map(str::to_string)
+        .collect();
+    (!levels.is_empty()).then_some(levels)
 }
 
 /// `test`: the in-process echo model. Zero-config offline demo backend.
@@ -1094,14 +1288,14 @@ mod tests {
         let pool = ModelPool::new(registry);
         assert_eq!(pool.models_of("p").len(), 1);
 
-        pool.fetched
-            .lock()
-            .expect("lock")
-            .insert("p".to_string(), vec![
+        pool.stage_fetched(
+            "p",
+            vec![
                 ModelInfo::from_id("m1"),
                 ModelInfo::from_id("m2"),
                 ModelInfo::from_id("m3"),
-            ]);
+            ],
+        );
 
         let models = pool.models_of("p");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
@@ -1135,10 +1329,7 @@ mod tests {
         fetched_m1.default_level = Some("high".to_string());
         let mut fetched_m2 = ModelInfo::from_id("m2");
         fetched_m2.context_window = Some(200_000);
-        pool.fetched
-            .lock()
-            .expect("lock")
-            .insert("p".to_string(), vec![fetched_m1, fetched_m2]);
+        pool.stage_fetched("p", vec![fetched_m1, fetched_m2]);
 
         let models = pool.models_of("p");
         // The declared window wins; the unset fields come from discovery.
@@ -1168,10 +1359,7 @@ mod tests {
         )
         .unwrap();
         let pool = ModelPool::new(registry).with_cache(cache_path.clone());
-        pool.fetched
-            .lock()
-            .expect("lock")
-            .insert("p".to_string(), vec![ModelInfo::from_id("fetched")]);
+        pool.stage_fetched("p", vec![ModelInfo::from_id("fetched")]);
         pool.save_cache();
 
         // A fresh pool preloads the overlay: the menu is instant on restart
@@ -1184,6 +1372,136 @@ mod tests {
         let pool = ModelPool::new(registry).with_cache(cache_path);
         let ids: Vec<String> = pool.models_of("p").iter().map(|m| m.id.clone()).collect();
         assert_eq!(ids, vec!["m1", "fetched"]);
+    }
+
+    /// A cached list belongs to one endpoint. Pointing the same provider name
+    /// at a different URL — `--base-url`, an edited `providers.toml` — must
+    /// not resurrect the previous endpoint's models.
+    #[test]
+    fn cache_is_dropped_when_the_provider_endpoint_moves() {
+        let dir = temp_cache_dir("codest-pool-cache-moved");
+        let cache_path = dir.join("model-cache.json");
+
+        let before = instance("p", Some(DEFAULT_PROTOCOL), &["declared"]);
+        let pool = ModelPool::new(ProviderRegistry::build(&[], vec![before]).unwrap())
+            .with_cache(cache_path.clone());
+        pool.stage_fetched("p", vec![ModelInfo::from_id("old-endpoint-model")]);
+        pool.save_cache();
+
+        // Same name, different base_url: the cached list no longer applies.
+        let mut moved = instance("p", Some(DEFAULT_PROTOCOL), &["declared"]);
+        moved.base_url = Some("http://127.0.0.1:2/v1".to_string());
+        let pool = ModelPool::new(ProviderRegistry::build(&[], vec![moved]).unwrap())
+            .with_cache(cache_path.clone());
+        let ids: Vec<String> = pool.models_of("p").iter().map(|m| m.id.clone()).collect();
+        assert_eq!(ids, vec!["declared"], "the old endpoint's models are gone");
+
+        // …and the prune is durable: the entry is not written back either.
+        pool.save_cache();
+        let content = std::fs::read_to_string(&cache_path).expect("read cache");
+        assert!(!content.contains("old-endpoint-model"), "{content}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Providers that are no longer configured must not linger in the file.
+    #[test]
+    fn cache_prunes_providers_that_are_no_longer_configured() {
+        let dir = temp_cache_dir("codest-pool-cache-prune");
+        let cache_path = dir.join("model-cache.json");
+
+        let pool = ModelPool::new(
+            ProviderRegistry::build(
+                &[],
+                vec![
+                    instance("kept", Some(DEFAULT_PROTOCOL), &["m"]),
+                    instance("dropped", Some(DEFAULT_PROTOCOL), &["m"]),
+                ],
+            )
+            .unwrap(),
+        )
+        .with_cache(cache_path.clone());
+        pool.stage_fetched("kept", vec![ModelInfo::from_id("fetched")]);
+        pool.stage_fetched("dropped", vec![ModelInfo::from_id("orphan")]);
+        pool.save_cache();
+
+        // A run that only knows `kept` rewrites the file without the orphan:
+        // the name `dropped` would otherwise be re-persisted forever.
+        let pool = ModelPool::new(
+            ProviderRegistry::build(&[], vec![instance("kept", Some(DEFAULT_PROTOCOL), &["m"])])
+                .unwrap(),
+        )
+        .with_cache(cache_path.clone());
+        pool.save_cache();
+        let content = std::fs::read_to_string(&cache_path).expect("read cache");
+        assert!(content.contains("kept"), "{content}");
+        assert!(!content.contains("orphan"), "{content}");
+        assert!(!content.contains("dropped"), "{content}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removing a provider drops its cached list from disk too, so a delete
+    /// in the wizard is not undone by the next start.
+    #[test]
+    fn removing_an_instance_forgets_its_cache() {
+        let dir = temp_cache_dir("codest-pool-cache-remove");
+        let cache_path = dir.join("model-cache.json");
+
+        let pool = ModelPool::new(
+            ProviderRegistry::build(&[], vec![instance("p", Some(DEFAULT_PROTOCOL), &["m"])])
+                .unwrap(),
+        )
+        .with_cache(cache_path.clone());
+        pool.stage_fetched("p", vec![ModelInfo::from_id("fetched")]);
+        pool.save_cache();
+        assert!(
+            std::fs::read_to_string(&cache_path)
+                .expect("read cache")
+                .contains("fetched")
+        );
+
+        assert!(pool.remove_instance("p").expect("remove"));
+        let content = std::fs::read_to_string(&cache_path).expect("read cache");
+        assert!(!content.contains("fetched"), "{content}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pre-tagging file layout carries no endpoint, so it cannot be
+    /// validated: it is dropped rather than trusted, and the run refetches.
+    #[test]
+    fn untagged_cache_entries_are_discarded() {
+        let dir = temp_cache_dir("codest-pool-cache-legacy");
+        let cache_path = dir.join("model-cache.json");
+        std::fs::write(
+            &cache_path,
+            r#"{"providers":{"p":[{"id":"legacy-model"}]}}"#,
+        )
+        .expect("write legacy cache");
+
+        let pool = ModelPool::new(
+            ProviderRegistry::build(&[], vec![instance("p", Some(DEFAULT_PROTOCOL), &["m"])])
+                .unwrap(),
+        )
+        .with_cache(cache_path.clone());
+        let ids: Vec<String> = pool.models_of("p").iter().map(|m| m.id.clone()).collect();
+        assert_eq!(ids, vec!["m"], "the unverifiable list is not used");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_cache_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{tag}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
     }
 
     #[test]
@@ -1219,6 +1537,113 @@ mod tests {
         assert!(models_from_openai_list(&serde_json::json!({})).is_empty());
     }
 
+    /// The `capabilities` / `limit` shape: window under `limit.context`,
+    /// levels under `capabilities.reasoning.effort`, default under
+    /// `capabilities.reasoning.default`.
+    #[test]
+    fn models_list_parses_limits_and_capabilities() {
+        let payload = serde_json::json!({
+            "object": "list",
+            "data": [{
+                "id": "some-model",
+                "object": "model",
+                "name": "Some Model",
+                "canonical_id": "vendor/some-model-1",
+                "limit": {"context": 1_000_000, "output": 384_000},
+                "capabilities": {
+                    "tools": {"supported": true},
+                    "reasoning": {
+                        "supported": true,
+                        "effort": ["low", "high", "max"],
+                        "default": "high"
+                    }
+                },
+                "cost": {"text": {"input": {"price": 0.15}, "output": {"price": 0.6}}}
+            }]
+        });
+        let models = models_from_openai_list(&payload);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "some-model");
+        assert_eq!(models[0].name.as_deref(), Some("Some Model"));
+        assert_eq!(models[0].context_window, Some(1_000_000));
+        assert_eq!(
+            models[0].reasoning.as_deref(),
+            Some(&["low".to_string(), "high".to_string(), "max".to_string()][..])
+        );
+        assert_eq!(models[0].default_level.as_deref(), Some("high"));
+    }
+
+    /// A model whose capabilities carry no `effort` list, and one carrying a
+    /// bare `toggle`, must not invent levels — `/effort` then uses its shared
+    /// defaults.
+    #[test]
+    fn models_list_tolerates_missing_effort_lists() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "toggle-only", "limit": {"context": 256_000},
+                 "capabilities": {"reasoning": {"supported": true, "toggle": true}}},
+                {"id": "bare", "capabilities": {"reasoning": {"supported": true}}},
+                {"id": "unsupported", "capabilities": {"reasoning": false}},
+                {"id": "flat-window", "context_window": 128_000},
+                {"id": "no-metadata"}
+            ]
+        });
+        let models = models_from_openai_list(&payload);
+        assert_eq!(models.len(), 5);
+        assert_eq!(models[0].context_window, Some(256_000));
+        assert_eq!(models[0].reasoning, None);
+        assert_eq!(models[0].default_level, None);
+        assert_eq!(models[1].reasoning, None);
+        assert_eq!(models[2].reasoning, None);
+        // The flat spelling still works, so older endpoints do not regress.
+        assert_eq!(models[3].context_window, Some(128_000));
+        assert_eq!(models[4].context_window, None);
+        assert_eq!(models[4].reasoning, None);
+    }
+
+    /// `limit.context` is the most specific spelling, so it wins over the
+    /// older flat ones when an endpoint reports both.
+    #[test]
+    fn models_list_prefers_limit_context() {
+        let payload = serde_json::json!({
+            "data": [{"id": "m", "limit": {"context": 500_000},
+                      "context_length": 128_000, "context_window": 200_000}]
+        });
+        assert_eq!(
+            models_from_openai_list(&payload)[0].context_window,
+            Some(500_000)
+        );
+    }
+
+    /// `options.models_url` names the models API explicitly; without it the
+    /// URL stays `{base_url}/models`, exactly as before the option existed.
+    #[test]
+    fn models_url_honours_the_option_and_defaults_to_the_base_path() {
+        let mut instance = instance("p", Some(DEFAULT_PROTOCOL), &["m"]);
+        assert_eq!(
+            models_url(&instance, "https://host/v1/"),
+            "https://host/v1/models"
+        );
+
+        instance.options.insert(
+            MODELS_URL_OPTION.to_string(),
+            serde_json::json!("https://host/inference/go/v1/models"),
+        );
+        assert_eq!(
+            models_url(&instance, "https://host/v1"),
+            "https://host/inference/go/v1/models"
+        );
+
+        // A blank option is the same as no option.
+        instance
+            .options
+            .insert(MODELS_URL_OPTION.to_string(), serde_json::json!("   "));
+        assert_eq!(
+            models_url(&instance, "https://host/v1"),
+            "https://host/v1/models"
+        );
+    }
+
     #[test]
     fn model_info_finds_declared_and_fetched_entries() {
         let mut declared = ModelInfo::from_id("m1");
@@ -1241,10 +1666,7 @@ mod tests {
         let registry =
             ProviderRegistry::build(&[], vec![instance]).expect("valid registry");
         let pool = ModelPool::new(registry);
-        pool.fetched
-            .lock()
-            .expect("lock")
-            .insert("p".to_string(), vec![fetched]);
+        pool.stage_fetched("p", vec![fetched]);
 
         assert_eq!(
             pool.model_info(&Selection::new("p", "m1"))

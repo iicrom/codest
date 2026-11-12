@@ -85,11 +85,11 @@ tools = []                     # 无工具——给不支持 function calling �
   选择与 effort）。
 - **持久化。** 启动 profile 记进会话元数据；每次切换向 rollout 追加一条
   `profile_switched` 记录。被恢复的会话还原**它自己**的状态——它最后
-  使用的模型（该模型声明了 `default_level` 时会重播种 effort）、它最后
-  运行时的工具集、它最后使用的 profile 名（在 `/profile` 里显示为活动）
-  ——而装配期绑定保持启动时的样子。新会话的 effort 由活动 profile 的
-  `effort` 播种（显式 `off` 也算数）；否则由初始模型的 `default_level`
-  播种。
+  使用的模型、推理 effort（`/effort` 或 profile 的 `effort`，显式 `off`
+  也算）、它最后运行时的工具集、它最后使用的 profile 名（在 `/profile`
+  里显示为活动）——而装配期绑定保持启动时的样子。从未选择过 effort 的
+  会话，才由活动 profile 的 `effort` 播种（显式 `off` 也算数），否则由
+  模型的 `default_level` 播种；记录过的选择绝不会被模型默认值覆盖。
 - **CLI flag 永远赢。** `--provider`/`--model` 覆盖任何声明的 default；
   profile 是预设，不是对你 flag 的覆盖。
 

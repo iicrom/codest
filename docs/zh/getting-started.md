@@ -48,7 +48,7 @@ codest --api-key sk-... --base-url https://api.openai.com/v1 --model gpt-4o-mini
 说明：
 
 - `--base-url` / `--api-key` 按**成对**要求工作（单端点路径）。只给其一时 codest 照常启动，在第一次发消息或打开 `/model` 时提示补全另一个。
-- 没有配置 `providers.toml` 时，flag/env 会合成一个一次性端点实例；一旦存在 `~/.codest/providers.toml`，同样的 flag 退化为**覆盖所选实例的字段**（见 [multi-provider.md](../multi-provider.md)）。
+- `--base-url` 永远跑一个一次性的 `untitled` 实例，即使 `~/.codest/providers.toml` 已经存在：已配置 provider 保留自己的端点与模型缓存，仍可在 `/model` 中选择。只有单独给 `--api-key` 时才会就地补全所选实例（见 [multi-provider.md](../multi-provider.md)）。
 - 模型发现在启动时后台执行；发现的元数据（上下文窗口、effort 等级）供 footer 与 `/model` 使用。
 
 ### 完全离线
@@ -78,7 +78,7 @@ codest --resume      # 同上，但先打开会话选择菜单
 | --- | --- | --- |
 | `--model <id>` | `CST_MODEL` | 启动时的模型 id（选择的 `model` 半边）。 |
 | `--provider <name>` | `CST_PROVIDER` | 启动时的 provider 实例。 |
-| `--base-url <url>` | `CST_BASE_URL` | OpenAI 兼容 base URL（或完整 `/chat/completions` URL），覆盖所选实例。 |
+| `--base-url <url>` | `CST_BASE_URL` | OpenAI 兼容 base URL（或完整 `/chat/completions` URL）。跑自己的 `untitled` 实例，不改动已配置 provider。 |
 | `--api-key <key>` | `CST_API_KEY` | 端点 API key，`--help` 中隐藏。 |
 | `--system <text>` | — | 覆盖系统提示词。 |
 | `--continue`、`-c` | — | 继续本工作区最近一次保存的会话。 |

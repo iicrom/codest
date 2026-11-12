@@ -355,6 +355,9 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
             if variant == "empty":
                 checks = {
                     "no model footer": "codest · no model" in screen,
+                    # The context segment is always on screen: with no window
+                    # and no measured turn it is a placeholder, not absent.
+                    "context placeholder": "· —  │  " in screen,
                     "no model banner": "backend: no model" in raw_after,
                     # The /help notice is taller than a fixed-size grid shows;
                     # the raw capture holds the whole thing.

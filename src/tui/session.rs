@@ -58,10 +58,12 @@ pub struct SessionView {
     /// Inline mode: final assistant text whose remaining lines still need to be
     /// flushed after a turn ends.
     pub inline_final_text: Option<String>,
-    /// Usage of the last completed turn as reported by the backend:
-    /// `(input, output)` tokens. The input of a chat-completions request
-    /// carries the whole transcript, so this pair doubles as the current
-    /// context size. `None` until the first measured turn in this run.
+    /// The most recent usage the backend reported, as `(input, output)`
+    /// tokens. The input of a chat-completions request carries the whole
+    /// transcript, so this pair doubles as the current context size. It moves
+    /// with every round that reports usage (`ContextUsage`, so the footer
+    /// follows a running turn) and is settled by the completed turn's
+    /// `TurnUsage`. `None` until this run measures anything.
     pub last_usage: Option<(u64, u64)>,
     /// Cumulative measured tokens across the session's completed turns.
     pub total_input: u64,
@@ -291,6 +293,7 @@ mod tests {
                 profile: None,
             },
             path: std::path::PathBuf::from("/tmp/s.jsonl"),
+            effort: None,
             messages: vec![
                 crate::core::protocol::Message::user("q"),
                 crate::core::protocol::Message::assistant("a"),
@@ -365,6 +368,7 @@ mod tests {
                 profile: None,
             },
             path: std::path::PathBuf::from("/tmp/s.jsonl"),
+            effort: None,
             messages: vec![crate::core::protocol::Message::user("q")],
             thinking: vec![crate::core::rollout::ThinkingRecord {
                 before: 5,

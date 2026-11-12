@@ -41,14 +41,14 @@ the instances below in `providers.toml`; `model-cache.json` is machine-managed.
 | --- | --- | --- | --- |
 | `name` | string | required | Unique instance name; also the `provider` half of a selection. Must not contain `/` and must not repeat. |
 | `protocol` | string | `"openai-compat"` | Protocol kind id. Built-ins: `openai-compat`, `test`; plugins contribute more. |
-| `base_url` | string | — | API root. Requests go to `{base_url}/chat/completions`; discovery to `{base_url}/models`. |
+| `base_url` | string | — | API root. Requests go to `{base_url}/chat/completions`; discovery to `{base_url}/models` (or `options.models_url`, see 3.1). |
 | `api_key` | string | — | Literal secret or a `$VAR` template (2.3). Unresolved, it fails the turn — never startup. |
 | `models` | array of tables | `[]` | Explicit model declarations (2.2). |
 | `fetch_models` | bool | `true` when no `models` are declared, `false` otherwise | Discover the list from the models API (Section 3). |
 | `headers` | table | `{}` | Static headers sent with every request. |
 | `body_overrides` | table | `{}` | JSON fields merged over the request body; overrides win over standard fields. |
 | `wire` | table | — | `openai-compat` wire quirks (Section 5). |
-| `options` | table | `{}` | Protocol-private pocket, handed to the factory verbatim (`option_str` / `option_u64` / `option_bool`). Unknown *top-level* keys are still rejected. |
+| `options` | table | `{}` | Protocol-private pocket, handed to the factory verbatim (`option_str` / `option_u64` / `option_bool`). `openai-compat` reads `models_url` from it (3.1); unknown *top-level* keys are still rejected. |
 
 ### 2.2 `[[providers.models]]`
 
@@ -86,10 +86,20 @@ Flags and env: `--provider` / `CST_PROVIDER` (instance to start with),
 - `--base-url` and `--api-key` are a **pair**: either alone synthesizes an
   *incomplete* instance gated at first use with a prompt naming the missing
   half, instead of sending a doomed request.
+- **`--base-url` always runs its own `untitled` instance.** It never
+  rewrites a configured instance's `base_url`, even when `providers.toml`
+  exists: the configured instances keep their names, endpoints, and cached
+  model lists, and stay selectable through `/model`. Combining it with
+  `--provider` is noted as ignored, since the flag already names the route.
+  (`OPENAI_BASE_URL` is *not* consulted here — it only feeds the
+  nothing-configured path, so exporting it cannot hijack a normal run.)
 - A synthesized instance never invents a model id: without `--model` the
   list comes from discovery and `/model` picks one; with `--model` the
-  selection is pinned but discovery still fills the menu. With
-  `providers.toml` present, the flags **override the selected instance**.
+  selection is pinned but discovery still fills the menu. A flag-pinned
+  route outranks every configured default, including a stale
+  `config.toml` `default` naming a provider that no longer exists.
+- Only `--api-key` alone still acts on a configured instance, completing
+  that instance's key without renaming or re-pointing it.
 - Validation is strict: unknown fields, duplicate names, a name containing
   `/`, an unknown `protocol` id, or empty/duplicate model ids all fail
   startup (the protocol error lists the known ids). An unknown **provider**
@@ -127,12 +137,19 @@ wire = { effort_field = "none" }                # endpoint rejects unknown reque
 - At startup the last discovered lists are preloaded from
   `~/.codest/model-cache.json`, so the menu is instant and a failed refresh
   never empties it. `fetch_models` instances are then fetched in the
-  background: `GET {base_url}/models` (OpenAI shape `{data: [{id, ...}]}`),
-  entries without an id skipped, duplicates collapsed, 5-second timeout.
-  Success and failure each produce one transcript notice — never a fatal
-  error — and success writes the cache back. Both context-window spellings
-  in the wild are accepted: `context_length` (OpenRouter) and
-  `context_window`.
+  background: `GET {base_url}/models` (or `options.models_url`), OpenAI
+  shape `{data: [{id, ...}]}`, entries without an id skipped, duplicates
+  collapsed, 5-second timeout. Success and failure each produce one
+  transcript notice — never a fatal error — and success writes the cache
+  back.
+- **Cached lists are per endpoint.** An entry records the `base_url` it was
+  discovered from and is used only when that still matches the configured
+  instance, so re-pointing a name at another URL (`--base-url`, an edited
+  `providers.toml`) never shows the old endpoint's models. Entries for
+  providers that are no longer configured are pruned on write, and deleting
+  a provider in the wizard drops its entry. A cache file from an older
+  codest (untagged entries) cannot be validated, so it is discarded and the
+  lists are refetched once.
 - The merged view per instance: declared models first (declaration order),
   then discovered models the config does not already declare; declared
   entries keep precedence but unset fields are filled from discovery.
@@ -146,6 +163,37 @@ wire = { effort_field = "none" }                # endpoint rejects unknown reque
   authoritative confirmation, and a failed switch keeps the current model.
   Clients are built per turn, not cached: switching changes what the next
   turn's client reads, and the session id is never baked into a client.
+
+### 3.1 Models-API shape and `models_url`
+
+The outer envelope is OpenAI's `{data: [{...}]}`. Entry fields are read by
+*shape*, never by vendor: the client does not know any provider's domain.
+
+| Field | Spellings read, in order | Feeds |
+| --- | --- | --- |
+| id | `id` (required, non-empty, deduplicated) | selection model half |
+| name | `name` | picker rows, `/status` |
+| context window | `limit.context` → `context_length` → `context_window` | footer readout, picker rows |
+| effort levels | `capabilities.reasoning.effort` → `reasoning` (ordered, lowest first) | `/effort` vocabulary |
+| default level | `capabilities.reasoning.default` → `default_level` | effort adopted on selection |
+
+Missing or malformed metadata is simply absent — never an error — and
+unknown fields (pricing, modalities, capability matrices, API blocks) are
+ignored.
+
+Endpoints whose models directory is not at `{base_url}/models` name it
+explicitly through the `options` pocket; the default is unchanged:
+
+```toml
+[[providers]]
+name = "gateway"
+base_url = "https://gateway.test/v1"
+  [providers.options]
+  models_url = "https://gateway.test/catalog/v1/models"  # GET exactly this
+```
+
+`models_url` is the one `options` key the built-in `openai-compat` factory
+interprets; every other key stays protocol-private to a plugin.
 
 ## 4. The `/provider` wizard
 
@@ -263,7 +311,14 @@ See [plugins.md](plugins.md) / [local-plugins.md](local-plugins.md).
 - **Why no default provider:** a default `api.openai.com` or fallback model
   id would send your key and prompts somewhere you did not choose; an empty
   route that explains itself is cheaper. The synthesized `untitled`
-  instance exists only because flags/env *explicitly* name an endpoint.
+  instance exists only because flags/env *explicitly* name an endpoint — and
+  because a name of its own keeps that endpoint's discovered models from
+  landing in a configured provider's cache slot.
+- **Why models discovery reads shapes, not vendors:** `limit.context` and
+  `capabilities.reasoning.effort` are field spellings, so they go in the
+  parser; a vendor's *path* is configuration, so it goes in
+  `options.models_url`. Adding the next endpoint's directory never touches
+  code.
 - **Why the protocol/instance split:** a `'static` plugin contract cannot
   carry runtime configuration, and per-vendor auth must not leak into core.
   Compile-time factories × config-data instances pin both: one factory

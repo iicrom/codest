@@ -191,14 +191,20 @@ pub async fn run(
     // The profile is a fresh-start preset: a restored session restores its
     // own state instead, though the profile it last used is still shown as
     // the active one.
-    let initial_effort = if fresh {
+    //
+    // Three states, mirroring the worker: `None` means "seed from the active
+    // model's `default_level`", `Some(None)` is an explicit `off`, and
+    // `Some(Some(level))` is that level. A restored session's own recorded
+    // choice wins; failing that (or on a fresh start) the profile preset.
+    let initial_effort: Option<Option<String>> = if fresh {
         profiles
             .active
             .as_deref()
             .and_then(|name| profiles.set.get(name))
-            .and_then(|active| active.effort.clone())
+            .and_then(|active| active.effort.as_deref())
+            .map(reasoning::normalize_effort)
     } else {
-        None
+        loaded.last().map(|session| session.effort.clone()).unwrap_or(None)
     };
     let active_profile = if fresh {
         profiles.active.clone()
@@ -677,26 +683,23 @@ impl App {
         active_view: usize,
         profiles: Arc<crate::core::config::ProfileSet>,
         active_profile: Option<String>,
-        initial_effort: Option<String>,
+        initial_effort: Option<Option<String>>,
     ) -> Self {
         let (inline_columns, inline_rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let inline_height = inline_pane_height(inline_rows, 1, 0, 0);
         let inline_top = inline_rows.saturating_sub(inline_height);
 
         let route = Selection::parse(&model_label).ok();
-        // A startup effort preset (the active profile's `effort`, normalized
-        // like `/effort` so `off` clears) wins; otherwise a model that
-        // declares a `default_level` starts with that — the same value the
-        // worker seeds, so footer and requests agree until `/effort`
-        // overrides either side.
-        let effort = initial_effort
-            .map(|value| reasoning::normalize_effort(&value))
-            .unwrap_or_else(|| {
-                route
-                    .as_ref()
-                    .and_then(|route| pool.model_info(route))
-                    .and_then(|model| model.default_level)
-            });
+        // Mirrors the worker's seeding: a recorded or configured effort wins
+        // outright — including an explicit `off` — and only an unset one is
+        // seeded from the model's `default_level`. Footer and requests agree
+        // until `/effort` overrides either side.
+        let effort = initial_effort.unwrap_or_else(|| {
+            route
+                .as_ref()
+                .and_then(|route| pool.model_info(route))
+                .and_then(|model| model.default_level)
+        });
 
         let tools = plugins.tools();
         let enabled_tools: std::collections::BTreeSet<String> = tools
@@ -2189,19 +2192,19 @@ impl App {
             .map(|(input, output)| input.saturating_add(output))
     }
 
-    /// The footer's context readout. With a known window the total is always
-    /// shown — `—/200.0k` before the first measured turn, `13.0k/200.0k (6%)`
-    /// once one completes —; without a window only measured usage appears
-    /// (`13.0k tok`). The boolean flags a nearly full window (≥90%) for a
-    /// warning color.
-    fn context_segment(&self) -> Option<(String, bool)> {
+    /// The footer's context readout, always present so the segment never
+    /// appears and disappears as metadata arrives: `13.0k/200.0k (6%)` when
+    /// both are known, `—/200.0k` with only a window, `13.0k tok` with only
+    /// measured usage, and `—` when neither is known yet. The boolean flags a
+    /// nearly full window (≥90%) for a warning color.
+    fn context_segment(&self) -> (String, bool) {
         match (self.context_tokens(), self.context_window()) {
             (Some(used), window) => {
                 let warn = window.is_some_and(|window| context_percent(used, window) >= 90);
-                Some((format_context_usage(used, window), warn))
+                (format_context_usage(used, window), warn)
             }
-            (None, Some(window)) => Some((format!("—/{}", format_tokens(window)), false)),
-            (None, None) => None,
+            (None, Some(window)) => (format!("—/{}", format_tokens(window)), false),
+            (None, None) => ("—".to_string(), false),
         }
     }
 
@@ -2730,6 +2733,12 @@ impl App {
                 view.live_thinking
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
+            }
+            EventMsg::ContextUsage { input, output } => {
+                // Display-only liveness: the footer follows the turn as it
+                // streams. The session totals and the rollout record are the
+                // completed-turn `TurnUsage`'s business.
+                self.view_mut().last_usage = Some((input, output));
             }
             EventMsg::TurnUsage { input, output } => {
                 // Record per session view: the last turn's usage doubles as
@@ -3354,19 +3363,13 @@ impl App {
         };
 
         let effort_label = self.effort.as_deref().unwrap_or(reasoning::EFFORT_OFF);
-        let context = self.context_segment();
+        let (context, context_warn) = self.context_segment();
         // The left side (label · state) wins: on a narrow terminal the right
         // hint is what degrades, never the state word.
-        let left_plain = match &context {
-            Some((text, _)) => format!(
-                " codest · {} · effort {effort_label} · {text}  │  {state}",
-                self.model_label
-            ),
-            None => format!(
-                " codest · {} · effort {effort_label}  │  {state}",
-                self.model_label
-            ),
-        };
+        let left_plain = format!(
+            " codest · {} · effort {effort_label} · {context}  │  {state}",
+            self.model_label
+        );
         let left_width = (display_width(&left_plain) as u16 + 1).min(area.width);
         let hint_width =
             (display_width(hints) as u16 + 1).min(area.width.saturating_sub(left_width));
@@ -3388,14 +3391,16 @@ impl App {
                 format!(" · effort {effort_label}"),
                 Style::default().fg(theme::DIM),
             ),
-        ];
-        if let Some((text, warn)) = &context {
             // A nearly full window renders in the accent color as a warning.
-            left.push(Span::styled(
-                format!(" · {text}"),
-                Style::default().fg(if *warn { theme::ACCENT } else { theme::DIM }),
-            ));
-        }
+            Span::styled(
+                format!(" · {context}"),
+                Style::default().fg(if context_warn {
+                    theme::ACCENT
+                } else {
+                    theme::DIM
+                }),
+            ),
+        ];
         left.push(Span::styled("  │  ", Style::default().fg(theme::DIM)));
         left.push(Span::styled(
             state,
@@ -4530,6 +4535,7 @@ mod tests {
                 },
                 path: PathBuf::from(format!("/tmp/{id}.jsonl")),
                 model: None,
+                effort: None,
                 last_usage,
                 total_input: last_usage.map_or(0, |(input, _)| input),
                 total_output: last_usage.map_or(0, |(_, output)| output),
@@ -4610,6 +4616,7 @@ mod tests {
             },
             path: PathBuf::from("/tmp/s.jsonl"),
             model: model.map(str::to_string),
+            effort: None,
             last_usage: None,
             total_input: 0,
             total_output: 0,
@@ -4915,7 +4922,9 @@ mod tests {
         app.try_submit();
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
 
-        let lines = render_lines(&mut app, 80, 20);
+        // Wide enough that the footer's always-on context segment does not
+        // squeeze the menu's hint out of the render.
+        let lines = render_lines(&mut app, 100, 20);
         let rendered = lines.join("\n");
         assert!(rendered.contains("▸ 2 · test/two"), "{rendered}");
         assert!(rendered.contains("test/one"), "{rendered}");
@@ -5021,7 +5030,7 @@ mod tests {
             lines.join("\n").contains("· 13.0k/200.0k (6%)"),
             "{lines:?}"
         );
-        assert!(!app.context_segment().unwrap().1);
+        assert!(!app.context_segment().1);
 
         // Crossing 90% of the window flags the segment as a warning.
         app.handle_agent_event(crate::core::Event::new(
@@ -5036,7 +5045,60 @@ mod tests {
             lines.join("\n").contains("· 190.0k/200.0k (95%)"),
             "{lines:?}"
         );
-        assert!(app.context_segment().unwrap().1);
+        assert!(app.context_segment().1);
+    }
+
+    /// The context segment is always on screen: without a measured turn and
+    /// without a known window it shows a placeholder rather than vanishing.
+    #[tokio::test]
+    async fn footer_keeps_the_context_segment_with_no_metadata() {
+        let mut app = test_app();
+        assert_eq!(app.context_window(), None);
+        assert_eq!(app.context_tokens(), None);
+        let lines = render_lines(&mut app, 110, 20);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("· —  │  "), "{rendered}");
+
+        // A measured round fills it in place, and the turn-in-progress
+        // event alone is enough to do so.
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ContextUsage {
+                input: 4_000,
+                output: 200,
+            },
+        ));
+        let lines = render_lines(&mut app, 110, 20);
+        assert!(lines.join("\n").contains("· 4.2k tok"), "{lines:?}");
+    }
+
+    /// Mid-turn usage is display-only: it moves the footer without touching
+    /// the session totals or the completed-turn record.
+    #[tokio::test]
+    async fn context_usage_updates_the_footer_without_accumulating() {
+        let mut app = test_app();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ContextUsage {
+                input: 900,
+                output: 100,
+            },
+        ));
+        assert_eq!(app.view().last_usage, Some((900, 100)));
+        assert_eq!(app.view().total_input, 0, "no accumulation mid-turn");
+        assert_eq!(app.view().total_output, 0);
+
+        // The completed turn is still the one counted.
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnUsage {
+                input: 1_000,
+                output: 200,
+            },
+        ));
+        assert_eq!(app.view().last_usage, Some((1_000, 200)));
+        assert_eq!(app.view().total_input, 1_000);
+        assert_eq!(app.view().total_output, 200);
     }
 
     #[tokio::test]

@@ -48,7 +48,7 @@ codest --api-key sk-... --base-url https://api.openai.com/v1 --model gpt-4o-mini
 Notes:
 
 - `--base-url` / `--api-key` are a **pair** (the single-endpoint path). Provide only one and codest still starts — it prompts for the other when you first send a message or open `/model`.
-- Without a `providers.toml`, the flags/env synthesize a one-off endpoint instance. Once `~/.codest/providers.toml` exists, the same flags degrade to *overriding fields of the selected instance* (see [multi-provider.md](multi-provider.md)).
+- `--base-url` always runs a one-off `untitled` instance, even once `~/.codest/providers.toml` exists: configured providers keep their endpoints and cached model lists, and stay selectable through `/model`. Only a lone `--api-key` still completes the selected instance in place (see [multi-provider.md](multi-provider.md)).
 - Model discovery runs in the background at startup; its metadata (context window, effort levels) feeds the footer and `/model`.
 
 ### Fully offline
@@ -78,7 +78,7 @@ codest --resume      # same, but open the session picker first
 | --- | --- | --- |
 | `--model <id>` | `CST_MODEL` | Model id to start with (the `model` half of a selection). |
 | `--provider <name>` | `CST_PROVIDER` | Provider instance to start with. |
-| `--base-url <url>` | `CST_BASE_URL` | OpenAI-compatible base URL (or a full `/chat/completions` URL). Overrides the selected instance. |
+| `--base-url <url>` | `CST_BASE_URL` | OpenAI-compatible base URL (or a full `/chat/completions` URL). Runs its own `untitled` instance, leaving configured providers untouched. |
 | `--api-key <key>` | `CST_API_KEY` | API key for the endpoint. Hidden from `--help` output. |
 | `--system <text>` | — | Override the system prompt. |
 | `--continue`, `-c` | — | Continue the most recent saved session of this workspace. |

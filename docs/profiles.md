@@ -91,13 +91,14 @@ The four bindings split into two halves:
   (`*` marks the current one, with each one's selection and effort).
 - **Persistence.** The startup profile is recorded in the session metadata;
   every switch appends a `profile_switched` record to the rollout. Restored
-  sessions restore their **own** state — the model they last used (which
-  reseeds the effort from that model's `default_level` when it declares
-  one), the tool set they last ran with, and the profile name they last
+  sessions restore their **own** state — the model they last used, the
+  reasoning effort (`/effort` or a profile's `effort`, an explicit `off`
+  included), the tool set they last ran with, and the profile name they last
   used (shown as active in `/profile`) — while assembly-time bindings stay
-  as they were at startup. A fresh session seeds its effort from the active
-  profile's `effort` (an explicit `off` counts); otherwise the initial
-  model's `default_level` seeds it.
+  as they were at startup. A session that has never chosen an effort seeds it
+  from the active profile's `effort` (an explicit `off` counts), otherwise
+  from the model's `default_level`; a recorded choice is never overwritten by
+  a model default.
 - **CLI flags always win.** `--provider`/`--model` override any declared
   default; a profile is a preset, not an override of your flags.
 

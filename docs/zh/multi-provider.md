@@ -39,14 +39,14 @@ codest 可以同时对接任意多个模型端点：能配置什么、TUI 命令
 | --- | --- | --- | --- |
 | `name` | 字符串 | 必填 | 实例唯一名；也是选择里 `provider` 那一半。不能含 `/`、不能重复。 |
 | `protocol` | 字符串 | `"openai-compat"` | 协议种类 id。内置：`openai-compat`、`test`；插件可贡献更多。 |
-| `base_url` | 字符串 | — | API 根。请求走 `{base_url}/chat/completions`，发现走 `{base_url}/models`。 |
+| `base_url` | 字符串 | — | API 根。请求走 `{base_url}/chat/completions`，发现走 `{base_url}/models`（或 `options.models_url`，见 §3.1）。 |
 | `api_key` | 字符串 | — | 明文密钥或 `$VAR` 模板（2.3）。未解析只报回合错误，不影响启动。 |
 | `models` | 表数组 | `[]` | 显式模型声明（2.2）。 |
 | `fetch_models` | 布尔 | 未声明 `models` 时为 `true`，否则 `false` | 从 models API 发现模型列表（§3）。 |
 | `headers` | 表 | `{}` | 随每个请求发送的静态请求头。 |
 | `body_overrides` | 表 | `{}` | 合并进请求体的 JSON 字段；覆盖标准字段。 |
 | `wire` | 表 | — | `openai-compat` 线协议 quirk（§5）。 |
-| `options` | 表 | `{}` | 协议私有口袋，原样交给工厂（`option_str` / `option_u64` / `option_bool`）。未知*顶层*键仍被拒绝。 |
+| `options` | 表 | `{}` | 协议私有口袋，原样交给工厂（`option_str` / `option_u64` / `option_bool`）。`openai-compat` 从中读取 `models_url`（§3.1）；未知*顶层*键仍被拒绝。 |
 
 ### 2.2 `[[providers.models]]`
 
@@ -80,9 +80,18 @@ Flag 与环境变量：`--provider` / `CST_PROVIDER`（启动实例）、
   `untitled`）；什么都没有就是空路由，TUI 照常启动并指引添加 provider。
 - `--base-url` 与 `--api-key` **成对**：只给其一时合成一个*不完整*实例，
   首次使用时被拦截并提示补全缺的另一半，而不是发出必败请求。
+- **`--base-url` 永远跑自己的 `untitled` 实例。** 即使
+  `providers.toml` 存在，它也不会改写任何已配置实例的 `base_url`：
+  已配置实例保留自己的名字、端点与已缓存的模型列表，仍可在 `/model`
+  里选择。与 `--provider` 同时给出会提示忽略后者，因为该 flag 已经指明
+  了路由。（`OPENAI_BASE_URL` **不**进入这条路径——它只服务"什么都没
+  配置"的兜底，否则导出这个变量就能劫持一次普通启动。）
 - 合成实例从不发明模型 id：不给 `--model` 时列表来自发现，由 `/model`
-  挑选；给了 `--model` 则初始选择已定，但发现仍会填充菜单。有
-  `providers.toml` 时，flag 改为**覆盖所选实例**。
+  挑选；给了 `--model` 则初始选择已定，但发现仍会填充菜单。flag 钉住的
+  路由优先于一切已配置默认值，包括残留的、指向已不存在 provider 的
+  `config.toml` `default`。
+- 只有单独给 `--api-key` 时才会作用于已配置实例：补全该实例的密钥，
+  不改名、不改指向。
 - 校验从严：未知字段、重复的 name、含 `/` 的 name、未知 `protocol` id、
   空或重复的模型 id 都是启动错误（协议错误会列出全部已知 id）。选择里
   的未知 **provider** 是硬错误；未声明的**模型 id** 告警继续——模型是否
@@ -118,10 +127,14 @@ wire = { effort_field = "none" }                # 端点拒绝未知请求字段
 
 - 启动时从 `~/.codest/model-cache.json` 预载上次发现的结果，菜单即时
   可用，一次失败的刷新也不会清空它。`fetch_models` 生效的实例随后后台
-  拉取：`GET {base[url}/models`（OpenAI 形状 `{data: [{id, ...}]}`），跳过
-  没有 id 的条目、折叠重复、5 秒超时。成功与失败各产生一条 transcript
-  通知——绝不致命——成功后写回缓存。上下文窗口的两种实际拼写都接受：
-  `context_length`（OpenRouter）与 `context_window`。
+  拉取：`GET {base_url}/models`（或 `options.models_url`），OpenAI 形状
+  `{data: [{id, ...}]}`，跳过没有 id 的条目、折叠重复、5 秒超时。成功与
+  失败各产生一条 transcript 通知——绝不致命——成功后写回缓存。
+- **缓存按端点归属。** 每条记录带着它被发现时的 `base_url`，只有与该
+  实例当前配置一致时才会使用，所以把同一个名字改指别的 URL（`--base-url`、
+  手改 `providers.toml`）绝不会显示旧端点的模型。已不再配置的 provider
+  在写回时被剪掉，向导里删除 provider 也会连带清掉它的记录。旧版本 codest
+  留下的无标签缓存无法校验，会被整体丢弃并重新发现一次。
 - 每个实例的合并视图：声明的模型在前（声明顺序），其后是配置未声明的
   发现结果；声明条目保持优先，缺着的字段由发现补齐。
 - `/model` 打开选择器，每个 `provider/model` 选择一行——同一实例的模型
@@ -131,6 +144,36 @@ wire = { effort_field = "none" }                # 端点拒绝未知请求字段
   流）：footer 标签乐观更新，worker 的 `ModelSwitched` 事件是权威确认，
   失败的切换保持现状。客户端每回合现建、不缓存：切换只是改变下一回合
   客户端读到什么，会话 id 也从不烘进客户端。
+
+### 3.1 models API 形状与 `models_url`
+
+外层信封是 OpenAI 的 `{data: [{...}]}`。条目字段按**形状**读取，与厂商
+无关：客户端不知道任何 provider 的域名。
+
+| 字段 | 依次尝试的拼写 | 去向 |
+| --- | --- | --- |
+| id | `id`（必填、非空、去重） | 选择的 model 半边 |
+| 名称 | `name` | 选择器行、`/status` |
+| 上下文窗口 | `limit.context` → `context_length` → `context_window` | footer 读数、选择器行 |
+| 推理等级 | `capabilities.reasoning.effort` → `reasoning`（有序，从低到高） | `/effort` 词汇表 |
+| 默认等级 | `capabilities.reasoning.default` → `default_level` | 选中模型时采用的 effort |
+
+元数据缺失或类型不对就当作不存在——绝不是错误——未知字段（定价、模态、
+能力矩阵、API 块）一律忽略。
+
+models 目录不在 `{base_url}/models` 的端点用 `options` 口袋显式指明；
+缺省行为不变：
+
+```toml
+[[providers]]
+name = "gateway"
+base_url = "https://gateway.test/v1"
+  [providers.options]
+  models_url = "https://gateway.test/catalog/v1/models"  # 原样 GET 这个地址
+```
+
+`models_url` 是内置 `openai-compat` 工厂唯一解释的 `options` 键，其余键
+仍是插件私有的。
 
 ## 4. `/provider` 向导
 
@@ -239,7 +282,11 @@ max_output_tokens = 131072       # option_u64；还有 option_bool
 
 - **为什么没有默认 provider**：默认 `api.openai.com` 或兜底模型 id，等于
   把你的密钥和对话送到一个你没有选过的地方；会自我解释的空路由代价更低。
-  合成 `untitled` 实例的前提，是 flag/env *显式*给出了端点。
+  合成 `untitled` 实例的前提，是 flag/env *显式*给出了端点；它拥有独立的
+  名字，这样那个端点发现到的模型就不会落进某个已配置 provider 的缓存槽。
+- **为什么模型发现只认形状、不认厂商**：`limit.context` 与
+  `capabilities.reasoning.effort` 是字段拼写，所以进解析器；厂商的*路径*
+  是配置，所以进 `options.models_url`。接入下一个端点的目录不需要改代码。
 - **为什么 kind/instance 分离**：`'static` 插件契约带不了运行期配置，
   而 per-vendor 鉴权不能泄漏进 core。编译期工厂 × 配置数据实例把两头都
   钉死：一个工厂服务它的协议的所有实例，全部实例状态都经 `create()`

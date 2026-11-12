@@ -22,7 +22,7 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 | 文件 | 写入方 | 影响 |
 | --- | --- | --- |
 | `plugins.toml` | `codest plugin install` / `uninstall` | 保存外部插件列表，以及 wrapper crate 链接所用的 codest checkout。 |
-| `model-cache.json` | 启动时的模型发现 | 预加载，`/model` 立即可用；刷新失败也不会清空菜单。 |
+| `model-cache.json` | 启动时的模型发现 | 预加载，`/model` 立即可用；刷新失败也不会清空菜单。每条记录带着发现的端点，只有端点仍与配置一致时才使用；已不再配置的 provider 在写回时被剪掉。旧版本 codest 留下的无标签缓存无法校验，会重新发现一次。 |
 | `providers.toml` | `/provider` 向导（仅在确认时） | 向导写入是原子的，但格式由机器生成：手写注释与排版会丢失。 |
 
 只有 `config.toml`、`providers.toml`、`profiles.toml` 供手写，且每个都是可选的——文件缺失就是什么都不贡献。
@@ -120,14 +120,14 @@ wire = { session_header = "x-session-id" }  # 改用网关自己的拼写
 | --- | --- |
 | `CST_MODEL` | 启动时的模型 id（选择的 `model` 半边）。 |
 | `CST_PROVIDER` | 启动时的 provider 实例。 |
-| `CST_BASE_URL` | OpenAI 兼容 base URL 或完整 `/chat/completions` URL；覆盖所选实例。 |
+| `CST_BASE_URL` | OpenAI 兼容 base URL 或完整 `/chat/completions` URL。会跑自己的 `untitled` 实例，而不是改写已配置实例。 |
 | `CST_API_KEY` | 端点 API key；覆盖所选实例。 |
 | `CST_PROFILE` | 以 `~/.codest/profiles.toml` 中的某个 profile 启动。 |
 | `CST_TUI_MODE` | `fullscreen`（默认）或 `inline`。 |
 | `CODEST_HOME` | 全部状态的根目录，替代 `~/.codest`。 |
 | `CODEST_SRC` | `codest plugin install`/`build` 用来链接 wrapper crate 的 codest checkout。 |
 | `OPENAI_API_KEY` | 使用合成的单端点实例时，作为 `CST_API_KEY` 的兜底。 |
-| `OPENAI_BASE_URL` | 使用合成的单端点实例时，作为 `CST_BASE_URL` 的兜底。 |
+| `OPENAI_BASE_URL` | `CST_BASE_URL` 的兜底，仅在 `providers.toml` 为空时生效——导出它不会改写已配置实例。 |
 
 `CODEST_SRC` 在安装器中的查询顺序位于显式 `--codest-src` 之后、二进制编译源目录与 `plugins.toml` 记录的路径之前；每个候选都会被校验为 codest checkout，失效的候选降级到下一个。见 [local-plugins.md](../local-plugins.md)。
 

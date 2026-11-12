@@ -203,9 +203,12 @@ pub struct ProviderInstance {
     pub wire: Option<WireQuirks>,
     /// Protocol-private configuration, handed to the instance's
     /// [`crate::providers::ProtocolFactory`] verbatim. A plugin's settings are
-    /// plain TOML under `[providers.options]`; the host never interprets a
-    /// key, so a new plugin needs no host change and no schema migration.
-    /// Unknown *top-level* keys are still rejected.
+    /// plain TOML under `[providers.options]`; the host interprets no *plugin*
+    /// key, so a new plugin needs no host change and no schema migration. The
+    /// built-in `openai-compat` factory reads one key of its own here —
+    /// `models_url`, an explicit models-API URL for endpoints whose directory
+    /// does not live at `{base_url}/models`. Unknown *top-level* keys are
+    /// still rejected.
     #[serde(default, deserialize_with = "toml_table_to_json_map", skip_serializing_if = "serde_json::Map::is_empty")]
     pub options: serde_json::Map<String, Value>,
     /// Set only for instances synthesized from partial CLI/env input, where

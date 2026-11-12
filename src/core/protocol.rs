@@ -109,6 +109,12 @@ pub enum EventMsg {
         /// unknown tool completes instantly, so small values are honest.
         duration_ms: u64,
     },
+    /// Token usage as the backend reported it for the round that just
+    /// finished streaming, sent as soon as it arrives rather than at turn
+    /// end. Display-only: the front-end updates its context readout from it,
+    /// while [`EventMsg::TurnUsage`] stays the single record of a completed
+    /// turn (accumulated in `/status`, persisted in the rollout).
+    ContextUsage { input: u64, output: u64 },
     /// Token usage for a completed turn, right before its `TurnComplete`.
     TurnUsage { input: u64, output: u64 },
     /// The turn was cancelled by the user.

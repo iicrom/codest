@@ -18,7 +18,7 @@ A session is one conversation: its message history, thinking cards, tool calls, 
 - **Only one session generates at a time.** The active session is the only one that can be busy; there is no parallel generation across sessions.
 - **Input is ignored while generating.** Typing still edits the composer, but a submission (message or command) is dropped until the turn ends.
 - **Session commands need a turn boundary.** `/new`, `/sessions`, and `/continue` are not accepted while a turn runs — press `Esc` to interrupt first, then run the command.
-- **Switching restores context.** Selecting a session in `/sessions` restores its conversation; the core also re-applies the model selection and enabled-tool set that session last used (best-effort — a selection that no longer resolves keeps the current model), and the footer usage counters are seeded from the recorded turns. Ops are FIFO, so the next user turn is answered with the restored context. Selecting the already-active session just closes the menu.
+- **Switching restores context.** Selecting a session in `/sessions` restores its conversation; the core also re-applies the model selection, the reasoning effort, and the enabled-tool set that session last used (best-effort — a selection that no longer resolves keeps the current model), and the footer usage counters are seeded from the recorded turns. Ops are FIFO, so the next user turn is answered with the restored context. Selecting the already-active session just closes the menu.
 - **`/clear` is per session.** It clears only the active session's context and transcript; other sessions, and the composer's input history, are untouched.
 - **The session list shows name, cell count, and a `current` marker.** Rows are numbered, the active session carries the marker, and the name is truncated to fit.
 - **Default naming.** A session is named after its first user message until `/rename` overrides it; the name is recorded in the rollout, so it survives restarts.
@@ -63,7 +63,8 @@ The picker renders one row per session — marker, 1-based number, the name (the
 | `tool_result` | One tool's output, replayed as a `role: "tool"` message answering its `tool_call_id`. |
 | `cleared` | A `/clear` within the session (system prompt retained). |
 | `renamed` | A `/rename`; the last one wins on replay. |
-| `model_switched` / `reasoning_effort_switched` | Model and effort changes — attribution metadata. |
+| `model_switched` | A model switch; the last one wins on replay, so a resumed session starts on the model it last used. |
+| `reasoning_effort_switched` | The session's reasoning effort (`/effort`, `/profile`); the last one wins on replay, and an explicit `off` is recorded as a choice rather than as "unset". |
 | `tools_switched` | The session's enabled-tool set; the last one wins, and absence means every declared tool was on. |
 | `profile_switched` | The active profile's name. |
 | `turn_usage` | Prompt/completion token counts of one completed turn, with the model that served it. |
