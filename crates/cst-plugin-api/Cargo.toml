@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Contract types shared by codest, its built-in plugins, and external provider plugins"
 license = "Apache-2.0"
-repository = "https://github.com/fufu/cst"
+repository = "https://github.com/iicrom/codest"
 readme = "README.md"
 
 [dependencies]
