@@ -82,6 +82,12 @@ use crate::core::openai_compat::endpoint_url;
 use crate::core::reasoning;
 use crate::core::rollout;
 use crate::core::rollout::LoadedSession;
+use crate::core::settings::HOST_SETTINGS;
+use crate::core::settings::SettingOwner;
+
+/// The host's own `/settings` fields: re-exported from the core so the screen
+/// and the command table cannot disagree about what the host configures.
+const HOST_SETTING_FIELDS: &[cst_plugin_api::settings::SettingField] = HOST_SETTINGS.fields;
 use crate::plugins::PluginEffect;
 use crate::plugins::PluginHost;
 use crate::plugins::PluginInfo;
@@ -568,6 +574,11 @@ struct App {
     context_view: Option<crate::tui::context_view::ContextView>,
     /// Open `/provider` wizard (`Some` while it owns the input).
     provider_wizard: Option<crate::tui::provider_wizard::Wizard>,
+    /// Open `/settings` screen (`Some` while it owns the input).
+    settings_view: Option<crate::tui::settings_view::SettingsView>,
+    /// The file `/settings` edits. Normally `~/.codest/config.toml`; a field
+    /// so a test can point the screen at a temporary document.
+    settings_path: PathBuf,
     /// Results from background wizard work (model probes, sign-ins).
     provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderTask>,
     provider_tasks: tokio::sync::mpsc::UnboundedReceiver<ProviderTask>,
@@ -789,6 +800,8 @@ impl App {
             tools_menu: None,
             context_view: None,
             provider_wizard: None,
+            settings_view: None,
+            settings_path: crate::core::config::config_path(),
             provider_tx,
             provider_tasks,
             provider_tasks_closed: false,
@@ -965,6 +978,15 @@ impl App {
                 let view = self.context_view.as_ref().expect("checked above");
                 view.render(frame, area);
             })?;
+            return Ok(());
+        }
+        // Same for the `/settings` screen.
+        if self.settings_view.is_some() {
+            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+            let mut view = self.settings_view.take().expect("checked above");
+            let drawn = tui.draw(|frame| view.render(frame, area));
+            self.settings_view = Some(view);
+            drawn?;
             return Ok(());
         }
         let width = size.width as usize;
@@ -1195,6 +1217,17 @@ impl App {
                 .handle_key(key)
             {
                 self.apply_context_action(action);
+            }
+            return;
+        }
+
+        // The `/settings` screen owns the whole keyboard while it is open:
+        // its rows take ↑↓/Enter/←→ and its editor takes typing, so nothing
+        // may leak into the composer underneath.
+        if let Some(view) = self.settings_view.as_mut() {
+            let event = view.handle_key(key);
+            if let Some(event) = event {
+                self.apply_settings_event(event);
             }
             return;
         }
@@ -1629,6 +1662,9 @@ impl App {
             // `/context` has two faces: the classic prompt report while the
             // session has no messages, the context viewer once it does.
             "context" => return self.open_context_view(),
+            // `/settings` opens the settings screen; an optional argument
+            // names the section to focus (host or plugin id).
+            "settings" => return self.open_settings(&invocation.args),
             _ => {}
         }
         let output = self
@@ -2485,6 +2521,83 @@ impl App {
         self.session.inspect_conversation();
     }
 
+    /// `/settings [section]`: open the settings screen over `config.toml`.
+    ///
+    /// The document is read fresh each time (a hand edit made since startup
+    /// shows up rather than being overwritten by a stale copy), and the
+    /// sections are the host's own plus one per plugin that declared one. A
+    /// named section that does not exist is an error, not a silent fallback.
+    fn open_settings(&mut self, args: &str) {
+        let path = self.settings_path.clone();
+        let file = match crate::core::settings::SettingsFile::load(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.view_mut()
+                    .history
+                    .push(HistoryCell::Error(format!("cannot open {error}")));
+                return;
+            }
+        };
+        let mut sections = vec![crate::tui::settings_view::Section {
+            title: "codest".to_string(),
+            description: "host settings",
+            owner: crate::core::settings::SettingOwner::Host,
+            fields: HOST_SETTING_FIELDS,
+        }];
+        for (id, section) in self.plugins.settings_sections() {
+            sections.push(crate::tui::settings_view::Section {
+                title: id.to_string(),
+                description: section.description,
+                owner: crate::core::settings::SettingOwner::Plugin(id),
+                fields: section.fields,
+            });
+        }
+        let mut view = crate::tui::settings_view::SettingsView::new(file, sections);
+        let name = args.trim();
+        if !name.is_empty() && !view.focus_section(name) {
+            let titles = view.section_titles().join(", ");
+            view.set_notice_error(format!("no section `{name}` (available: {titles})"));
+        }
+        self.command_menu_dismissed = true;
+        self.settings_view = Some(view);
+    }
+
+    /// Carry out one `/settings` screen event. A save is already on disk; the
+    /// app applies the file's new values — the footer switch directly, a
+    /// plugin pocket through its `on_settings_changed` hook — so the running
+    /// session matches the file it will restart from.
+    fn apply_settings_event(&mut self, event: crate::tui::settings_view::SettingsEvent) {
+        use crate::tui::settings_view::SettingsEvent;
+        match event {
+            SettingsEvent::Close => self.settings_view = None,
+            SettingsEvent::Saved { section } => {
+                let Some(view) = self.settings_view.as_ref() else {
+                    return;
+                };
+                let global = view.global().clone();
+                let owner = view.section_owner(section);
+                self.apply_global_config(&global);
+                let SettingOwner::Plugin(id) = owner.unwrap_or(SettingOwner::Host) else {
+                    return;
+                };
+                let info = self.plugin_info();
+                let output = self.plugins.settings_changed(id, global.plugins.get(id), info);
+                self.apply_output(output);
+            }
+        }
+    }
+
+    /// Adopt a freshly written `config.toml`: the footer table and the
+    /// per-plugin pockets that every hook receives.
+    fn apply_global_config(&mut self, global: &crate::core::config::GlobalConfig) {
+        self.status_bar = global.status_bar.clone();
+        self.plugin_settings = global
+            .plugins
+            .iter()
+            .map(|(id, settings)| (id.clone(), settings.clone()))
+            .collect();
+    }
+
     /// Carry out one viewer action: every mutation is an op away — the
     /// worker is the only owner of the transcript.
     fn apply_context_action(&mut self, action: crate::tui::context_view::ContextAction) {
@@ -3152,6 +3265,14 @@ impl App {
             view.render(frame, area);
             return;
         }
+        // The `/settings` screen does too, and it mutates its own scroll, so
+        // it is taken out and put back.
+        if self.settings_view.is_some() {
+            let mut view = self.settings_view.take().expect("checked above");
+            view.render(frame, area);
+            self.settings_view = Some(view);
+            return;
+        }
         let width = area.width as usize;
 
         let composer_width = width.saturating_sub(2).max(1);
@@ -3510,6 +3631,8 @@ impl App {
             None => {
                 if let Some(wizard) = self.provider_wizard.as_ref() {
                     wizard.hint()
+                } else if self.settings_view.is_some() {
+                    "↑↓ select · Enter change · ←→ cycle · Esc close"
                 } else if self.session_menu.is_some() {
                     "↑↓ select · Enter switch · Esc close"
                 } else if self.model_menu.is_some() {
@@ -4894,6 +5017,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_opens_edits_a_plugin_toggle_and_applies_it_live() {
+        // A temporary `config.toml` so the test never touches the real one.
+        let path = std::env::temp_dir().join(format!(
+            "codest-app-settings-{}-{:x}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut app = test_app();
+        app.settings_path = path.clone();
+
+        app.run_command(Invocation {
+            spec: &crate::core::settings::SETTINGS_COMMAND,
+            args: String::new(),
+        });
+        assert!(app.settings_view.is_some(), "the screen owns the frame");
+
+        // The card for the host and for every plugin that declared settings;
+        // `tps` is the built-in with one.
+        let rendered = render_lines(&mut app, 100, 26).join("\n");
+        assert!(rendered.contains("Settings"), "{rendered}");
+        assert!(rendered.contains("codest"), "{rendered}");
+        assert!(rendered.contains("tps"), "{rendered}");
+        assert!(rendered.contains("Tokens-per-second meter"), "{rendered}");
+
+        // Move to the tps card's first row (the toggle) and flip it.
+        let host_rows = HOST_SETTING_FIELDS.len();
+        for _ in 0..host_rows {
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // The file recorded it under the plugin's pocket…
+        let global = crate::core::config::load_global(&path).expect("parse");
+        assert_eq!(global.plugins["tps"].option_bool("enabled"), Some(true));
+        // …the app's copy of the pockets moved with it…
+        assert_eq!(
+            app.plugin_settings
+                .iter()
+                .find(|(id, _)| id == "tps")
+                .and_then(|(_, settings)| settings.option_bool("enabled")),
+            Some(true)
+        );
+        // …and the plugin was told, so the meter is on for this run too.
+        assert!(crate::plugins::builtin::TPS.is_enabled());
+
+        // Esc gives the frame back to the chat.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.settings_view.is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn settings_rejects_an_unknown_section_argument() {
+        let path = std::env::temp_dir().join(format!(
+            "codest-app-settings-named-{}-{:x}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut app = test_app();
+        app.settings_path = path.clone();
+        app.run_command(Invocation {
+            spec: &crate::core::settings::SETTINGS_COMMAND,
+            args: "nope".to_string(),
+        });
+        let rendered = render_lines(&mut app, 100, 26).join("\n");
+        assert!(rendered.contains("no section `nope`"), "{rendered}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
     async fn command_menu_renders_above_the_composer() {
         let mut app = test_app();
         app.composer.set_text("/".to_string());
@@ -6256,8 +6455,8 @@ mod tests {
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            20,
-            "sixteen commands plus four aliases"
+            21,
+            "seventeen commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -6267,8 +6466,9 @@ mod tests {
 
         app.composer.set_text("/se".to_string());
         let matches = app.command_matches();
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matches.len(), 2, "`/se` offers /sessions and /settings");
         assert_eq!(matches[0].name, "sessions");
+        assert_eq!(matches[1].name, "settings");
 
         app.composer.set_text("/re".to_string());
         let matches = app.command_matches();
@@ -6304,9 +6504,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 19);
+        assert_eq!(app.command_selection, 20);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 18);
+        assert_eq!(app.command_selection, 19);
     }
 
     #[tokio::test]

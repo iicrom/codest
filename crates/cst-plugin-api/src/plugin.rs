@@ -132,6 +132,33 @@ pub trait Plugin: Sync {
     /// Called after the core confirms that the conversation was cleared.
     fn on_conversation_cleared(&self, _ctx: &mut PluginContext<'_>) {}
 
+    /// The settings section `/settings` shows for this plugin.
+    ///
+    /// Every field names a key of this plugin's `[plugins."<id>"]` pocket in
+    /// `config.toml`; the host renders the rows, persists an edit atomically,
+    /// and then calls [`Plugin::on_settings_changed`] with the whole pocket as
+    /// it now stands. Returning `None` (the default) keeps the plugin out of
+    /// `/settings` — a plugin with nothing to configure declares nothing.
+    fn settings(&self) -> Option<crate::settings::SettingsSection> {
+        None
+    }
+
+    /// Apply a settings edit. `settings` is the plugin's whole pocket as it
+    /// was just written (`None` when the edit removed the last key), so a
+    /// plugin reads the keys it cares about and ignores the rest —
+    /// [`crate::config::PluginSettings`] offers the typed readers.
+    ///
+    /// Called after the file write succeeded, on the front-end's thread, so it
+    /// must be quick. The edit persists either way; a value that only takes
+    /// effect at startup is declared as such
+    /// ([`crate::settings::SettingField::restart`]) and needs no work here.
+    fn on_settings_changed(
+        &self,
+        _settings: Option<&crate::config::PluginSettings>,
+        _ctx: &mut PluginContext<'_>,
+    ) {
+    }
+
     /// Which event categories this plugin wants on [`Plugin::on_event`].
     ///
     /// The default subscribes to nothing: the host filters before dispatching,

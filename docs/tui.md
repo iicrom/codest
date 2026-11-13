@@ -31,7 +31,7 @@ In `inline` the app never scrolls anything: `PgUp`/`PgDn` are handed straight to
 Both modes arrange the same four bands, top to bottom: transcript, menu band, composer, footer.
 
 - **Transcript.** User turns carry a `› ` prefix; assistant answers open with `• ` and indent continuations under the text; errors use `! `; notices are dim and unprefixed; an aborted turn leaves a `■ interrupted` marker. Thinking cards, tool cards, and plugin reports such as `/context` are cells in the same list. The transcript is per session: switching sessions switches the rendered view, and a background session catches up when it becomes active.
-- **Menu band.** The slash-command candidate popup, or one of the pickers (`/sessions`, `/model`, `/effort`, `/tools`) while one is open. It collapses to zero rows when nothing needs it.
+- **Menu band.** The slash-command candidate popup, or one of the pickers (`/sessions`, `/model`, `/effort`, `/tools`) while one is open. It collapses to zero rows when nothing needs it. The full-frame screens (`/context`, `/provider`, `/settings`) replace the whole layout instead of occupying the band.
 - **Composer.** A multi-line editor with a single top border and a `› ` prompt in its own two-column gutter, capped at eight visible rows; longer input scrolls inside it. Bracketed paste is enabled, so a multi-line paste lands as text instead of a burst of keystrokes.
 - **Footer.** The left side reads `codest · <provider/model> · effort <level> · <context>`, then a `│` and the state word — `ready`, or a spinner with `working · Esc interrupt` while a turn runs. The context readout is always present: `used/window (n%)` once both are known, `—/window` when only the window is, `used tok` when only usage is, and `—` when neither is known yet. It tracks each streaming round as it reports usage, so a long tool round never leaves it stale, and the completed turn settles it. The right side is the hint line for the current context; a transient message such as `thinking expanded` takes its place for a couple of seconds.
 
@@ -109,6 +109,7 @@ Tool activity is display-only — it never surfaces as agent text. The conversat
 | Composer editing | [`../src/tui/composer.rs`](../src/tui/composer.rs) |
 | Full-frame `/context` viewer | [`../src/tui/context_view.rs`](../src/tui/context_view.rs) |
 | `/provider` wizard step machine | [`../src/tui/provider_wizard.rs`](../src/tui/provider_wizard.rs) |
+| Full-frame `/settings` screen (cards, rows, editor, notice line) | [`../src/tui/settings_view.rs`](../src/tui/settings_view.rs) |
 | Palette | [`../src/tui/theme.rs`](../src/tui/theme.rs) |
 
 Startup puts three notices at the top of the active session's transcript: a one-line banner, a `backend: <provider/model> · mode: <mode>` line, and a keybinding hint that differs by mode. On a resume the same three are prefixed above the restored transcript, followed by a count of restored sessions; on a plain start with saved sessions available, a hint points at `/sessions`. They are ordinary notice cells — a `/clear` removes them with the rest of the transcript.

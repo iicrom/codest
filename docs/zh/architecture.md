@@ -110,6 +110,7 @@ codest/
     │   ├── context_store.rs   # 上下文浏览/编辑状态
     │   ├── tools.rs           # 工具派发
     │   ├── tools_switch.rs    # /tools 会话开关
+    │   ├── settings.rs        # /settings 指令 + config.toml 写入
     │   ├── conversation.rs    # 线性会话历史
     │   ├── model.rs           # ModelClient trait + StreamItem + 错误类型
     │   ├── openai_compat.rs   # HTTP + SSE 流式客户端（openai-compat 协议）
@@ -122,7 +123,7 @@ codest/
     ├── plugins/
     │   ├── mod.rs             # Plugin trait 宿主 / effects / 协议收集
     │   ├── install.rs         # codest plugin install|uninstall|list|build
-    │   └── builtin/           # 静态注册表：help、clear、quit、status、continue、tools/{shell,bash,pwsh,fs,truncate}
+    │   └── builtin/           # 静态注册表：help、clear、quit、status、continue、tps、tools/{shell,bash,pwsh,fs,truncate}
     └── tui/
         ├── app.rs             # 事件循环 / fullscreen & inline 渲染 / 菜单
         ├── session.rs         # 每会话视图状态
@@ -130,6 +131,7 @@ codest/
         ├── composer.rs        # 输入编辑器
         ├── provider_wizard.rs # /provider 向导
         ├── context_view.rs    # /context 查看器
+        ├── settings_view.rs   # /settings 界面（卡片 + 行 + 编辑器）
         ├── markdown.rs        # Markdown 渲染（pulldown-cmark）
         ├── highlight.rs       # 代码高亮（syntect → TokenKind）
         ├── theme.rs           # 颜色

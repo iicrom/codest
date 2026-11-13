@@ -13,6 +13,7 @@ pub mod highlight;
 pub mod markdown;
 pub mod provider_wizard;
 pub mod session;
+pub mod settings_view;
 pub mod theme;
 pub mod wrap;
 

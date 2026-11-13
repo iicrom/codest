@@ -26,6 +26,7 @@ Types only — no HTTP client, no configuration loading, no terminal code:
 | `model` | `ModelClient`, `StreamItem`, `TurnOptions`, `ModelError` |
 | `message` | `Message`, `Role` |
 | `config` | `ProviderInstance`, `ModelInfo`, `WireQuirks`, `PluginSettings` |
+| `settings` | `SettingsSection`, `SettingField`, `SettingKind`, `SettingOption` |
 | `commands` | `CommandSpec`, `CommandTable`, `Invocation`, `ArgsPolicy` |
 | `tools` | `ToolSpec`, `ToolCall`, `ToolExecutor`, `ToolCallAccumulator` |
 | `sse` | `SseDecoder`, `SseFrame` |
@@ -38,7 +39,11 @@ The host re-exports each module under its historical path (`codest::core::model`
 
 A plugin exports one or more `static` values implementing `Plugin`. It usually
 also implements `ProtocolFactory` (returned from `Plugin::protocols`) and
-declares sign-in entries (returned from `Plugin::auth_providers`). See
+declares sign-in entries (returned from `Plugin::auth_providers`). A plugin with
+anything to configure additionally returns a `SettingsSection` from
+`Plugin::settings` — the host renders it in `/settings`, writes an edit into the
+plugin's `[plugins."<id>"]` pocket in `config.toml`, and calls
+`Plugin::on_settings_changed` with the new pocket. See
 [`../../docs/local-plugins.md`](../../docs/local-plugins.md) and the reference
 implementation at `../../../cst-provider-qoder`.
 

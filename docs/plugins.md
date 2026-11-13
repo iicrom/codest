@@ -56,6 +56,8 @@ binary. The host side lives in [`src/plugins/mod.rs`](../src/plugins/mod.rs).
 | `subscriptions()` | — | `EventSubscription` | `NONE` |
 | `on_event(&PluginEvent, &mut PluginContext)` | one core event + context | — | no-op |
 | `run_command(&Invocation, &mut PluginContext)` | parsed command + args | `Result<(), PluginError>` | error |
+| `settings()` | — | `Option<SettingsSection>` | `None` |
+| `on_settings_changed(Option<&PluginSettings>, &mut PluginContext)` | the pocket as now written | — | no-op |
 
 Plugins are shared as `&'static dyn Plugin`, so everything takes `&self`;
 stateful plugins use interior mutability (`Mutex`, atomics). Command specs,
@@ -124,7 +126,7 @@ prompt section lands after the command plugins' contributions.
 | `quit` | `/quit` (`/exit`) | Requests `Quit` |
 | `status` | `/status` | Backend, mode, transcript size, context usage, token totals, plugin list |
 | `continue` | `/continue` | Requests `ContinueTurn` — resume an interrupted turn |
-| `tps` | `/tps` | Live tokens-per-second meter for the footer (off by default) |
+| `tps` | `/tps`, a `/settings` toggle | Live tokens-per-second meter for the footer (off by default) |
 | `shell` (`bash` / `pwsh`) | the same-named tool + prompt section | Runs one shell command |
 | `fs` | `read`, `write`, `edit` tools | File operations |
 
@@ -428,6 +430,58 @@ listen = "127.0.0.1:8737"
 `option_str` / `option_u64` / `option_bool` readers plus the raw JSON map.
 A table naming an unknown plugin id is a **startup error** — a silent
 no-op hides typos — so remove the table when you uninstall a plugin.
+
+### Settings in `/settings`
+
+A plugin with options declares them instead of documenting them: returning a
+`SettingsSection` from `Plugin::settings()` puts a card on the `/settings`
+screen, one row per field, and turns every edit into a write to this plugin's
+pocket. The host owns rendering, validation, and persistence; the plugin owns
+the meaning of each key.
+
+```rust
+static FIELDS: [SettingField; 2] = [
+    SettingField::toggle("enabled", "Meter", "live tokens-per-second readout", false),
+    SettingField::select("mode", "Mode", "when to fold the readout", &MODES, "auto"),
+];
+
+fn settings(&self) -> Option<SettingsSection> {
+    Some(SettingsSection::new("my-plugin", "what it does, briefly", &FIELDS))
+}
+
+fn on_settings_changed(
+    &self,
+    settings: Option<&PluginSettings>,
+    ctx: &mut PluginContext<'_>,
+) {
+    // Called after a successful write (and never for a startup-only field
+    // while the run continues): the pocket is the file as it now stands.
+    let enabled = settings.and_then(|s| s.option_bool("enabled")).unwrap_or(false);
+    self.set_enabled(enabled);
+}
+```
+
+Four rules make a card predictable:
+
+* **Keys are pocket keys.** `SettingField::key` addresses one entry of
+  `[plugins."<id>"]` — the same entry `ctx.plugin_settings()` reads, so a value
+  written by the screen is what the next startup parses. No second format.
+* **Values are text plus a kind.** `Boolean`, `Select` (with `SettingOption`s),
+  `Number`, and `Text` decide how the row edits and how the text is stored as
+  TOML (`true`, `64`, `"high"`). An unparsable number is refused before it
+  touches the file.
+* **`default` is what an absent key means.** The row shows it marked
+  `(default)`, and clearing a text row removes the key — restoring this value
+  rather than pinning a copy of it.
+* **`restart()` marks a startup-only field.** The edit still persists; the row
+  carries a `restart` badge and `on_settings_changed` is the only chance to
+  apply it live. Declare it whenever the value feeds something built once at
+  startup (a server address, a protocol choice).
+
+The built-in `tps` plugin ([tps.rs](../src/plugins/builtin/tps.rs)) is the
+reference: one toggle, saved to `[plugins.tps] enabled`, applied in place so
+the meter turns on without a restart. Its `/tps` command stays a run-only
+shortcut for the same switch.
 
 **A monitoring plugin, end to end:** subscribe to `EventSubscription::ALL`,
 treat `SNAPSHOT` events as the authoritative transcript, forward batched
