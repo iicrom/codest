@@ -625,7 +625,7 @@ impl Writer {
     fn push_code_line(&mut self, prefix: &[Span<'static>], spans: Vec<Span<'static>>) {
         let pad = spans_width(prefix);
         let available = self.width.saturating_sub(pad).max(1);
-        for (index, row) in wrap_styled_hard(&spans, available).into_iter().enumerate() {
+        for (index, row) in wrap_code(&spans, available).into_iter().enumerate() {
             let mut line = Vec::with_capacity(row.len() + 1);
             if index == 0 {
                 line.extend(prefix.iter().cloned());
@@ -798,13 +798,13 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
 
 /// Wrap styled spans at `width`, splitting only at character boundaries so
 /// each row keeps its own per-span styles.
-fn wrap_styled(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+pub fn wrap_styled(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     wrap_styled_rows(spans, |chars| wrap_chars(chars, width))
 }
 
 /// Like [`wrap_styled`] but never reflows across a space: used for code, where
 /// a dropped break space would change the source.
-fn wrap_styled_hard(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+pub fn wrap_code(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     wrap_styled_rows(spans, |chars| wrap_chars_hard(chars, width))
 }
 

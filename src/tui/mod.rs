@@ -18,6 +18,7 @@ pub mod screen;
 pub mod session;
 pub mod settings_view;
 pub mod theme;
+pub mod tool_body;
 pub mod wrap;
 
 use clap::ValueEnum;

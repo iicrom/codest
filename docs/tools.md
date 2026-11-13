@@ -88,6 +88,29 @@ Every call renders as a tool card in the transcript:
 - The rest collapses into `… +N lines (ctrl+o to expand)`; `Ctrl+O` expands or folds all tool output (see [commands.md](commands.md)). Folded and expanded are per-frame view decisions, so the cells themselves stay stateless.
 - While a call runs, a live card with a spinner header and an elapsed row sits in the transcript tail; tools run sequentially, so at most one is ever live.
 
+### File-tool bodies
+
+The file tools know more than their result string does, so their cards render a structured body instead of dumping it — the way cordis-harness-tui renders them:
+
+```text
+● edit(src/tui/chat.rs) · 1.2s
+ ⎿    (+2 -1) replaced 1 occurrence
+    - fn body(…) { dim }
+    + fn body(…) { highlighted }
+    +     …
+
+● read(src/tui/theme.rs) · 6ms
+ ⎿  24 pub const TOOL_EXEC: Color = Color::Cyan;
+    25 /// Read-only file tools (`read`).
+       [2 lines total, showing 24-25]
+```
+
+- **`write` and `edit`** render a diff excerpt: `-` rows for the text the call replaced, `+` rows for what it wrote, over a dim `(+N -M)` stat row that also keeps the tool's one-line verdict (`created`, `overwrote`, `replaced 2 occurrences`) minus the path the header already shows. `write` has no `-` side — it does not know the old content, and inventing one would misstate the change.
+- **`read`** renders its numbered window under a right-aligned dim number column, with the `[N lines total, showing …]` caption indented under the code.
+- Both are **syntax-highlighted** by the file's extension, and the `-`/`+` tint rides on the marker and on whatever the palette leaves uncolored, so an added line reads green at a glance while its keywords and strings keep their own colors.
+- A structured body folds at **8 rows** (a diff row says far more per line than a row of command output, which keeps the 3-row budget), and `Ctrl+O` expands it like any other output. Rows are counted and capped while the body is built, so a huge `write` never materializes rows the card cannot show.
+- The body is code, so it wraps at the column budget rather than at spaces: a wrapped row re-joins into the line it came from. The code lives in [`src/tui/tool_body.rs`](../src/tui/tool_body.rs); `chat.rs` owns the card gutter and the fold hint.
+
 ## Testing the loop offline
 
 `scripts/openai_test_server.py` is a stdlib-only OpenAI-compatible server that turns message keywords into real tool calls, so the whole loop can be exercised without a network:

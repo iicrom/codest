@@ -28,6 +28,13 @@ pub const TOOL_READ: Color = Color::Green;
 /// Mutating file tools (`write`, `edit`).
 pub const TOOL_MUTATE: Color = Color::Yellow;
 
+// Diff body tones. A `write`/`edit` card paints the file's new content as `+`
+// rows and the text it replaced as `-` rows; the pair is deliberately not
+// [`ERROR`] and [`ASSISTANT`], so a diff never reads as a failure or as a
+// stray assistant bullet.
+pub const DIFF_ADD: Color = Color::Green;
+pub const DIFF_DEL: Color = Color::Red;
+
 // Code-block syntax highlighting. Semantic names rather than "the color of a
 // function": each kind is one palette entry, so restyling code means editing
 // this block and `highlight::style` keeps its shape.

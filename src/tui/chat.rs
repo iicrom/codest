@@ -11,8 +11,8 @@
 //! hangs from a spine:
 //!
 //! ```text
-//! ⚓ thinking · 4.2s
-//!   │ dim italic reasoning…
+//! ⚓ thinking · 4.2s (ctrl+t to expand)
+//!   │ …the newest reasoning row…
 //!
 //! ● bash(cargo build) · 4.2s
 //!  ⎿  Compiling codest
@@ -21,12 +21,18 @@
 //!
 //! The tool header is `● name(args) · duration` with the name in the tool's
 //! category color and the `⎿` spine tinted to match; the thinking header is
-//! `⚓ thinking · duration` in the thinking color over a `│` rail. Folded, each
-//! card is that one header line plus a dim hint naming its own expand key —
-//! `ctrl+t` for thinking, `ctrl+o` for tool output, since the two fold
-//! independently. Which cards show their body is decided per frame by
-//! [`CardDisplay`], resolved from the global toggles — cells themselves stay
-//! stateless.
+//! `⚓ thinking · duration` in the thinking color over a `│` rail. Folded, a
+//! tool card is that one header line plus a dim hint naming its expand key
+//! (`ctrl+o`), and a thinking card keeps the header plus one row of context —
+//! its newest reasoning row, clipped from the start so the tokens that arrived
+//! last stay readable. The two fold independently (`ctrl+t` for thinking).
+//! Which cards show their body is decided per frame by [`CardDisplay`],
+//! resolved from the global toggles — cells themselves stay stateless.
+//!
+//! File-tool bodies are structured rather than textual: a `write`/`edit` card
+//! renders a highlighted diff excerpt and a `read` card its numbered window.
+//! [`tool_body`] builds those rows; this module owns the card gutter, the fold
+//! cap, and the wrapping they share with every other body.
 
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -36,7 +42,10 @@ use ratatui::text::Span;
 
 use crate::plugins::ReportBlock;
 use crate::plugins::ReportEntry;
+use crate::tui::markdown::wrap_code;
+use crate::tui::markdown::wrap_styled;
 use crate::tui::theme;
+use crate::tui::tool_body;
 use crate::tui::wrap::display_width;
 use crate::tui::wrap::wrap_str;
 
@@ -48,6 +57,11 @@ pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"
 /// How many result lines a folded tool card previews before the `… +N lines`
 /// hint — cordis caps a folded text body at three rows.
 const TOOL_BODY_MAX_LINES: usize = 3;
+
+/// A folded diff body gets a deeper budget: a hunk line carries far more
+/// meaning per row than a line of command output, and cordis caps its diff
+/// cards at eight. `write` and `edit` render through this.
+const DIFF_BODY_MAX_LINES: usize = 8;
 
 /// Body spine of a tool card: the `⎿` bracket on the first row, blank indent
 /// under it afterwards (both four columns wide, so rows align).
@@ -158,9 +172,14 @@ impl HistoryCell {
 /// Render one executed tool call as a card: the status glyph, the bold
 /// category-colored tool name with its argument summary in parentheses, and
 /// the duration chip on the header row; the output then hangs under a `⎿`
-/// spine tinted like the header. Folded (`expanded == false`) the output shows
-/// a head preview and a dim `… +N lines` hint; a failure rides in the body, in
-/// the error color.
+/// spine tinted like the header.
+///
+/// The body is one of three things. A file tool (`write`, `edit`, `read`)
+/// renders a structured body — a highlighted `-`/`+` diff excerpt, or the
+/// file's own lines under a number column — capped at [`DIFF_BODY_MAX_LINES`].
+/// Any other tool shows the head of its output text, capped at
+/// [`TOOL_BODY_MAX_LINES`]. Either way a folded card ends in a dim
+/// `… +N lines` hint, and a failure rides in the body in the error color.
 fn tool_card_lines(
     name: &str,
     arguments: &str,
@@ -181,6 +200,13 @@ fn tool_card_lines(
     let name_style = Style::default().fg(category).add_modifier(Modifier::BOLD);
     let text_style = Style::default().fg(theme::DIM);
     let glyph = if error.is_some() { "✗" } else { "●" };
+    // A structured body gets a deeper budget: a diff row says far more per line
+    // than a row of command output, so cordis caps diff cards at eight.
+    let budget = if expanded {
+        usize::MAX
+    } else {
+        DIFF_BODY_MAX_LINES
+    };
 
     // The duration chip rides at the end of the header; the argument summary
     // bows out early enough to keep it visible. The parentheses wrapping the
@@ -220,6 +246,8 @@ fn tool_card_lines(
             Style::default().fg(theme::ERROR),
             &gutter,
         ));
+    } else if let Some(body) = tool_body::build(name, arguments, result, budget) {
+        lines.extend(body_lines(&body, width, text_style, &gutter));
     } else if !result.trim().is_empty() {
         let (mut body, hidden) = capped_gutter_lines(
             result,
@@ -232,12 +260,8 @@ fn tool_card_lines(
             text_style,
             &gutter,
         );
-        if hidden > 0 {
-            let noun = if hidden == 1 { "line" } else { "lines" };
-            body.push(Line::from(Span::styled(
-                format!(" … +{hidden} {noun} (ctrl+o to expand)"),
-                text_style,
-            )));
+        if let Some(hint) = fold_hint(hidden, text_style) {
+            body.push(hint);
         }
         lines.extend(body);
     } else {
@@ -247,6 +271,84 @@ fn tool_card_lines(
         ]));
     }
     lines
+}
+
+/// Fold hint under a capped body: how many logical lines the card hid, and the
+/// key that restores them.
+fn fold_hint(hidden: usize, style: Style) -> Option<Line<'static>> {
+    if hidden == 0 {
+        return None;
+    }
+    let noun = if hidden == 1 { "line" } else { "lines" };
+    Some(Line::from(Span::styled(
+        format!(" … +{hidden} {noun} (ctrl+o to expand)"),
+        style,
+    )))
+}
+
+/// Lay a structured [`tool_body::Body`] out under the card gutter. The body was
+/// already capped while it was built (so a huge `write` never materializes rows
+/// the card cannot show); its [`Body::hidden`] count becomes the fold hint under
+/// the rows, the way a capped text body ends.
+fn body_lines(
+    body: &tool_body::Body,
+    width: usize,
+    text_style: Style,
+    gutter: &Gutter,
+) -> Vec<Line<'static>> {
+    let available = width.saturating_sub(display_width(gutter.first)).max(1);
+
+    // Every row reserves the body's widest lead as its column, so diff signs,
+    // line numbers, and a caption under them all line up and the code starts at
+    // one column.
+    let lead_width = body
+        .rows
+        .iter()
+        .map(|row| display_width(&row.lead))
+        .max()
+        .unwrap_or(0);
+    let code_width = available.saturating_sub(lead_width).max(1);
+
+    let mut out = Vec::with_capacity(body.rows.len() + usize::from(body.hidden > 0));
+    for row in &body.rows {
+        let pad = lead_width.saturating_sub(display_width(&row.lead));
+        let lead = Span::styled(format!("{}{}", row.lead, " ".repeat(pad)), row.tone.style());
+        let rows = if body.code {
+            wrap_code(&row.spans, code_width)
+        } else {
+            wrap_styled(&row.spans, code_width)
+        };
+        for (index, content) in rows.into_iter().enumerate() {
+            let mut spans = Vec::with_capacity(content.len() + 1);
+            if index == 0 {
+                spans.push(lead.clone());
+            } else {
+                spans.push(Span::raw(" ".repeat(lead_width)));
+            }
+            spans.extend(content);
+            out.push(with_gutter(spans, out.is_empty(), gutter));
+        }
+    }
+    if let Some(hint) = fold_hint(body.hidden, text_style) {
+        out.push(hint);
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(
+            gutter.first.to_string(),
+            gutter.style,
+        )));
+    }
+    out
+}
+
+/// Prefix `spans` with the card's spine — the `⎿` bracket on the very first
+/// row, blank indent under it afterwards.
+fn with_gutter(spans: Vec<Span<'static>>, first: bool, gutter: &Gutter) -> Line<'static> {
+    let spine = if first { gutter.first } else { gutter.rest };
+    let mut line = Vec::with_capacity(spans.len() + 1);
+    line.push(Span::styled(spine.to_string(), gutter.style));
+    line.extend(spans);
+    Line::from(line)
 }
 
 /// The live stand-in shown while a tool executes: the braille spinner in the
@@ -570,32 +672,95 @@ pub fn assistant_lines_tracked(
 
 /// The settled thinking card: a `⚓ thinking` header in the thinking color
 /// (with the duration chip when the stream was timed) over the dim italic
-/// body hanging under the thinking rail, or — folded — a one-line marker
-/// naming the expand key.
+/// body hanging under the thinking rail.
+///
+/// Folded, the card keeps one row of context instead of collapsing to a bare
+/// marker: the newest reasoning row rides under the rail, clipped from its
+/// START so the tokens that arrived last stay readable. That is the reference
+/// TUI's ticker rule — a folded card still answers "what is it thinking about
+/// right now?" — and the `…` on the left is what says the row was clipped.
 pub fn thinking_card_lines(
     text: &str,
     width: usize,
     expanded: bool,
     duration_ms: Option<u64>,
 ) -> Vec<Line<'static>> {
-    let mut header = thinking_header(duration_ms);
-    if !expanded {
-        header.push(Span::styled(
-            " (ctrl+t to expand)".to_string(),
-            Style::default().fg(theme::DIM),
+    let mut lines = vec![Line::from(thinking_header(duration_ms))];
+    if expanded {
+        lines.extend(gutter_lines(
+            text,
+            width,
+            thinking_text_style(),
+            &Gutter::rail(),
         ));
-        return vec![Line::from(header)];
+        return lines;
     }
-    let mut lines = vec![Line::from(header)];
-    lines.extend(gutter_lines(
-        text,
-        width,
-        Style::default()
-            .fg(theme::DIM)
-            .add_modifier(Modifier::ITALIC),
-        &Gutter::rail(),
+    // Folded: the expand hint rides the header (so the preview keeps the full
+    // width), then the preview row when the stream said anything at all.
+    lines[0].spans.push(Span::styled(
+        " (ctrl+t to expand)".to_string(),
+        Style::default().fg(theme::DIM),
     ));
+    if let Some(preview) = thinking_tail_line(text, width, 0) {
+        lines.push(preview);
+    }
     lines
+}
+
+/// The dim italic style every thinking body row carries.
+fn thinking_text_style() -> Style {
+    Style::default()
+        .fg(theme::DIM)
+        .add_modifier(Modifier::ITALIC)
+}
+
+/// The newest non-blank reasoning row, hanging under the thinking rail.
+///
+/// An over-long row is clipped from its START (leading `…`): while a model
+/// reasons, the end of the line is where the new tokens land, so trimming the
+/// head is what keeps the preview live instead of frozen on old words.
+/// `reserve` columns are held back for whatever the caller appends to the row
+/// (the live card's block cursor).
+fn thinking_tail_line(text: &str, width: usize, reserve: usize) -> Option<Line<'static>> {
+    let rail = Gutter::rail();
+    let available = width
+        .saturating_sub(display_width(rail.first) + reserve)
+        .max(1);
+    let latest = normalize(text)
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .find(|line| !line.trim().is_empty())?
+        .to_string();
+
+    let body = if display_width(&latest) > available {
+        // The `…` costs a column of its own.
+        let budget = available.saturating_sub(1).max(1);
+        format!("…{}", tail_columns(&latest, budget))
+    } else {
+        latest
+    };
+    Some(Line::from(vec![
+        Span::styled(rail.first.to_string(), rail.style),
+        Span::styled(body, thinking_text_style()),
+    ]))
+}
+
+/// The widest suffix of `text` that fits in `budget` display columns. A wide
+/// glyph that would overflow is dropped rather than half-printed, and a
+/// leading blank left by the cut is trimmed so the ellipsis hugs the word.
+fn tail_columns(text: &str, budget: usize) -> String {
+    let mut width = 0usize;
+    let mut start = text.len();
+    for (index, ch) in text.char_indices().rev() {
+        let cell = crate::tui::wrap::char_width(ch);
+        if width + cell > budget {
+            break;
+        }
+        width += cell;
+        start = index;
+    }
+    text[start..].trim_start().to_string()
 }
 
 /// The `⚓ thinking` header spans, with the duration chip when the stream was
@@ -623,8 +788,12 @@ fn thinking_header(duration_ms: Option<u64>) -> Vec<Span<'static>> {
 
 /// The thinking card while its stream is live (the transcript tail): a
 /// braille spinner header with the dim italic body on the rail underneath and
-/// the block cursor riding the last row. The body shows only when `expanded`;
-/// the spinner alone still signals that reasoning is happening.
+/// the block cursor riding the last row.
+///
+/// Folded, the live card still previews its newest row — the spinner says
+/// reasoning is happening, the ticker says what it is about. The preview is
+/// the same clipped-from-the-start row the settled card shows: the newest
+/// tokens land at the end of a reasoning line, so that is the end to keep.
 pub fn thinking_live_lines(
     text: &str,
     width: usize,
@@ -645,19 +814,16 @@ pub fn thinking_live_lines(
         ),
     ])];
     if expanded {
-        let mut body = gutter_lines(
-            text,
-            width,
-            Style::default()
-                .fg(theme::DIM)
-                .add_modifier(Modifier::ITALIC),
-            &Gutter::rail(),
-        );
+        let mut body = gutter_lines(text, width, thinking_text_style(), &Gutter::rail());
         if let Some(last) = body.last_mut() {
             last.spans
                 .push(Span::styled("▌", Style::default().fg(theme::ACCENT)));
         }
         lines.append(&mut body);
+    } else if let Some(mut row) = thinking_tail_line(text, width, 1) {
+        row.spans
+            .push(Span::styled("▌", Style::default().fg(theme::ACCENT)));
+        lines.push(row);
     }
     lines
 }
@@ -810,8 +976,7 @@ mod tests {
             "and the reasoning text stays dim italic"
         );
         assert!(
-            rendered[1]
-                .spans[1]
+            rendered[1].spans[1]
                 .style
                 .add_modifier
                 .contains(Modifier::ITALIC)
@@ -824,9 +989,14 @@ mod tests {
             text: "reasoning hard".to_string(),
             duration_ms: Some(4_200),
         };
+        // Folded: the header naming the expand key, then the newest reasoning
+        // row as a preview, so a folded card still says what it was about.
         assert_eq!(
             plain(&cell.lines(60, &folded_all())),
-            vec!["⚓ thinking · 4.2s (ctrl+t to expand)"]
+            vec![
+                "⚓ thinking · 4.2s (ctrl+t to expand)",
+                "  │ reasoning hard"
+            ]
         );
 
         // Even folded the header is the thinking color, not the notice gray.
@@ -837,6 +1007,50 @@ mod tests {
             Some(theme::DIM),
             "the expand hint recedes"
         );
+        // The preview is a body row: thinking rail, dim italic text.
+        assert_eq!(rendered[1].spans[0].style.fg, Some(theme::THINKING));
+        assert_eq!(rendered[1].spans[1].style.fg, Some(theme::DIM));
+        assert!(
+            rendered[1].spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn folded_thinking_previews_the_newest_row_clipped_from_the_start() {
+        // The preview follows the stream's tail, skipping trailing blanks.
+        let cell = HistoryCell::Thinking {
+            text: "first thought\nsecond thought\n\n".to_string(),
+            duration_ms: None,
+        };
+        assert_eq!(
+            plain(&cell.lines(60, &folded_all())),
+            vec!["⚓ thinking (ctrl+t to expand)", "  │ second thought"]
+        );
+
+        // A row wider than the card keeps its END — the newest tokens land
+        // there — and marks the clip with a leading ellipsis.
+        let cell = HistoryCell::Thinking {
+            text: "aaaa bbbb cccc dddd eeee".to_string(),
+            duration_ms: None,
+        };
+        let rendered = plain(&cell.lines(20, &folded_all()));
+        assert_eq!(rendered[0], "⚓ thinking (ctrl+t to expand)");
+        assert_eq!(rendered[1], "  │ …cccc dddd eeee");
+        assert!(display_width(&rendered[1]) <= 20, "{rendered:?}");
+
+        // Thinking that is nothing but whitespace previews nothing: the card
+        // stays the header alone rather than showing an empty rail row.
+        let cell = HistoryCell::Thinking {
+            text: "  \n\n".to_string(),
+            duration_ms: None,
+        };
+        assert_eq!(
+            plain(&cell.lines(60, &folded_all())),
+            vec!["⚓ thinking (ctrl+t to expand)"]
+        );
     }
 
     #[test]
@@ -844,10 +1058,21 @@ mod tests {
         let lines = thinking_live_lines("deep thought", 20, true, "⠹");
         assert_eq!(plain(&lines), vec!["⠹ thinking…", "  │ deep thought▌"]);
 
-        // Folded, the spinner header alone keeps signaling that reasoning is
-        // happening.
+        // Folded, the spinner header keeps signaling that reasoning is
+        // happening and the newest row previews what it is about.
         let lines = thinking_live_lines("deep thought", 20, false, "⠹");
-        assert_eq!(plain(&lines), vec!["⠹ thinking…"]);
+        assert_eq!(plain(&lines), vec!["⠹ thinking…", "  │ deep thought▌"]);
+
+        // An over-long live row is clipped from the start too: the newest
+        // tokens are at its end, where the cursor rides.
+        let lines = thinking_live_lines("aaaa bbbb cccc dddd", 16, false, "⠹");
+        let rendered = plain(&lines);
+        assert_eq!(rendered[0], "⠹ thinking…");
+        assert!(rendered[1].ends_with("▌"), "{rendered:?}");
+        assert!(rendered[1].contains('…'), "{rendered:?}");
+        for row in &rendered {
+            assert!(display_width(row) <= 16, "{row:?} overflows");
+        }
     }
 
     #[test]
@@ -882,6 +1107,133 @@ mod tests {
                 "    e",
             ]
         );
+    }
+
+    #[test]
+    fn write_card_renders_the_content_as_a_diff() {
+        let cell = HistoryCell::ToolCall {
+            name: "write".to_string(),
+            arguments: r#"{"path": "src/a.py", "content": "one\ntwo\nthree\n"}"#.to_string(),
+            result: "created src/a.py (14 bytes)".to_string(),
+            error: None,
+            duration_ms: Some(120),
+        };
+        // The stat row, then the content as added lines under one marker
+        // column — the result string ("created … (14 bytes)") is gone, since
+        // the body itself is the more useful statement.
+        assert_eq!(
+            plain(&cell.lines(60, &expanded_all())),
+            vec![
+                "● write(src/a.py) · 120ms",
+                " ⎿    (+3 -0) created",
+                "    + one",
+                "    + two",
+                "    + three",
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_card_diffs_the_replaced_text() {
+        let cell = HistoryCell::ToolCall {
+            name: "edit".to_string(),
+            arguments: r#"{"path": "a.rs", "old_string": "old", "new_string": "new"}"#.to_string(),
+            result: "replaced 1 occurrence in a.rs".to_string(),
+            error: None,
+            duration_ms: None,
+        };
+        let rendered = cell.lines(60, &expanded_all());
+        assert_eq!(
+            plain(&rendered),
+            vec![
+                "● edit(a.rs)",
+                " ⎿    (+1 -1) replaced 1 occurrence",
+                "    - old",
+                "    + new",
+            ]
+        );
+        // Removed rows are red, added rows green, both on the marker column.
+        let removed = &rendered[2];
+        assert_eq!(removed.spans[1].content.as_ref(), "- ");
+        assert_eq!(removed.spans[1].style.fg, Some(theme::DIFF_DEL));
+        assert_eq!(removed.spans[2].style.fg, Some(theme::DIFF_DEL));
+        let added = &rendered[3];
+        assert_eq!(added.spans[1].content.as_ref(), "+ ");
+        assert_eq!(added.spans[1].style.fg, Some(theme::DIFF_ADD));
+        assert_eq!(added.spans[2].style.fg, Some(theme::DIFF_ADD));
+    }
+
+    #[test]
+    fn diff_bodies_fold_at_the_deeper_diff_budget() {
+        let content: Vec<String> = (1..=12).map(|n| format!("line {n}")).collect();
+        let cell = HistoryCell::ToolCall {
+            name: "write".to_string(),
+            arguments: serde_json::json!({ "path": "a.txt", "content": content.join("\n") })
+                .to_string(),
+            result: "created a.txt".to_string(),
+            error: None,
+            duration_ms: None,
+        };
+        // Folded: the stat row plus eight content rows, then the hint. Rows are
+        // laid out first and folded second, so the hint is never content.
+        let folded = plain(&cell.lines(80, &folded_all()));
+        assert_eq!(folded.len(), 1 + DIFF_BODY_MAX_LINES + 1);
+        assert_eq!(folded[1], " ⎿    (+12 -0) created");
+        assert_eq!(folded[8], "    + line 7");
+        assert_eq!(folded[9], " … +5 lines (ctrl+o to expand)");
+
+        // Expanded: every row, no hint.
+        let expanded = plain(&cell.lines(80, &expanded_all()));
+        assert_eq!(expanded.len(), 1 + 13);
+        assert_eq!(expanded.last().unwrap(), "    + line 12");
+    }
+
+    #[test]
+    fn read_card_renumbers_its_window_under_one_column() {
+        let cell = HistoryCell::ToolCall {
+            name: "read".to_string(),
+            arguments: r#"{"path": "a.rs"}"#.to_string(),
+            result:
+                "     1\tfn main() {\n     2\t    body();\n     3\t}\n[3 lines total, showing 1-3]"
+                    .to_string(),
+            error: None,
+            duration_ms: None,
+        };
+        assert_eq!(
+            plain(&cell.lines(60, &expanded_all())),
+            vec![
+                "● read(a.rs)",
+                " ⎿  1 fn main() {",
+                "    2     body();",
+                "    3 }",
+                // The caption starts where the code column does, so it reads as
+                // a note about the body rather than as line 4 of the file.
+                "      [3 lines total, showing 1-3]",
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_card_wraps_a_long_diff_row_without_eating_spaces() {
+        let cell = HistoryCell::ToolCall {
+            name: "write".to_string(),
+            arguments: r#"{"path": "a.txt", "content": "aaaa bbbb cccc"}"#.to_string(),
+            result: "created a.txt".to_string(),
+            error: None,
+            duration_ms: None,
+        };
+        let rendered = plain(&cell.lines(20, &expanded_all()));
+        // The code row wraps at the column budget and keeps every character,
+        // including the space it broke at.
+        let joined: String = rendered[2..]
+            .iter()
+            .map(|row| row.trim_start_matches(' '))
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(joined.contains("aaaa bbbb cccc"), "{rendered:?}");
+        for row in &rendered {
+            assert!(display_width(row) <= 20, "{row:?} overflows the card");
+        }
     }
 
     #[test]

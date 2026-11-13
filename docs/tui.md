@@ -73,11 +73,23 @@ Unknown languages or blocks over 128 KiB degrade to plain text but keep the lang
 Model thinking renders as a collapsible card:
 
 ```text
-⚓ thinking · 4.2s
-  │ dim italic reasoning…
+⚓ thinking · 4.2s (ctrl+t to expand)
+  │ …the newest reasoning row, clipped from its start…
 ```
 
-The header is `⚓ thinking` with a duration chip in the thinking color (purple); the body is italic text under a `│` rail. `Ctrl+T` or `/thinking` toggles whether settled thinking cards show their body, and a folded card names its own expand key. While reasoning streams, the card is a live variant: a braille spinner replaces the anchor glyph, the duration chip waits until the stream stops, and a block cursor rides the last body row.
+Expanded, the card shows the whole reasoning under the rail:
+
+```text
+⚓ thinking · 4.2s
+  │ dim italic reasoning…
+  │ …still hanging from one rail…
+```
+
+The header is `⚓ thinking` with a duration chip in the thinking color (purple); the body is italic text under a `│` rail. `Ctrl+T` or `/thinking` toggles whether settled thinking cards show their body, and a folded card names its own expand key.
+
+A folded card keeps **one row of context**: the newest non-blank reasoning row rides under the rail, clipped from its **start** (leading `…`) when it is wider than the card. While a model reasons, the end of a line is where the new tokens land, so trimming the head is what keeps the preview live instead of frozen on old words — the reference TUI's ticker rule. The live variant does the same, so a folded card still answers "what is it thinking about right now?" instead of only "it is thinking". Thinking that is nothing but whitespace previews nothing and stays the header alone.
+
+While reasoning streams, the card is a live variant: a braille spinner replaces the anchor glyph, the duration chip waits until the stream stops, and a block cursor rides the preview row (or the last body row when expanded).
 
 Thinking text is read from `reasoning_content` by default, and a provider instance can rename the field with `wire.thinking_fields`. Cards are display metadata only: they are replayed on resume so the transcript looks the same, but thinking never re-enters the model context — the model is not shown its own reasoning as conversation. The rollout records each reasoning block with the wall-clock duration behind the header chip and attaches it to the assistant message it preceded, which is how a replay puts the card back above the right answer.
 
@@ -95,6 +107,17 @@ Every tool call renders as its own card:
 
 The header is `● name(args) · duration`, with the name in the tool's category color and the `⎿` spine tinted to match. The body previews the first 3 lines; `Ctrl+O` expands and collapses the full output. While the call is still running, a braille spinner occupies the status-glyph slot and an elapsed-time row hangs under the spine. Failures swap `●` for `✗` and render the message in the error color in place of output. When the argument summary had to fold (a multi-line command, typically), expanding restores the full arguments above the output.
 
+The file tools render a **structured body** instead of their result text, because they know more than it does — a `write`/`edit` card shows a highlighted `-`/`+` excerpt over a `(+N -M)` stat row, and a `read` card shows its numbered window under a dim number column:
+
+```text
+● edit(src/tui/chat.rs) · 1.2s
+ ⎿    (+2 -1) replaced 1 occurrence
+    - fn body(…) { dim }
+    + fn body(…) { highlighted }
+```
+
+Those bodies fold at 8 rows rather than 3, are highlighted by the file's extension, and wrap at the column budget like code. [tools.md](tools.md#file-tool-bodies) has the details.
+
 Tool activity is display-only — it never surfaces as agent text. The conversation carries the wire messages (the assistant's `tool_calls` and each tool's result); the card is front-end bookkeeping. A replayed session rebuilds the cards from the rollout and shows a duration chip only for calls this run measured.
 
 ## Implementation map
@@ -103,6 +126,7 @@ Tool activity is display-only — it never surfaces as agent text. The conversat
 | --- | --- |
 | Terminal setup, event loop, both render paths, menus, footer | [`../src/tui/app.rs`](../src/tui/app.rs) |
 | Transcript cells (user, assistant, error, notice, interrupted, both cards, reports) | [`../src/tui/chat.rs`](../src/tui/chat.rs) |
+| Structured tool bodies: `write`/`edit` diff excerpts, `read` line columns | [`../src/tui/tool_body.rs`](../src/tui/tool_body.rs) |
 | Per-session view state: cells, scroll, fold mirrors, inline flush bookkeeping | [`../src/tui/session.rs`](../src/tui/session.rs) |
 | Markdown → ratatui lines, incl. tables, fences, links | [`../src/tui/markdown.rs`](../src/tui/markdown.rs) |
 | Code tokenization behind `TokenKind` | [`../src/tui/highlight.rs`](../src/tui/highlight.rs) |

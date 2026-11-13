@@ -73,11 +73,23 @@ CST_TUI_MODE=inline codest
 模型思考渲染为可折叠卡片：
 
 ```text
-⚓ thinking · 4.2s
-  │ dim italic reasoning…
+⚓ thinking · 4.2s (ctrl+t to expand)
+  │ …最新一行推理，超宽时从开头截断…
 ```
 
-头部是 `⚓ thinking` 加一个用时标签，使用 thinking 颜色（紫色）；正文是挂在 `│` 轨道下的斜体文本。`Ctrl+T` 或 `/thinking` 切换已定型卡片是否展开正文，折叠的卡片会标明自己的展开键。推理流式输出期间，卡片是活动版本：转轮替换锚形图标，用时标签等流结束才出现，块光标骑在正文最后一行。
+展开时，卡片在轨道下显示整段推理：
+
+```text
+⚓ thinking · 4.2s
+  │ dim italic reasoning…
+  │ …同一根轨道上继续挂着的正文…
+```
+
+头部是 `⚓ thinking` 加一个用时标签，使用 thinking 颜色（紫色）；正文是挂在 `│` 轨道下的斜体文本。`Ctrl+T` 或 `/thinking` 切换已定型卡片是否展开正文，折叠的卡片会标明自己的展开键。
+
+折叠状态仍保留 **一行上下文**：最后一行非空的推理挂在轨道下；当它宽于卡片时从 **开头** 截断（前导 `…`）。模型推理时，新 token 落在一行的末尾，因此裁掉头部才能让预览跟着流走，而不是卡在旧词上——这正是参考 TUI 的 ticker 规则。活动版本同理，折叠的卡片因此不只回答“它在思考”，还回答“此刻在思考什么”。纯空白的推理不产生预览，卡片只留头部。
+
+推理流式输出期间，卡片是活动版本：转轮替换锚形图标，用时标签等流结束才出现，块光标骑在预览行上（展开时骑在正文最后一行）。
 
 思考文本默认读取 `reasoning_content`，provider 实例可用 `wire.thinking_fields` 改名。卡片是显示元数据：恢复会话时回放，让 transcript 看上去与当时一致，但思考内容永远不会重新进入模型上下文——模型不会把自己的推理当作会话内容再读一遍。rollout 记录每个推理块及其实际耗时（即头部标签的来源），并把它挂在其先行的那条助手消息上，回放时卡片因此落回正确的位置。
 
@@ -95,6 +107,17 @@ CST_TUI_MODE=inline codest
 
 头部是 `● name(args) · duration`，工具名用所属类别的颜色，`⎿` 脊线同色。正文预览前 3 行；`Ctrl+O` 展开/折叠完整输出。调用仍在执行时，转轮占据状态图标位，耗时行挂在脊线下方。失败时 `●` 换成 `✗`，错误信息以错误色代替输出显示。参数摘要被折叠时（典型是多行命令），展开会在输出上方恢复完整参数。
 
+文件类工具渲染 **结构化正文** 而不是结果文本，因为它们比结果字符串知道得更多——`write`/`edit` 卡片显示高亮的 `-`/`+` 节选并配一条 `(+N -M)` 统计行，`read` 卡片把带编号的窗口放在暗色行号列下：
+
+```text
+● edit(src/tui/chat.rs) · 1.2s
+ ⎿    (+2 -1) replaced 1 occurrence
+    - fn body(…) { dim }
+    + fn body(…) { highlighted }
+```
+
+这类正文折叠到 8 行而不是 3 行，按文件扩展名语法高亮，并像代码一样按列宽硬折行。细节见 [tools.md](tools.md#文件类工具的正文)。
+
 工具活动只是显示内容——它从不作为 agent 文本出现。会话里保存的是线协议消息（助手的 `tool_calls` 与每次工具的结果）；卡片是前端自己的账务。恢复会话时卡片由 rollout 重建，只有本轮实测过的调用才带用时标签。
 
 ## 实现地图
@@ -103,6 +126,7 @@ CST_TUI_MODE=inline codest
 | --- | --- |
 | 终端装配、事件循环、两条渲染路径、菜单、footer | [`../src/tui/app.rs`](../../src/tui/app.rs) |
 | transcript 单元格（用户、助手、错误、通知、中断、两类卡片、报告） | [`../src/tui/chat.rs`](../../src/tui/chat.rs) |
+| 结构化工具正文：`write`/`edit` 的 diff 节选、`read` 的行号列 | [`../src/tui/tool_body.rs`](../../src/tui/tool_body.rs) |
 | 每会话视图状态：单元格、滚动、折叠镜像、inline 刷出记账 | [`../src/tui/session.rs`](../../src/tui/session.rs) |
 | Markdown → ratatui 行，含表格、围栏、链接 | [`../src/tui/markdown.rs`](../../src/tui/markdown.rs) |
 | `TokenKind` 之后的代码分词 | [`../src/tui/highlight.rs`](../../src/tui/highlight.rs) |

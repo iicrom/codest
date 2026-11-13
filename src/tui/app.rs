@@ -6270,7 +6270,8 @@ mod tests {
         assert!(lines.iter().any(|line| line.starts_with('⚓')), "{rendered}");
         assert!(rendered.contains("long thoughts"), "{rendered}");
 
-        // Folded (the default): a single marker line naming the expand key.
+        // Folded (the default): the marker line naming the expand key over a
+        // one-row preview of the newest reasoning.
         app.show_thinking = false;
         let lines = render_lines(&mut app, 60, 20);
         let rendered = lines.join("\n");
@@ -6278,7 +6279,14 @@ mod tests {
             rendered.contains("thinking · 4.2s (ctrl+t to expand)"),
             "{rendered}"
         );
-        assert!(!rendered.contains("long thoughts"), "{rendered}");
+        let header = lines
+            .iter()
+            .position(|line| line.contains("thinking · 4.2s (ctrl+t to expand)"))
+            .expect("header row");
+        assert!(
+            lines[header + 1].contains("long thoughts"),
+            "the preview follows the header: {rendered}"
+        );
     }
 
     #[tokio::test]
@@ -6370,20 +6378,19 @@ mod tests {
         });
 
         // Scrollback is immutable, so the flush bakes in the current fold
-        // state: folded by default, compact and permanent.
+        // state: folded by default — header plus the newest-row preview.
         let pending = app.take_inline_pending(60);
         let text: Vec<String> = pending
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect();
+        let header = text
+            .iter()
+            .position(|row| row.contains("⚓ thinking · 4.2s (ctrl+t to expand)"))
+            .expect("header row");
         assert!(
-            text.iter()
-                .any(|row| row.contains("⚓ thinking · 4.2s (ctrl+t to expand)")),
-            "{text:?}"
-        );
-        assert!(
-            !text.iter().any(|row| row.contains("deep reasoning")),
-            "{text:?}"
+            text[header + 1].contains("deep reasoning"),
+            "the folded card keeps a preview row: {text:?}"
         );
     }
 
