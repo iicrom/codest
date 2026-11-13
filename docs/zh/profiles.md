@@ -53,6 +53,8 @@ default = "glm/glm-5.3"        # 启动选择；赢过 config.toml 的 default�
 effort = "high"                # 启动时等价于 /effort high
 tools = ["bash", "fs"]         # 只有这些插件的工具声明给模型；
                                # 其余插件保留命令、钩子与提示词片段
+                               # （Windows 上 shell 插件的 id 是 "pwsh"，
+                               #   见 plugins.md 第 3 节）
 
   [profiles.code.prompt]
   append = "你是资深 Rust 工程师…"   # 追加在基础提示词与插件片段之后

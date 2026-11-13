@@ -87,7 +87,7 @@ Fold state is per frame, not per card: `Ctrl+T` flips one global flag that every
 Every tool call renders as its own card:
 
 ```text
-● bash(cargo build) · 4.2s
+● bash(cargo build) · 4.2s   # `pwsh(...)` on a Windows host
  ⎿  Compiling codest
     … +3 lines (ctrl+o to expand)
 ```
@@ -117,7 +117,7 @@ Startup puts three notices at the top of the active session's transcript: a one-
 
 - [commands.md](commands.md) — every slash command and keybinding, including `Ctrl+T` and `Ctrl+O`.
 - [configuration.md](configuration.md) — `wire.thinking_fields`, provider instances, and the rest of the file reference.
-- [tools.md](tools.md) — the `bash` and `fs` tools whose calls render as these cards.
+- [tools.md](tools.md) — the shell (`bash`/`pwsh`) and `fs` tools whose calls render as these cards.
 - [../src/tui/app.rs](../src/tui/app.rs) — the event loop and the two rendering paths.
 - [../src/tui/chat.rs](../src/tui/chat.rs) — the transcript cells, including both card kinds.
 

@@ -1253,9 +1253,11 @@ mod tests {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).expect("plugin dir");
         let contract = if contract_pinned {
+            // `toml_string`, not a bare interpolation: on Windows the path
+            // carries backslashes that TOML would read as escapes.
             format!(
-                "cst-plugin-api = {{ path = \"{}\" }}\n",
-                root.join("cst-src").join(CONTRACT_SUBDIR).display()
+                "cst-plugin-api = {{ path = {} }}\n",
+                toml_string(&path_string(&root.join("cst-src").join(CONTRACT_SUBDIR)))
             )
         } else {
             "cst-plugin-api = \"0.1\"\n".to_string()
@@ -1381,8 +1383,8 @@ mod tests {
             dir.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"plugin\"\nversion = \"0.1.0\"\n\n\
-                 [dependencies]\ncst-plugin-api = {{ path = \"{}\" }}\n",
-                other.join(CONTRACT_SUBDIR).display()
+                 [dependencies]\ncst-plugin-api = {{ path = {} }}\n",
+                toml_string(&path_string(&other.join(CONTRACT_SUBDIR)))
             ),
         )
         .expect("manifest");

@@ -12,7 +12,9 @@ cargo run -- --help         # default-run 是 `codest`
 cargo install --path .      # 两个命令都装进 ~/.cargo/bin
 ```
 
-没有 feature 矩阵可选，也没有 build script：crate 直接按 `Cargo.toml` 里声明的依赖编译。唯一的平台条件依赖是 Unix 上的 `libc`，供 `bash` 工具的进程组终止使用。冒烟脚本需要的东西只有 debug 二进制和 `python3`（仅标准库）。
+没有 feature 矩阵可选，也没有 build script：crate 直接按 `Cargo.toml` 里声明的依赖编译。唯一的平台条件依赖是 Unix 上的 `libc`，供 shell 工具的进程组终止使用；Windows 路径不需要额外 crate（`taskkill` 是系统自带程序）。冒烟脚本需要的东西只有 debug 二进制和 `python3`（仅标准库）。
+
+三个 `scripts/*_smoke.py` 都需要 unix 伪终端（`pty` / `fcntl`），所以只在 unix 宿主上可跑。Windows 上的检查手段是 `cargo test`：工具单元测试会真实拉起 `pwsh`，断言退出码、stderr 合并、超时杀进程树与 UTF-8 输出。
 
 ## 测试
 
@@ -21,7 +23,7 @@ cargo test                                      # 单元测试（离线，进程
 
 python3 scripts/openai_test_server.py --port 8080   # 本地 OpenAI 兼容服务
 python3 scripts/pty_smoke.py                    # pty 内端到端冒烟（双 TUI 模式）
-python3 scripts/tool_smoke.py                   # 真实 bash/read 执行 + /tools 开关
+python3 scripts/tool_smoke.py                   # 真实 shell/read 执行 + /tools 开关
 python3 scripts/markdown_smoke.py               # Markdown 渲染可视检查（双 TUI 模式）
 python3 scripts/session_header_smoke.py         # 断言 session-id 头真的发到线上
 python3 scripts/plugin_smoke.py                 # 外部插件安装/构建往返
@@ -31,7 +33,7 @@ python3 scripts/plugin_smoke.py                 # 外部插件安装/构建往�
 | --- | --- |
 | `cargo test` | core 与 TUI 各模块的单元测试。模型是 `EchoModelClient`，一个进程内的确定性 echo，按词大小的分片流式输出，什么都不出进程。会话测试在总线上驱动真实的 worker，断言事件序列、取消、工具轮与 rollout 内容。 |
 | `pty_smoke.py` | 在伪终端里启动二进制、输入消息，把捕获的 ANSI 输出渲染成纯文本网格。默认跑两种 TUI 模式：`fullscreen` 必须发出 `\x1b[?1049h`（alternate screen）与 `\x1b[?1000h`（鼠标捕获），`inline` 两者都不能发；滚轮必须能滚、消息必须出现在 transcript、模式提示与空闲 footer 必须出现、进程必须干净退出。config 变体额外检查模型发现、菜单切换与 footer 的上下文窗口（声明窗口与发现窗口）；两个变体都会用 `--continue` 再跑一遍，检查恢复的会话与记录的用量。 |
-| `tool_smoke.py` | 对本地服务跑 `bash` 与 `read` 两个用例：真实工具轮必须显示出命令输出（`hello-from-tool`、`exit code: 0`）或文件内容（`alpha`、`gamma`、`3 lines total`）；随后 `/tools <name> off` 加 `/context` 必须按收窄后的集合报出 `Tools (3/4 enabled)`，并仍把该工具列为 `disabled`。 |
+| `tool_smoke.py` | 对本地服务跑 shell 工具与 `read` 两个用例：真实工具轮必须显示出命令输出（`hello-from-tool`、`exit code: 0`）或文件内容（`alpha`、`gamma`、`3 lines total`）；随后 `/tools <name> off` 加 `/context` 必须按收窄后的集合报出 `Tools (3/4 enabled)`，并仍把该工具列为 `disabled`。 |
 | `markdown_smoke.py` | 两种模式下的可视检查，素材来自脚本化的服务回复：标题文本、粗体/斜体/行内代码、圆点与嵌套圆点标记、有序标记、`▎` 引用竖条、分隔线、带 `│ rust` / `│ python` 标签与正文的两个代码围栏、表头与表线、任务复选框——以及屏幕上不出现原始的 `**bold**` 标记。inline 模式检查标题、代码标签与无原始标记三项。 |
 | `session_header_smoke.py` | 对会 dump 请求头的服务跑三种情况：默认实例发出的 `session-id` 头取值匹配 UUIDv7；`wire.session_header = "none"` 一个都不发；model 级 opt-out 也不发。客户端完全没发请求也算失败。 |
 | `plugin_smoke.py` | 外部插件往返，默认指向同级 checkout（`--plugin ../cst-provider-qoder`）：`codest plugin install <路径>` 干净退出、写入 `plugins.toml`、生成 wrapper crate 并构建出 wrapper 二进制；manifest 以 path 依赖该插件，生成的代码链接它的 `PLUGIN` 静态量；构建出的二进制在 `/status` 里报出插件 id、在 `/help` 里列出其指令；`codest plugin uninstall` 重新生成不含插件的 wrapper 并重新构建。最后对 codest checkout 做一次 `git status --porcelain` 比对，证明安装没有动过仓库（`--skip-git-check` 可关闭）。 |
@@ -66,7 +68,7 @@ python3 scripts/plugin_smoke.py --skip-git-check
 
 - `POST /chat/completions` —— 收 OpenAI 形状的请求，回 SSE 流（`data:` 帧，最后是 `data: [DONE]`），末尾带一个 usage 分片。推理增量先于可见回复发出，模拟 `reasoning_content` 先到的推理型后端；
 - `GET /models` —— OpenAI 形状的模型目录，让 `fetch_models` 发现有东西可发现；
-- 关键词触发 —— `@bash`、`@read`、`@write`、`@edit` 映射到对应内置工具、参数取关键词之后的文本（`@bash ls -la` → `bash` 收 `{"command": "ls -la"}`）；`@write <路径> <内容>` 与 `@edit <路径> | <旧> | <新>` 遵循固定形状；`@tool` 调用 `--tool` / `--tool-arguments` 指定的那个；
+- 关键词触发 —— `@bash`（Windows 上为 `@pwsh`，跟随宿主的 shell 工具）、`@read`、`@write`、`@edit` 映射到对应内置工具、参数取关键词之后的文本（`@bash ls -la` → `bash` 收 `{"command": "ls -la"}`）；`@write <路径> <内容>` 与 `@edit <路径> | <旧> | <新>` 遵循固定形状；`@tool` 调用 `--tool` / `--tool-arguments` 指定的那个；
 - 普通消息 —— 不含关键词的消息得到一条 help 回复，列出这些关键词与端点。
 
 服务在请求之间不保存状态：它靠检查收到的消息来决定怎么回答。已经带了一轮工具调用的回合会得到轮次总结回复而不是再次调用——没有这道闸，关键词会一直留在用户消息里，循环永远不会结束。正是这一条规则让冒烟测试能在无外网、无真实模型的情况下跑完整个 agent 链路：请求、工具调用、工具结果、后续回合。

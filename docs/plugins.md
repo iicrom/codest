@@ -4,7 +4,7 @@ English | [简体中文](zh/plugins.md)
 
 A codest plugin is an ordinary Rust value linked into the binary that extends
 the agent without touching the core or the terminal: `/help`, `/clear`,
-`/quit`, `/status`, `/continue`, and the `bash`/`fs` tool sets are all plugins
+`/quit`, `/status`, `/continue`, and the shell (`bash`/`pwsh`) and `fs` tool sets are all plugins
 — there is no privileged command layer. This guide covers the contract; see
 [local-plugins.md](local-plugins.md) for installing third-party plugins.
 
@@ -18,7 +18,7 @@ One plugin can contribute any subset of the following, all through the
 | Slash commands | `commands()` + `run_command()` | `/help`, `/clear`, `/status` |
 | System-prompt fragment | `system_prompt()` | Domain instructions, tool conventions |
 | Lifecycle hooks | `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` | Notices, reports, requested actions |
-| Tools | `tools()` + `run_tool()` | Model-invoked capabilities (`bash`, `read`, …) |
+| Tools | `tools()` + `run_tool()` | Model-invoked capabilities (`bash`/`pwsh`, `read`, …) |
 | Protocol factories | `protocols()` | A new wire protocol for `providers.toml` instances |
 | Sign-in entries | `auth_providers()` / `auth_status()` / `begin_sign_in()` | Browser/PAT sign-in behind `/provider` |
 | Event stream | `subscriptions()` + `on_event()` | Meters, monitors, reactions to the agent's run |
@@ -109,7 +109,7 @@ The registry is [`src/plugins/builtin/mod.rs`](../src/plugins/builtin/mod.rs):
 ```rust
 pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &help::HELP, &clear::CLEAR, &quit::QUIT, &status::STATUS,
-    &r#continue::CONTINUE, &tps::TPS, &tools::BASH, &tools::FS,
+    &r#continue::CONTINUE, &tps::TPS, &tools::SHELL, &tools::FS,
 ];
 ```
 
@@ -125,19 +125,40 @@ prompt section lands after the command plugins' contributions.
 | `status` | `/status` | Backend, mode, transcript size, context usage, token totals, plugin list |
 | `continue` | `/continue` | Requests `ContinueTurn` — resume an interrupted turn |
 | `tps` | `/tps` | Live tokens-per-second meter for the footer (off by default) |
-| `bash` | `bash` tool + prompt section | Runs one shell command |
+| `shell` (`bash` / `pwsh`) | the same-named tool + prompt section | Runs one shell command |
 | `fs` | `read`, `write`, `edit` tools | File operations |
 
 Two tool plugins rather than one, so profile tool filters and the `/tools`
 switch act per plugin; the per-`ToolSpec` `read_only` flag does the rest.
 
-**`bash`** ([tools/bash.rs](../src/plugins/builtin/tools/bash.rs)) spawns
-`$SHELL -c <command>` (falling back to `/bin/sh`) in the working directory —
-a one-shot command, not a persistent shell. The `timeout` argument defaults
-to 300s and is capped at 600s; expiry kills the whole process group (the
-child was given its own group at spawn), so backgrounded children do not
-outlive the call. Both pipes are drained on threads to prevent deadlock,
-capped at 1 MiB per stream, tail-truncated before reaching the model.
+**`shell`** ([tools/shell.rs](../src/plugins/builtin/tools/shell.rs)) is the
+engine; the platform module supplies only the command line and the wording.
+[`tools/bash.rs`](../src/plugins/builtin/tools/bash.rs) (unix) and
+[`tools/pwsh.rs`](../src/plugins/builtin/tools/pwsh.rs) (Windows) are thin
+shims, and [`tools/mod.rs`](../src/plugins/builtin/tools/mod.rs) picks one
+through a `#[cfg]` alias — so the tool name, the plugin id, the schema, the
+prompt section, and the runner all follow the host. On unix it spawns
+`$SHELL -c <command>` (falling back to `/bin/sh`); on Windows it spawns
+`pwsh -NoLogo -NoProfile -NonInteractive -Command`. Either way it is a
+one-shot command, not a persistent shell, run in the working directory.
+
+The engine owns the shared behavior: the `timeout` argument defaults to 300s
+and is capped at 600s; expiry kills the whole process tree (unix signals the
+child's own process group; Windows runs `taskkill /F /T`), so backgrounded
+children do not outlive the call. Both pipes are drained on threads to
+prevent deadlock, capped at 1 MiB per stream, tail-truncated before reaching
+the model.
+
+The argument shape is identical on both hosts, so a call written for one
+works on the other; only the name changes. A replayed `tools_switched` that
+names the other platform's tool is dropped by the existing validation.
+
+Windows specifics: the command is wrapped in a script that pins
+`[Console]::OutputEncoding` to UTF-8 and normalizes the exit code
+(`$LASTEXITCODE` for a native command, else `$?` for a failing cmdlet, else
+`1` for a caught exception — a bare `pwsh -Command` reports a cmdlet failure
+as `0`). A missing `pwsh` fails with the install hint rather than falling
+back to `powershell.exe`.
 
 **`fs`** ([tools/fs.rs](../src/plugins/builtin/tools/fs.rs)) implements
 `read` (line-numbered window, `offset`/`limit` continuation, binary files

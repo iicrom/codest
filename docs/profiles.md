@@ -56,6 +56,8 @@ default = "glm/glm-5.3"        # startup selection; beats config.toml's default,
 effort = "high"                # behaves exactly like /effort high at startup
 tools = ["bash", "fs"]         # only these plugins' tools are sent to the model;
                                # the others keep commands, hooks, and prompt fragments
+                               # (`pwsh`, not `bash`, is the shell plugin's id on
+                               # Windows — see plugins.md §3)
 
   [profiles.code.prompt]
   append = "你是资深 Rust 工程师…"   # appended after the base prompt and plugin fragments

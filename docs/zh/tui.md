@@ -87,7 +87,7 @@ CST_TUI_MODE=inline codest
 每次工具调用渲染为一张卡片：
 
 ```text
-● bash(cargo build) · 4.2s
+● bash(cargo build) · 4.2s   # Windows 宿主上是 `pwsh(...)`
  ⎿  Compiling codest
     … +3 lines (ctrl+o to expand)
 ```
@@ -117,7 +117,7 @@ CST_TUI_MODE=inline codest
 
 - [commands.md](../commands.md) —— 全部 slash 指令与按键，含 `Ctrl+T` 与 `Ctrl+O`。
 - [configuration.md](../configuration.md) —— `wire.thinking_fields`、provider 实例以及其余文件参考。
-- [tools.md](../tools.md) —— 这些卡片所渲染的 `bash` 与 `fs` 工具。
+- [tools.md](../tools.md) —— 这些卡片所渲染的 shell（`bash`/`pwsh`）与 `fs` 工具。
 - [../src/tui/app.rs](../../src/tui/app.rs) —— 事件循环与两条渲染路径。
 - [../src/tui/chat.rs](../../src/tui/chat.rs) —— transcript 单元格，含两类卡片。
 

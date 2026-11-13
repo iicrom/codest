@@ -122,7 +122,7 @@ codest/
     ├── plugins/
     │   ├── mod.rs             # Plugin trait host / effects / protocol collection
     │   ├── install.rs         # codest plugin install|uninstall|list|build
-    │   └── builtin/           # static registry: help, clear, quit, status, continue, tools/{bash,fs,truncate}
+    │   └── builtin/           # static registry: help, clear, quit, status, continue, tools/{shell,bash,pwsh,fs,truncate}
     └── tui/
         ├── app.rs             # event loop / fullscreen & inline rendering / menus
         ├── session.rs         # per-session view state

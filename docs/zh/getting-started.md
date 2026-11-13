@@ -7,7 +7,7 @@
 ## 环境要求
 
 - Rust **1.88+**（edition 2024）——仅构建需要；二进制之外没有运行时依赖。
-- 任意终端。除 `bash` 工具用到的 Unix 进程组处理外没有平台相关代码。
+- 任意终端。平台相关代码只限于 shell 工具：unix 用进程组做超时终止，Windows 用 `taskkill /F /T`，并需要把 [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows)（`pwsh`）放进 `PATH`。
 
 ## 安装
 
@@ -61,7 +61,7 @@ python3 scripts/openai_test_server.py --port 8080
 codest --api-key test --base-url http://127.0.0.1:8080/v1 --model test-model
 ```
 
-测试服务支持 SSE 流式输出、`GET /models`，不校验 key，并会把消息里的关键词（`@bash`、`@read`、`@write`、`@edit`、`@tool`）转成真实工具调用——足以在没有外网的情况下验证整条 agent 链路。
+测试服务支持 SSE 流式输出、`GET /models`，不校验 key，并会把消息里的关键词（`@bash`、`@read`、`@write`、`@edit`、`@tool`）转成真实工具调用——足以在没有外网的情况下验证整条 agent 链路。shell 关键词跟随宿主：Windows 上是 `@pwsh`。
 
 也可以完全不起服务：在 provider 实例上声明 `protocol = "test"`，使用内置的进程内 echo 后端。
 
@@ -104,7 +104,7 @@ install 的具体行为（在仓库外生成 wrapper crate 并构建）见 [loca
 - [configuration.md](configuration.md) —— `config.toml`、`providers.toml`、`profiles.toml`、session 头与全部环境变量。
 - [commands.md](../commands.md) —— 全部 slash 指令及其行为。
 - [sessions.md](../sessions.md) —— rollout 持久化、`--continue` / `--resume`、中断恢复。
-- [tools.md](../tools.md) —— `bash` 与 `fs` 工具、会话级开关、工具轮数。
+- [tools.md](../tools.md) —— shell（`bash`/`pwsh`）与 `fs` 工具、会话级开关、工具轮数。
 - [tui.md](../tui.md) —— 按键、fullscreen 与 inline、Markdown 渲染与 thinking 卡片。
 - [architecture.md](../architecture.md) —— `Op`/`Event` 总线、会话 worker、模块地图。
 

@@ -4,7 +4,7 @@
 
 codest 的插件是一个编译进二进制的普通 Rust 值，它扩展 agent 的能力，但不碰
 core、不碰终端：`/help`、`/clear`、`/quit`、`/status`、`/continue` 以及
-`bash`/`fs` 工具集全部是插件——不存在特权命令层。本文覆盖插件契约；第三方
+`bash`/`pwsh` 与 `fs` 工具集全部是插件——不存在特权命令层。本文覆盖插件契约；第三方
 插件的安装见 [local-plugins.md](../local-plugins.md)。
 
 ## 1. 总览
@@ -17,7 +17,7 @@ core、不碰终端：`/help`、`/clear`、`/quit`、`/status`、`/continue` 以
 | 斜杠命令 | `commands()` + `run_command()` | `/help`、`/clear`、`/status` |
 | 系统提示词片段 | `system_prompt()` | 领域指令、工具使用约定 |
 | 生命周期钩子 | `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` | 通知、报告、请求宿主动作 |
-| 工具 | `tools()` + `run_tool()` | 模型可调用的能力（`bash`、`read`…） |
+| 工具 | `tools()` + `run_tool()` | 模型可调用的能力（`bash`/`pwsh`、`read`…） |
 | 协议工厂 | `protocols()` | 给 `providers.toml` 实例接新线协议 |
 | 登录入口 | `auth_providers()` / `auth_status()` / `begin_sign_in()` | `/provider` 后面的浏览器/PAT 登录 |
 | 事件流 | `subscriptions()` + `on_event()` | 计量器、监控端、对 agent 运行的响应 |
@@ -102,7 +102,7 @@ transcript 显示一行失败（工具）；注册表层面的问题是启动错
 ```rust
 pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &help::HELP, &clear::CLEAR, &quit::QUIT, &status::STATUS,
-    &r#continue::CONTINUE, &tps::TPS, &tools::BASH, &tools::FS,
+    &r#continue::CONTINUE, &tps::TPS, &tools::SHELL, &tools::FS,
 ];
 ```
 
@@ -117,17 +117,33 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
 | `status` | `/status` | backend、模式、transcript 大小、上下文用量、token 合计、插件列表 |
 | `continue` | `/continue` | 请求 `ContinueTurn`——恢复被打断的回合 |
 | `tps` | `/tps` | 页脚的实时 tokens-per-second 计量（默认关闭） |
-| `bash` | `bash` 工具 + 提示词段落 | 执行一条 shell 命令 |
+| `shell`（`bash` / `pwsh`） | 同名工具 + 提示词段落 | 执行一条 shell 命令 |
 | `fs` | `read`、`write`、`edit` 工具 | 文件操作 |
 
 拆成两个工具插件而不是一个，是为了让 profile 的工具过滤和 `/tools` 开关按
 插件生效；更细的粒度由每个 `ToolSpec` 的 `read_only` 标记承担。
 
-**`bash`**（[tools/bash.rs](../../src/plugins/builtin/tools/bash.rs)）在工作
-目录里 spawn `$SHELL -c <command>`（回退 `/bin/sh`）——一次性命令，不是持久
-shell。`timeout` 参数默认 300s、上限 600s；超时杀掉整个进程组（子进程在
-spawn 时被放进独立进程组），所以后台子进程不会比调用本身活得更久。两条管道
-由线程排空以防死锁，每条流最多收集 1 MiB，回传给模型前做尾部截断。
+**`shell`**（[tools/shell.rs](../../src/plugins/builtin/tools/shell.rs)）是引擎；
+平台模块只提供命令行与措辞。[`tools/bash.rs`](../../src/plugins/builtin/tools/bash.rs)
+（unix）与 [`tools/pwsh.rs`](../../src/plugins/builtin/tools/pwsh.rs)（Windows）
+是薄壳，而 [`tools/mod.rs`](../../src/plugins/builtin/tools/mod.rs) 通过一个
+`#[cfg]` 别名选定其一——于是工具名、插件 id、schema、提示词段落与执行器全部
+跟随宿主。unix 上 spawn `$SHELL -c <command>`（回退 `/bin/sh`），Windows 上
+spawn `pwsh -NoLogo -NoProfile -NonInteractive -Command`。两边都是一次性命令，
+不是持久 shell，工作目录为工作区。
+
+引擎承担所有共享行为：`timeout` 参数默认 300s、上限 600s；超时杀掉整棵进程树
+（unix 向子进程自己的进程组发信号；Windows 执行 `taskkill /F /T`），所以后台
+子进程不会比调用本身活得更久。两条管道由线程排空以防死锁，每条流最多收集
+1 MiB，回传给模型前做尾部截断。
+
+两个宿主的参数形状完全一致，在一端写好的调用在另一端照样能用，只有名字不同。
+回放的 `tools_switched` 若指名另一平台的工具，会被现有校验丢弃。
+
+Windows 的差异：命令被包进一段脚本，开头把 `[Console]::OutputEncoding` 钉成
+UTF-8，并归一退出码（原生命令取 `$LASTEXITCODE`，失败的 cmdlet 取 `$?`，异常
+被捕获后按 1 退出——裸 `pwsh -Command` 会把 cmdlet 失败报成 `0`）。`pwsh` 缺失
+时返回安装提示，而不回退到 `powershell.exe`。
 
 **`fs`**（[tools/fs.rs](../../src/plugins/builtin/tools/fs.rs)）实现
 `read`（带行号的窗口，`offset`/`limit` 续读，拒绝二进制文件，隐藏 BOM）、

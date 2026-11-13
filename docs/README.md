@@ -17,7 +17,7 @@ All user-facing guides are maintained bilingually: English in `docs/`, Chinese m
 | Document | Contents | 中文 |
 | --- | --- | --- |
 | [sessions.md](sessions.md) | Multi-session workflow, rollout persistence, resume flags, `/continue`, the `session-id` header. | [zh](zh/sessions.md) |
-| [tools.md](tools.md) | The tool-call loop, built-in `bash`/`fs` tools, `/tools` toggles, tool cards, offline testing. | [zh](zh/tools.md) |
+| [tools.md](tools.md) | The tool-call loop, built-in shell (`bash`/`pwsh`) and `fs` tools, `/tools` toggles, tool cards, offline testing. | [zh](zh/tools.md) |
 | [tui.md](tui.md) | Fullscreen vs inline, Markdown rendering subset, streaming commit rule, code highlighting, thinking cards. | [zh](zh/tui.md) |
 
 ## Extending

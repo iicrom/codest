@@ -12,7 +12,9 @@ cargo run -- --help         # default-run is `codest`
 cargo install --path .      # installs both commands into ~/.cargo/bin
 ```
 
-There is no feature matrix to pick from and no build script: the crate compiles from the dependencies declared in `Cargo.toml`. The only platform-conditional dependency is `libc` on Unix, used for the `bash` tool's process-group kill. Everything the smoke scripts need is the debug binary plus `python3` (standard library only).
+There is no feature matrix to pick from and no build script: the crate compiles from the dependencies declared in `Cargo.toml`. The only platform-conditional dependency is `libc` on Unix, used for the shell tool's process-group kill; the Windows path needs no extra crate (`taskkill` is an OS binary). Everything the smoke scripts need is the debug binary plus `python3` (standard library only).
+
+All three `scripts/*_smoke.py` need a unix pseudo-terminal (`pty` / `fcntl`), so they run on unix hosts only. On Windows, `cargo test` is the check: the tool unit tests spawn a real `pwsh` and assert the exit code, the merged stderr, the timeout kill, and UTF-8 output.
 
 ## Testing
 
@@ -21,7 +23,7 @@ cargo test                                      # unit tests (offline, in-proces
 
 python3 scripts/openai_test_server.py --port 8080   # local OpenAI-compatible server
 python3 scripts/pty_smoke.py                    # end-to-end smoke in a pty (both TUI modes)
-python3 scripts/tool_smoke.py                   # real bash/read execution + /tools toggles
+python3 scripts/tool_smoke.py                   # real shell/read execution + /tools toggles
 python3 scripts/markdown_smoke.py               # visual markdown check (both TUI modes)
 python3 scripts/session_header_smoke.py         # asserts the session-id header hits the wire
 python3 scripts/plugin_smoke.py                 # external plugin install/build round-trip
@@ -31,7 +33,7 @@ python3 scripts/plugin_smoke.py                 # external plugin install/build 
 | --- | --- |
 | `cargo test` | Unit tests across core and TUI modules. The model is `EchoModelClient`, an in-process deterministic echo that streams word-sized deltas, so nothing leaves the process. Session tests drive a real worker over the bus and assert the event sequence, cancellation, tool rounds, and rollout contents. |
 | `pty_smoke.py` | Spawns the binary in a pseudo-terminal, types a message, and renders the captured ANSI output to a plain text grid. Both TUI modes run by default: `fullscreen` must emit `\x1b[?1049h` (alternate screen) and `\x1b[?1000h` (mouse capture), `inline` must emit neither; the wheel must scroll, the message must appear in the transcript, the mode notice and idle footer must appear, the process must exit cleanly. A config variant additionally checks model discovery, the picker switch, and the footer's context window (declared and discovered); both variants rerun with `--continue` to check the restored session and its recorded usage. |
-| `tool_smoke.py` | Two cases, `bash` and `read`, against the local server: a real tool round must show the command's output (`hello-from-tool`, `exit code: 0`) or the file's content (`alpha`, `gamma`, `3 lines total`); then `/tools <name> off` followed by `/context` must report the narrowed set as `Tools (3/4 enabled)` and still list the tool as `disabled`. |
+| `tool_smoke.py` | Two cases, the shell tool and `read`, against the local server: a real tool round must show the command's output (`hello-from-tool`, `exit code: 0`) or the file's content (`alpha`, `gamma`, `3 lines total`); then `/tools <name> off` followed by `/context` must report the narrowed set as `Tools (3/4 enabled)` and still list the tool as `disabled`. |
 | `markdown_smoke.py` | A visual check in both modes, from a scripted server reply: heading text, bold/italic/inline code, bullet and nested-bullet markers, an ordered marker, the `▎` quote bar, a rule, two code fences with `│ rust` / `│ python` labels and body, a table header and divider, a task checkbox — plus the absence of raw `**bold**` markers. Inline mode is checked for the heading, a code label, and the absence of raw markers. |
 | `session_header_smoke.py` | Three cases against a server that dumps request headers: the default instance sends a `session-id` header whose value matches a UUIDv7; `wire.session_header = "none"` sends none; a model-level opt-out sends none. It also fails if the client sent no request at all. |
 | `plugin_smoke.py` | External plugin round-trip, defaulting to a sibling checkout (`--plugin ../cst-provider-qoder`): `codest plugin install <path>` exits cleanly, writes `plugins.toml`, generates the wrapper crate, and builds a wrapper binary; the manifest depends on the plugin by path and the generated code links its `PLUGIN` static; the built binary reports the plugin id in `/status` and its command in `/help`; `codest plugin uninstall` regenerates a plugin-free wrapper and rebuilds. A `git status --porcelain` check on the codest checkout proves the install left the repository untouched (`--skip-git-check` opts out). |
@@ -66,7 +68,7 @@ Each prints one `PASS`/`FAIL` line per assertion and returns a non-zero exit cod
 
 - `POST /chat/completions` — an OpenAI-shaped request in, an SSE stream out (`data:` frames, then `data: [DONE]`), including a final chunk carrying usage. Reasoning deltas precede the visible reply, mirroring reasoning-tuned backends whose `reasoning_content` arrives first;
 - `GET /models` — an OpenAI-shaped model catalog, so `fetch_models` discovery has something to find;
-- keyword triggers — `@bash`, `@read`, `@write`, `@edit` map to that built-in tool with the text after the keyword (`@bash ls -la` → `bash` with `{"command": "ls -la"}`); `@write <path> <content>` and `@edit <path> | <old> | <new>` follow a fixed shape; `@tool` calls whatever `--tool` / `--tool-arguments` name;
+- keyword triggers — `@bash` (`@pwsh` on Windows, following the host's shell tool), `@read`, `@write`, `@edit` map to that built-in tool with the text after the keyword (`@bash ls -la` → `bash` with `{"command": "ls -la"}`); `@write <path> <content>` and `@edit <path> | <old> | <new>` follow a fixed shape; `@tool` calls whatever `--tool` / `--tool-arguments` name;
 - plain messages — any message without a keyword gets a help reply that lists these keywords and the endpoints.
 
 The server holds no state between requests: it decides what to answer by inspecting the messages it was sent. A turn that already carries a tool round gets the round-summary reply instead of another call — without that guard the keyword would stay in the user message and the loop would never terminate. That single rule is what lets a smoke test drive the complete agent loop — request, tool call, tool result, follow-up round — with no network and no real model.

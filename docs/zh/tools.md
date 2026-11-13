@@ -2,7 +2,7 @@
 
 [English](../tools.md) | 简体中文
 
-codest 实现了完整的 OpenAI 工具链路。具体工具并不内建于 core：每个工具由插件声明，内置的 `bash` 与 `fs` 工具集本身也是普通插件（见 [plugins.md](../plugins.md) 第 3 节）。
+codest 实现了完整的 OpenAI 工具链路。具体工具并不内建于 core：每个工具由插件声明，内置的 shell（`bash`/`pwsh`）与 `fs` 工具集本身也是普通插件（见 [plugins.md](../plugins.md) 第 3 节）。
 
 ## 工具链路
 
@@ -26,19 +26,27 @@ codest 实现了完整的 OpenAI 工具链路。具体工具并不内建于 core
 
 ## 内置工具
 
-### `bash`
+### `bash` / `pwsh`
 
-- 通过 `$SHELL -c` 执行单条 shell 命令（`$SHELL` 未设置时回退到 `/bin/sh`），工作目录为工作区。
+shell 工具是**宿主的那个**，在编译期选定：unix 上是 `bash`，Windows 上是 `pwsh`。工具名与插件 id 都跟随平台，所以 Windows 上 `/tools`、`profile.tools` 与卡片表头说的都是 `pwsh`；参数形状完全一致（`command` / `timeout`），在一端写好的调用在另一端照样能用。
+
+- 一次一条 shell 命令——unix 为 `$SHELL -c`（`$SHELL` 未设置时回退到 `/bin/sh`），Windows 为 `pwsh -NoLogo -NoProfile -NonInteractive -Command`——工作目录为工作区。
 - `timeout` 参数单位为秒，默认 **300**，上限 **600**——超限值被夹紧，而不是拒绝。
-- 超时杀死整个**进程组**（`process_group(0)`），后台子进程无法活过超时或继续占住管道。
+- 超时杀掉整个**进程树**：unix 向子进程的进程组发信号（`process_group(0)`），Windows 执行 `taskkill /F /T`（失败再回退到直接 kill）。后台子进程无法活过超时或继续占住管道。
 - 输出合并 stdout 与 stderr（先 stdout，后 stderr），并以退出码脚注结尾（`[exit code: N]`、`[terminated by signal]` 或超时通知）。
 - 按尾截断到最后 **2000 行 / 50 KB**，并附一条可操作的通知；超长单行截到 2000 字符，收集期间每条管道上限 1 MiB，失控命令不会耗尽内存。
+
+Windows 上值得知道的差异：
+
+- 命令被包进一段脚本，开头把 `[Console]::OutputEncoding` 钉成 UTF-8，原生命令的输出不会被控制台旧代码页弄成乱码。
+- 退出码被归一：原生命令取 `$LASTEXITCODE`，失败的 cmdlet 取 `$?`（→ 1），异常被捕获后按 1 退出。裸 `pwsh -Command` 会把 cmdlet 失败报成 `0`，那会被读成成功。
+- `pwsh` 是 PowerShell 7，Windows 并不自带。缺失时工具返回带安装提示的错误——不静默回退到 `powershell.exe`，那会让同一个工具在不同机器上行为不一致。
 
 ### `fs`
 
 | 工具 | 行为 |
 | --- | --- |
-| `read` | 对文本文件做带行号的窗口读取，支持 `offset`（从 1 开始）与 `limit` 续读；拒绝二进制文件并指向 `bash`。标记为 `read_only`。 |
+| `read` | 对文本文件做带行号的窗口读取，支持 `offset`（从 1 开始）与 `limit` 续读；拒绝二进制文件并指向宿主的 shell 工具（`bash`/`pwsh`）。标记为 `read_only`。 |
 | `write` | 以完整内容创建或覆盖文件，按需创建父目录。 |
 | `edit` | 通过 `old_string`/`new_string` 做精确字符串替换；要求唯一匹配，或使用 `replace_all`。保留 BOM 与 CRLF，未被改动的行保持原字节。 |
 
@@ -61,14 +69,14 @@ codest 实现了完整的 OpenAI 工具链路。具体工具并不内建于 core
 - 启用集是**按会话**的，并记录在 rollout 中，因此恢复的会话沿用上次运行的工具集。
 - **profile 与 `/tools` 是两个不同的切面。** profile 的 `tools` 过滤以**插件 id** 为粒度、在**装配期**（仅启动时）生效，决定哪些插件的工具被声明；`/tools` 再在**会话期**按**单个工具**微调。见 [profiles.md](../profiles.md)。
 
-两层是叠加的：profile 写 `tools = ["fs"]` 会把全部 `bash` 工具从该会话的世界里移除，随后 `/tools write off` 又把 `write` 对模型隐藏。被 profile 过滤掉的工具无法在当前会话恢复——那需要去掉 profile 重启。
+两层是叠加的：profile 写 `tools = ["fs"]` 会把 shell 工具（`bash`/`pwsh`）从该会话的世界里移除，随后 `/tools write off` 又把 `write` 对模型隐藏。被 profile 过滤掉的工具无法在当前会话恢复——那需要去掉 profile 重启。
 
 ## 工具卡片
 
 每次调用在 transcript 中渲染为一张工具卡片：
 
 ```text
-● bash(cargo build) · 4.2s
+● bash(cargo build) · 4.2s   # Windows 宿主上是 `pwsh(...)`
  ⎿  Compiling codest v0.1.0
     Finished `dev` profile [unoptimized + debuginfo] target(s)
     [exit code: 0]
@@ -86,7 +94,7 @@ codest 实现了完整的 OpenAI 工具链路。具体工具并不内建于 core
 
 | 关键词 | 调用 |
 | --- | --- |
-| `@bash <command>` | `bash`，参数 `{"command": "<command>"}` |
+| `@bash <command>`（Windows 上为 `@pwsh`） | 宿主的 shell 工具，参数 `{"command": "<command>"}` |
 | `@read <path>` | `read`，参数 `{"path": "<path>"}` |
 | `@write <path> <content>` | `write` |
 | `@edit <path> \| <old> \| <new>` | `edit` |
@@ -102,7 +110,7 @@ python3 scripts/openai_test_server.py --port 8080
 codest --api-key test --base-url http://127.0.0.1:8080/v1 --model test-model
 ```
 
-`scripts/tool_smoke.py` 端到端驱动同一条链路：真实的 `bash`/`read` 执行加 `/tools` 开关。
+`scripts/tool_smoke.py` 端到端驱动同一条链路：真实的 shell/`read` 执行加 `/tools` 开关。它需要 unix 伪终端（`pty`），因此 Windows 上工具路径改由 `cargo test` 覆盖——那里的单元测试会真实拉起 `pwsh`，断言退出码、stderr 合并、超时杀进程树与 UTF-8 输出。
 
 ## 设计说明
 

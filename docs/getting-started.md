@@ -7,7 +7,7 @@ Install codest, point it at an endpoint, and run a first session. The rest of th
 ## Requirements
 
 - Rust **1.88+** (edition 2024) — only needed to build; there are no runtime dependencies outside the binary.
-- Any terminal. No platform-specific code beyond Unix process-group handling for the `bash` tool.
+- Any terminal. Platform-specific code is confined to the shell tool: unix uses the process group for the timeout kill, Windows uses `taskkill /F /T` and needs [PowerShell 7](https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows) (`pwsh`) on `PATH`.
 
 ## Installation
 
@@ -61,7 +61,7 @@ python3 scripts/openai_test_server.py --port 8080
 codest --api-key test --base-url http://127.0.0.1:8080/v1 --model test-model
 ```
 
-The test server streams SSE, serves `GET /models`, never validates keys, and turns message keywords (`@bash`, `@read`, `@write`, `@edit`, `@tool`) into real tool calls — enough to exercise the whole agent loop without a network.
+The test server streams SSE, serves `GET /models`, never validates keys, and turns message keywords (`@bash`, `@read`, `@write`, `@edit`, `@tool`) into real tool calls — enough to exercise the whole agent loop without a network. The shell keyword follows the host: `@pwsh` on Windows.
 
 You can also skip the server entirely: declare `protocol = "test"` on a provider instance to use the built-in in-process echo backend.
 
@@ -104,7 +104,7 @@ See [local-plugins.md](local-plugins.md) for what install actually does (it buil
 - [configuration.md](configuration.md) — `config.toml`, `providers.toml`, `profiles.toml`, session header, environment variables.
 - [commands.md](commands.md) — every slash command and its behavior.
 - [sessions.md](sessions.md) — rollout persistence, `--continue` / `--resume`, recovery.
-- [tools.md](tools.md) — the `bash` and `fs` tools, per-session toggles, tool rounds.
+- [tools.md](tools.md) — the shell (`bash`/`pwsh`) and `fs` tools, per-session toggles, tool rounds.
 - [tui.md](tui.md) — keybindings, fullscreen vs inline, markdown and thinking cards.
 - [architecture.md](architecture.md) — the `Op`/`Event` bus, the session worker, the module map.
 

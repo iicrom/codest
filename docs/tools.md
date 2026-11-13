@@ -2,7 +2,7 @@
 
 English | [简体中文](zh/tools.md)
 
-codest implements the complete OpenAI tool-call loop. The concrete tools are not built into the core: each one is declared by a plugin, and the built-in `bash` and `fs` sets are ordinary plugins (§3 in [plugins.md](plugins.md)).
+codest implements the complete OpenAI tool-call loop. The concrete tools are not built into the core: each one is declared by a plugin, and the built-in shell (`bash`/`pwsh`) and `fs` sets are ordinary plugins (§3 in [plugins.md](plugins.md)).
 
 ## The loop
 
@@ -26,19 +26,27 @@ On the wire, a declared tool is a standard chat-completions `tools` entry, and i
 
 ## Built-in tools
 
-### `bash`
+### `bash` / `pwsh`
 
-- One shell command via `$SHELL -c` (falling back to `/bin/sh`), run in the workspace directory.
+The shell tool is the **host's own**, selected at compile time: `bash` on unix, `pwsh` on Windows. The tool name and the plugin id follow the platform, so `/tools`, `profile.tools`, and the card header all say `pwsh` on Windows; the arguments are identical (`command`, `timeout`), so a call written on one host works on the other.
+
+- One shell command — `$SHELL -c` (falling back to `/bin/sh`) on unix, `pwsh -NoLogo -NoProfile -NonInteractive -Command` on Windows — run in the workspace directory.
 - `timeout` parameter in seconds, default **300**, capped at **600** — an over-limit value is clamped, not rejected.
-- On expiry the whole **process group** is killed (`process_group(0)`), so background children cannot outlive the timeout or hold the pipes open.
+- On expiry the whole **process tree** is killed: unix signals the child's process group (`process_group(0)`), Windows runs `taskkill /F /T` (falling back to a plain kill). Background children cannot outlive the timeout or hold the pipes open.
 - Output merges stdout and stderr (stdout first, then stderr) and ends with an exit-code footer (`[exit code: N]`, `[terminated by signal]`, or the timeout notice).
 - Tail-truncated to the last **2000 lines / 50 KB** with an actionable notice; single lines are clipped at 2000 characters, and each pipe is capped at 1 MiB while collecting so a runaway command cannot exhaust memory.
+
+Windows differences worth knowing:
+
+- The command is wrapped in a script that pins `[Console]::OutputEncoding` to UTF-8, so native output is not mangled by the console's legacy code page.
+- The exit code is normalized: `$LASTEXITCODE` for a native command, else `$?` for a failing cmdlet (`1`), else `1` for a caught exception. A bare `pwsh -Command` reports a cmdlet failure as `0`, which would read as success.
+- `pwsh` is PowerShell 7 and does not ship with Windows. A missing `pwsh` returns an error with the install hint — there is no silent fallback to `powershell.exe`, which would make the same tool behave differently per machine.
 
 ### `fs`
 
 | Tool | Behavior |
 | --- | --- |
-| `read` | Line-numbered window over a text file, with `offset` (1-based) and `limit` continuation; refuses binary files and points at `bash` instead. Marked `read_only`. |
+| `read` | Line-numbered window over a text file, with `offset` (1-based) and `limit` continuation; refuses binary files and points at the host's shell tool (`bash`/`pwsh`) instead. Marked `read_only`. |
 | `write` | Create or overwrite a file with complete content, creating parent directories as needed. |
 | `edit` | Exact-string replacement via `old_string`/`new_string`; requires a unique match or `replace_all`. BOM and CRLF are preserved, so untouched lines keep their bytes. |
 
@@ -61,14 +69,14 @@ All paths resolve against the working directory when relative.
 - The enabled set is **per session** and is recorded in the rollout, so a resumed session continues with the tools it last ran with.
 - **Profile vs `/tools` are two different seams.** A profile's `tools` filter works by **plugin id at assembly time** (startup only), deciding which plugins' tools are declared at all; `/tools` then fine-tunes individual tools **per tool at session time**. See [profiles.md](profiles.md).
 
-The two layers compose: profile `tools = ["fs"]` removes every `bash` tool from the session's world, and `/tools write off` then hides `write` from the model as well. Nothing restores a tool the profile filtered out — that would need a restart without the profile.
+The two layers compose: profile `tools = ["fs"]` removes the shell tool (`bash`/`pwsh`) from the session's world, and `/tools write off` then hides `write` from the model as well. Nothing restores a tool the profile filtered out — that would need a restart without the profile.
 
 ## Tool cards
 
 Every call renders as a tool card in the transcript:
 
 ```text
-● bash(cargo build) · 4.2s
+● bash(cargo build) · 4.2s   # `pwsh(...)` on a Windows host
  ⎿  Compiling codest v0.1.0
     Finished `dev` profile [unoptimized + debuginfo] target(s)
     [exit code: 0]
@@ -86,7 +94,7 @@ Every call renders as a tool card in the transcript:
 
 | Keyword | Call |
 | --- | --- |
-| `@bash <command>` | `bash` with `{"command": "<command>"}` |
+| `@bash <command>` (`@pwsh` on Windows) | the host's shell tool with `{"command": "<command>"}` |
 | `@read <path>` | `read` with `{"path": "<path>"}` |
 | `@write <path> <content>` | `write` |
 | `@edit <path> \| <old> \| <new>` | `edit` |
@@ -102,7 +110,7 @@ python3 scripts/openai_test_server.py --port 8080
 codest --api-key test --base-url http://127.0.0.1:8080/v1 --model test-model
 ```
 
-`scripts/tool_smoke.py` drives the same loop end to end: real `bash`/`read` execution plus `/tools` toggles.
+`scripts/tool_smoke.py` drives the same loop end to end: real shell/`read` execution plus `/tools` toggles. It needs a unix pseudo-terminal (`pty`), so on Windows the tool paths are covered by `cargo test` instead — those unit tests spawn a real `pwsh` and assert the exit code, the merged stderr, the timeout kill, and UTF-8 output.
 
 ## Design note
 

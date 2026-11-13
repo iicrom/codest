@@ -15,8 +15,9 @@ Pass `--port 0` to bind an ephemeral port; the chosen URL is printed on stdout.
 
 Tool-calling round trip: a keyword in the last user message turns the next
 response into a `tool_calls` delta (fragmented arguments, the shape providers
-stream) instead of text. `@bash`, `@read`, `@write` and `@edit` call that
-built-in tool with the text after the keyword (`@bash ls -la` → `bash` with
+stream) instead of text. `@bash` (`@pwsh` on Windows — the built-in shell tool
+is the host's own), `@read`, `@write` and `@edit` call that built-in tool with
+the text after the keyword (`@bash ls -la` → `bash` with
 `{"command": "ls -la"}`); `@tool` calls whatever `--tool` / `--tool-arguments`
 configured, which by default is the unregistered `ping` — no tool by that name
 is in the binary, so its result is the `error: unknown tool …` text. codest
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -146,6 +148,12 @@ TOOL_NAME = "ping"
 # `--tool-arguments` replaces it for tools with a different schema.
 TOOL_ARGUMENTS = '{"note":"called by the test server"}'
 
+# The built-in shell tool is the host's own (`bash` on unix, `pwsh` on
+# Windows); the keyword and its example follow so the same script works on
+# either host.
+SHELL_TOOL = "pwsh" if os.name == "nt" else "bash"
+SHELL_EXAMPLE = "Get-ChildItem" if os.name == "nt" else "ls -la"
+
 
 def first_word(rest: str) -> tuple[str, str]:
     """Split `rest` into its first whitespace-delimited word and the remainder."""
@@ -153,8 +161,8 @@ def first_word(rest: str) -> tuple[str, str]:
     return head, tail.strip()
 
 
-def bash_arguments(rest: str) -> dict[str, Any]:
-    return {"command": rest or "echo hello from the test server"}
+def shell_arguments(rest: str) -> dict[str, Any]:
+    return {"command": rest or SHELL_EXAMPLE}
 
 
 def read_arguments(rest: str) -> dict[str, Any]:
@@ -212,10 +220,10 @@ TRIGGERS: tuple[Trigger, ...] = (
         ),
     ),
     Trigger(
-        keyword="@bash",
-        tool="bash",
-        summary="run a shell command, e.g. `@bash ls -la`",
-        build=bash_arguments,
+        keyword=f"@{SHELL_TOOL}",
+        tool=SHELL_TOOL,
+        summary=f"run a shell command, e.g. `@{SHELL_TOOL} {SHELL_EXAMPLE}`",
+        build=shell_arguments,
     ),
     Trigger(
         keyword="@read",

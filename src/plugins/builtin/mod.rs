@@ -21,7 +21,10 @@ pub use help::HELP;
 pub use r#continue::CONTINUE;
 pub use quit::QUIT;
 pub use status::STATUS;
-pub use tools::BASH;
+/// The host's shell tool plugin: `bash` on unix, `pwsh` on Windows. The id
+/// and the tool name follow the platform, so `/tools` and `profile.tools`
+/// speak the same word on either host.
+pub use tools::SHELL;
 pub use tools::FS;
 pub use tps::TPS;
 
@@ -37,6 +40,6 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &status::STATUS,
     &r#continue::CONTINUE,
     &tps::TPS,
-    &tools::BASH,
+    &tools::SHELL,
     &tools::FS,
 ];

@@ -15,7 +15,7 @@ cargo install --git https://github.com/iicrom/codest
 codest    # 或：cst
 ```
 
-主要特性：`/model` 多 Provider 切换、命名 profile、带会话级开关的 `bash`/`fs` 工具、UUIDv7 会话恢复、thinking 与工具卡片、带语法高亮的 Markdown 回复，以及 fullscreen / inline 双 TUI 模式。
+主要特性：`/model` 多 Provider 切换、命名 profile、带会话级开关的 `bash`/`pwsh` 与 `fs` 工具、UUIDv7 会话恢复、thinking 与工具卡片、带语法高亮的 Markdown 回复，以及 fullscreen / inline 双 TUI 模式。
 
 ## 文档
 
@@ -32,7 +32,7 @@ codest    # 或：cst
 | 文档 | 内容 | English |
 | --- | --- | --- |
 | [多会话](docs/zh/sessions.md) | 多会话工作流、rollout 持久化、`/continue` 恢复、session 头。 | [EN](docs/sessions.md) |
-| [工具调用](docs/zh/tools.md) | 工具链路、内置 `bash`/`fs` 工具、`/tools` 开关、工具卡片。 | [EN](docs/tools.md) |
+| [工具调用](docs/zh/tools.md) | 工具链路、内置 `bash`/`pwsh` 与 `fs` 工具、`/tools` 开关、工具卡片。 | [EN](docs/tools.md) |
 | [终端界面](docs/zh/tui.md) | fullscreen 与 inline、Markdown 渲染、代码高亮、thinking 卡片。 | [EN](docs/tui.md) |
 
 ### 扩展

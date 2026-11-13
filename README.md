@@ -15,7 +15,7 @@ cargo install --git https://github.com/iicrom/codest
 codest    # or: cst
 ```
 
-Highlights: multi-provider switching with `/model`, named profiles, `bash`/`fs` tools with per-session toggles, resumable sessions with UUIDv7 ids, thinking and tool cards, Markdown replies with syntax highlighting, and two TUI modes (fullscreen / inline).
+Highlights: multi-provider switching with `/model`, named profiles, `bash`/`pwsh` and `fs` tools with per-session toggles, resumable sessions with UUIDv7 ids, thinking and tool cards, Markdown replies with syntax highlighting, and two TUI modes (fullscreen / inline).
 
 ## Documentation
 
@@ -32,7 +32,7 @@ Highlights: multi-provider switching with `/model`, named profiles, `bash`/`fs` 
 | Document | Contents | 中文 |
 | --- | --- | --- |
 | [Sessions](docs/sessions.md) | Multi-session workflow, rollout persistence, `/continue` recovery, session headers. | [中文](docs/zh/sessions.md) |
-| [Tool calling](docs/tools.md) | The tool loop, built-in `bash`/`fs` tools, `/tools` toggles, tool cards. | [中文](docs/zh/tools.md) |
+| [Tool calling](docs/tools.md) | The tool loop, built-in `bash`/`pwsh` and `fs` tools, `/tools` toggles, tool cards. | [中文](docs/zh/tools.md) |
 | [Terminal UI](docs/tui.md) | Fullscreen vs inline, Markdown rendering, code highlighting, thinking cards. | [中文](docs/zh/tui.md) |
 
 ### Extending

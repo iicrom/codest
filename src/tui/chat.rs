@@ -287,8 +287,8 @@ pub fn running_tool_lines(
 
 /// The tool's arguments as a card header shows them.
 struct ToolArgs {
-    /// One-line summary: the command for `bash`, the path for the file tools,
-    /// the raw JSON otherwise.
+    /// One-line summary: the command for the shell tool (`bash` / `pwsh`), the
+    /// path for the file tools, the raw JSON otherwise.
     summary: String,
     /// The full value [`Self::summary`] folded out of (the whole command or
     /// path string) — an expanded card shows it in the body when the header
@@ -347,7 +347,10 @@ fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
 /// tool *is*, not how it ended (the glyph itself reports success/failure).
 fn tool_category_color(name: &str) -> Color {
     match name {
-        "bash" => theme::TOOL_EXEC,
+        // The host's shell tool: `bash` on unix, `pwsh` on Windows. Both
+        // names are listed so a card replayed from a session recorded on the
+        // other platform still colors as a command runner.
+        "bash" | "pwsh" => theme::TOOL_EXEC,
         "read" => theme::TOOL_READ,
         "write" | "edit" => theme::TOOL_MUTATE,
         _ => theme::ACCENT,
