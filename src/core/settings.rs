@@ -100,10 +100,16 @@ impl SettingValue {
                 "false" | "off" | "no" => Ok(Self::Bool(false)),
                 other => Err(format!("`{other}` is not a boolean (true / false)")),
             },
-            SettingKind::Number => trimmed
-                .parse::<i64>()
-                .map(Self::Integer)
-                .map_err(|_| format!("`{trimmed}` is not an integer")),
+            // Non-negative only: the readers a plugin reaches for
+            // (`PluginSettings::option_u64`) return `None` for a negative
+            // TOML integer, so storing one would be a silent no-op at the
+            // next read rather than the value the user typed.
+            SettingKind::Number => match trimmed.parse::<u64>() {
+                Ok(number) => Ok(Self::Integer(
+                    i64::try_from(number).map_err(|_| format!("`{trimmed}` is too large"))?,
+                )),
+                Err(_) => Err(format!("`{trimmed}` is not a non-negative integer")),
+            },
             SettingKind::Select => {
                 if field.options.iter().any(|option| option.value == trimmed) {
                     Ok(Self::Text(trimmed.to_string()))
@@ -347,6 +353,9 @@ mod tests {
             Ok(SettingValue::Integer(250))
         );
         assert!(SettingValue::parse(&FIELDS[1], "2.5").is_err());
+        // A negative value would read back as `None` through `option_u64`, so
+        // it is refused before it can be stored.
+        assert!(SettingValue::parse(&FIELDS[1], "-1").is_err());
         assert_eq!(
             SettingValue::parse(&FIELDS[2], "full"),
             Ok(SettingValue::Text("full".to_string()))

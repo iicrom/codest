@@ -15,9 +15,13 @@
 //! entirely — the default implementation of
 //! [`crate::plugin::Plugin::settings`] returns `None`.
 
-/// The namespace the host's own settings live in. A plugin id may not be
-/// `codest` (ids are validated against the shipped set, which does not use
-/// it), so the two can never collide.
+/// The namespace the host's own settings live in, and a reserved plugin id.
+///
+/// `/settings` always shows a card for the host under this name, so a plugin
+/// taking it would put two cards with one title on screen and make
+/// `/settings codest` ambiguous. [`crate::plugin::PluginHost`] rejects a
+/// plugin that registers it, which is what makes the two namespaces safe to
+/// share one config file.
 pub const HOST_NAMESPACE: &str = "codest";
 
 /// How a field's text value is stored and edited.
@@ -66,8 +70,10 @@ pub struct SettingField {
     pub options: &'static [SettingOption],
     /// The value shown while `config.toml` has no entry for the key.
     pub default: Option<&'static str>,
-    /// The value is read at startup and cannot be applied mid-run; the row
-    /// carries a `restart` badge and the edit still persists.
+    /// The value is read at startup and cannot be applied mid-run. The row
+    /// carries a `⟲` marker, the help bar says `restart to apply`, the edit
+    /// still persists, and the host skips
+    /// [`crate::plugin::Plugin::on_settings_changed`] for it.
     pub restart: bool,
 }
 

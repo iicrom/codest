@@ -18,16 +18,17 @@
 use std::collections::BTreeSet;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::Frame;
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::core::protocol::{Message, Role};
 use crate::core::tokens::{format_context_usage, format_tokens};
 use crate::plugins::{PluginInfo, ReportBlock, ReportEntry, ReportGroup};
 use crate::tui::composer::Composer;
+use crate::tui::screen::{Document, Panel, Screen};
 use crate::tui::theme;
 use crate::tui::wrap::{display_width, wrap_str};
 
@@ -52,11 +53,7 @@ fn clip(text: &str, max_chars: usize) -> String {
 }
 
 fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if count == 1 { "" } else { "s" }
 }
 
 /// The classic `/context` report: tools, the assembled system prompt with
@@ -150,7 +147,10 @@ pub fn build_context_report(info: &PluginInfo<'_>) -> ReportBlock {
     });
 
     // Usage: the measured context size, as in the footer.
-    let context = match info.last_usage.map(|(input, output)| input.saturating_add(output)) {
+    let context = match info
+        .last_usage
+        .map(|(input, output)| input.saturating_add(output))
+    {
         Some(tokens) => {
             let mut line = format_context_usage(tokens, info.context_window);
             if info.context_window.is_none() {
@@ -191,9 +191,14 @@ pub fn build_context_report(info: &PluginInfo<'_>) -> ReportBlock {
 pub enum ContextAction {
     Close,
     /// Delete the named transcript indices (already cascade-expanded).
-    Delete { indices: Vec<usize> },
+    Delete {
+        indices: Vec<usize>,
+    },
     /// Replace the content of the transcript message at `index`.
-    Edit { index: usize, content: String },
+    Edit {
+        index: usize,
+        content: String,
+    },
     /// Undo the most recent mutation.
     Undo,
 }
@@ -210,6 +215,10 @@ pub struct ContextView {
     /// The edit box for the selected entry, when editing.
     editing: Option<Composer>,
     error: Option<String>,
+    /// The list's viewport. Focus-follow gives way to the wheel: a wheel
+    /// notch scrolls without moving the selection, and the next ↑↓ re-anchors
+    /// the window on it.
+    screen: Screen,
 }
 
 impl ContextView {
@@ -248,6 +257,17 @@ impl ContextView {
     /// Whether a rejected op is being shown.
     pub fn has_error(&self) -> bool {
         self.error.is_some()
+    }
+
+    /// Feed a bracketed paste. Only an open edit box takes it — a paste into
+    /// the list would otherwise land in the chat composer underneath this
+    /// modal screen. Returns whether it was consumed.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(composer) = self.editing.as_mut() else {
+            return false;
+        };
+        composer.insert_str(text);
+        true
     }
 
     fn selected_entry(&self) -> Option<&Message> {
@@ -309,9 +329,9 @@ impl ContextView {
             self.confirm_delete = false;
             return match key.code {
                 KeyCode::Char('y') => {
-                    let indices = self.entries().map(|entries| {
-                        expand_delete_indices(entries, self.selected)
-                    });
+                    let indices = self
+                        .entries()
+                        .map(|entries| expand_delete_indices(entries, self.selected));
                     indices
                         .filter(|indices| !indices.is_empty())
                         .map(|indices| ContextAction::Delete { indices })
@@ -370,101 +390,109 @@ impl ContextView {
         }
     }
 
+    /// Move the selection one step, wrapping at both ends: `↑` on the first
+    /// entry lands on the last and `↓` on the last lands on the first.
     fn move_selection(&mut self, delta: isize) {
         let Some(len) = self.entries().map(|entries| entries.len()) else {
             return;
         };
-        let target = self.selected as isize + delta;
-        self.selected = target.clamp(0, len as isize - 1) as usize;
+        if let Some(next) = crate::tui::screen::step_focus(self.selected, len, delta) {
+            self.selected = next;
+        }
     }
 
-    /// Render over the whole frame area: header, entry list, inspector (or
-    /// the edit box), and a hint line.
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    /// Scroll the entry list with the wheel. The selection stays put, so a
+    /// wheel notch browses without changing what `d`/`e` would act on.
+    pub fn wheel(&mut self, lines: isize) {
+        self.screen.scroll_by(lines);
+    }
+
+    /// Render over the whole frame area, through the shared full-frame chrome:
+    /// a header with the entry count, the scrolling entry list, the inspector
+    /// (or the edit box) as a fixed panel, and the help bar.
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let width = area.width as usize;
+        let document = self.doc(width);
+        let count = self.entries().map(|entries| entries.len());
 
-        let inspector_height = match area.height {
-            0..=3 => 0,
-            height => ((height - 2) * 2 / 5).clamp(3, 12).min(height - 3),
-        };
-        let chunks = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(inspector_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-        self.render_header(frame, chunks[0]);
-        self.render_list(frame, chunks[1], width);
-        if inspector_height > 0 {
-            self.render_inspector(frame, chunks[2], width);
-        }
-        self.render_hints(frame, chunks[3]);
-    }
-
-    fn render_header(&self, frame: &mut Frame, area: Rect) {
-        let count = match self.entries() {
-            Some(entries) => format!(
-                "{} entr{} (system + transcript)",
-                entries.len(),
-                match entries.len() {
-                    1 => "y",
-                    _ => "ies",
-                }
+        let crumb = match count {
+            Some(0) => "no entries".to_string(),
+            Some(count) => format!(
+                "{count} entr{} (system + transcript)",
+                if count == 1 { "y" } else { "ies" }
             ),
             None => "loading…".to_string(),
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "Context",
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" · "),
-                Span::raw(count),
-            ])),
-            area,
-        );
-    }
-
-    fn render_list(&self, frame: &mut Frame, area: Rect, width: usize) {
-        let Some(entries) = self.entries() else {
-            return;
+        let mut chrome = crate::tui::screen::Chrome::new("Context");
+        chrome.crumb = Some(&crumb);
+        chrome.counter = count
+            .filter(|count| *count > 0)
+            .map(|count| (self.selected, count));
+        // The inspector keeps roughly two fifths of the screen, bounded so a
+        // tall terminal does not turn into one long panel and a short one
+        // still shows the list.
+        chrome.panel_height = match area.height {
+            0..=3 => 0,
+            height => ((height - 2) * 2 / 5).clamp(3, 12).min(height - 3),
         };
-        let height = area.height as usize;
-        if height == 0 {
-            return;
-        }
+        chrome.notice = self.error.as_ref().map(|error| (error.as_str(), true));
+        chrome.description = None;
+        chrome.keys = self.hint_keys();
 
-        // Stateless windowing: the selected row always stays inside the
-        // visible slice, like the shared command menu.
-        let start = self
-            .selected
-            .saturating_sub(height - 1)
-            .min(entries.len().saturating_sub(1));
-        let lines: Vec<Line<'static>> = entries
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(height)
-            .map(|(index, message)| entry_line(message, index == self.selected, width))
-            .collect();
-        frame.render_widget(Paragraph::new(ratatui::text::Text::from(lines)), area);
+        // The inspector is rendered to lines here so the shared frame can
+        // place it: it is read-only, and the panel shape keeps the layout
+        // arithmetic in one place.
+        let panel =
+            (chrome.panel_height > 0).then(|| self.inspector_panel(width, chrome.panel_height));
+        let focus = count.map(|_| self.selected);
+        self.screen
+            .render(frame, area, &document, focus, &chrome, panel);
+        // The list may have shrunk under the wheel (a delete landed): keep
+        // the viewport inside the new document.
+        self.screen.clamp(document.len());
     }
 
-    fn render_inspector(&self, frame: &mut Frame, area: Rect, width: usize) {
-        if let Some(composer) = self.editing.as_ref() {
-            render_editor(composer, frame, area, width);
-            return;
+    /// The entry list as the shared document: one focusable line per entry.
+    /// The text depends on the width, so it is rebuilt per frame.
+    fn doc(&self, width: usize) -> Document {
+        let Some(entries) = self.entries() else {
+            return Document::new();
+        };
+        Document::push_focused(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, message)| entry_line(message, index == self.selected, width)),
+        )
+    }
+
+    /// The key list for the help bar's right edge.
+    fn hint_keys(&self) -> &'static str {
+        if self.editing.is_some() {
+            return "Enter save · Ctrl+J newline · Esc cancel";
         }
+        if self.confirm_delete {
+            return "delete? y/n";
+        }
+        "↑↓ move · d delete · e edit · u undo · Esc close"
+    }
+
+    /// The inspector as lines: the edit box, or the selected entry in full
+    /// with an honest overflow marker.
+    fn inspector_panel(&self, width: usize, height: u16) -> crate::tui::screen::Panel<'static> {
+        if let Some(composer) = self.editing.as_ref() {
+            return editor_panel(composer, width, height);
+        }
+        crate::tui::screen::Panel::Lines(self.inspector_lines(width, height))
+    }
+
+    /// The selected entry in full, or nothing while there is none.
+    fn inspector_lines(&self, width: usize, height: u16) -> Vec<Line<'static>> {
         let Some(message) = self.selected_entry() else {
-            return;
+            return Vec::new();
         };
         let index = self.selected;
 
@@ -481,7 +509,7 @@ impl ContextView {
             Style::default().fg(theme::SUBTLE),
         ))];
         lines.extend(message_lines(message, width));
-        let visible = (area.height as usize).max(1);
+        let visible = (height as usize).max(1);
         let overflow = lines.len().saturating_sub(visible);
         lines.truncate(visible.saturating_sub(usize::from(overflow > 0)));
         if overflow > 0 {
@@ -490,45 +518,7 @@ impl ContextView {
                 Style::default().fg(theme::DIM),
             )));
         }
-        frame.render_widget(Paragraph::new(ratatui::text::Text::from(lines)), area);
-    }
-
-    fn render_hints(&self, frame: &mut Frame, area: Rect) {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(message) = self.selected_entry() {
-            if deletable(message) {
-                if self.confirm_delete {
-                    parts.push("delete? y/n".to_string());
-                } else {
-                    parts.push("d delete".to_string());
-                }
-            }
-            if editable(message) && !self.confirm_delete {
-                parts.push("e edit".to_string());
-            }
-        }
-        if self.editing.is_some() {
-            parts.clear();
-            parts.push("Enter save".to_string());
-            parts.push("Ctrl+J newline".to_string());
-            parts.push("Esc cancel".to_string());
-        } else {
-            parts.insert(0, "↑↓ move".to_string());
-            parts.push("u undo".to_string());
-            parts.push("Esc close".to_string());
-        }
-        let mut spans = vec![Span::styled(
-            parts.join(" · "),
-            Style::default().fg(theme::DIM),
-        )];
-        if let Some(error) = &self.error {
-            let used = display_width(&parts.join(" · ")) + 4;
-            let available = (area.width as usize).saturating_sub(used);
-            let text = clip(error, available.max(10));
-            spans.push(Span::raw("  ·  "));
-            spans.push(Span::styled(text, Style::default().fg(theme::ERROR)));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        lines
     }
 }
 
@@ -646,13 +636,13 @@ fn entry_line(message: &Message, selected: bool, width: usize) -> Line<'static> 
         ),
         Span::styled(
             badge,
-            Style::default().fg(role_color(message.role)).add_modifier(
-                if selected {
+            Style::default()
+                .fg(role_color(message.role))
+                .add_modifier(if selected {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
-                },
-            ),
+                }),
         ),
         Span::raw(" "),
         Span::styled(preview, Style::default().fg(theme::DIM)),
@@ -667,7 +657,11 @@ fn entry_line(message: &Message, selected: bool, width: usize) -> Line<'static> 
 /// The one-line preview: collapsed content, or the tool calls an assistant
 /// message asks for.
 fn preview_text(message: &Message) -> String {
-    let collapsed: String = message.content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed: String = message
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let calls = message
         .tool_calls
         .as_deref()
@@ -728,50 +722,41 @@ fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
 }
 
 /// The edit box: a bordered block over the inspector area with the
-/// composer's wrapped rows and the terminal cursor.
-fn render_editor(composer: &Composer, frame: &mut Frame, area: Rect, width: usize) {
-    frame.render_widget(
-        Block::new()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::ACCENT)),
-        area,
-    );
-    if area.width < 4 || area.height < 3 {
-        return;
-    }
+/// composer's wrapped rows and the terminal cursor placed inside it.
+fn editor_panel<'a>(composer: &Composer, width: usize, height: u16) -> Panel<'a> {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: width as u16,
+        height,
+    };
     let composer_width = width.saturating_sub(4).max(1);
     let rows = composer.visual_rows(composer_width);
     let (cursor_row, cursor_column) = composer.cursor_visual(composer_width);
-    let inner = Rect {
-        x: area.x + 2,
-        y: area.y + 1,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(2),
-    };
-    let visible = rows
-        .iter()
-        .skip(cursor_row.saturating_sub(inner.height as usize - 1))
-        .take(inner.height as usize)
-        .cloned()
-        .collect::<Vec<_>>();
-    let lines = visible
-        .iter()
+    let inner_height = (height.saturating_sub(2) as usize).max(1);
+    let offset = cursor_row.saturating_sub(inner_height.saturating_sub(1));
+    let visible = rows.iter().skip(offset).take(inner_height);
+    let lines: Vec<Line<'static>> = visible
         .map(|row| Line::from(Span::raw(row.clone())))
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(ratatui::text::Text::from(lines)), inner);
-
-    let offset = cursor_row.saturating_sub(inner.height as usize - 1);
-    let cursor_in_view = cursor_row - offset;
+        .collect();
+    let paragraph = Paragraph::new(ratatui::text::Text::from(lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::ACCENT)),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    // The caret is one cell inside the border, on the row the composer says.
     let column = u16::try_from(cursor_column).unwrap_or(u16::MAX);
-    let x = inner
-        .x
-        .saturating_add(column)
-        .min(inner.x + inner.width.saturating_sub(1));
-    let y = inner
-        .y
-        .saturating_add(cursor_in_view as u16)
-        .min(inner.y + inner.height.saturating_sub(1));
-    frame.set_cursor_position(ratatui::layout::Position::new(x, y));
+    let x = 2u16.saturating_add(column);
+    let y = 1u16.saturating_add((cursor_row - offset) as u16);
+    Panel::Cursor {
+        paragraph,
+        position: (
+            x.min(area.width.saturating_sub(2)),
+            y.min(area.height.saturating_sub(1)),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +786,46 @@ mod tests {
         let mut view = ContextView::new();
         view.apply_snapshot(messages);
         view
+    }
+
+    /// A transcript long enough to scroll: the wheel tests need more entries
+    /// than a short terminal can show.
+    fn long_transcript() -> Vec<Message> {
+        let mut messages = vec![Message::system("be brief")];
+        for index in 0..30 {
+            messages.push(Message::user(format!("message {index}")));
+        }
+        messages
+    }
+
+    #[test]
+    fn the_wheel_scrolls_without_moving_the_selection() {
+        let mut view = view_with(long_transcript());
+        assert_eq!(view.selected, 0);
+        // Render once so the screen learns the page height.
+        render_rows(&mut view, 60, 16);
+        view.wheel(4);
+        assert!(view.screen.scroll > 0, "the viewport moved");
+        assert_eq!(view.selected, 0, "the selection did not move");
+        view.wheel(-99);
+        assert_eq!(view.screen.scroll, 0, "never negative");
+    }
+
+    #[test]
+    fn a_keyboard_step_re_anchors_the_window_on_the_selection() {
+        let mut view = view_with(long_transcript());
+        render_rows(&mut view, 60, 16);
+        view.wheel(6);
+        assert!(view.screen.scroll > 0);
+        // A step down moves the selection, and the next frame re-anchors the
+        // window on it — the scroll offset the wheel set does not survive.
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.selected, 1);
+        render_rows(&mut view, 60, 16);
+        assert_eq!(
+            view.screen.scroll, 1,
+            "the window snapped back to the selection instead of staying scrolled"
+        );
     }
 
     fn transcript() -> Vec<Message> {
@@ -863,15 +888,22 @@ mod tests {
     }
 
     #[test]
-    fn navigation_moves_and_clamps() {
+    fn navigation_wraps_at_both_ends() {
         let mut view = view_with(transcript());
         view.handle_key(key(KeyCode::Down));
         assert_eq!(view.selected, 1);
+        // ↑ from the first entry lands on the last, ↓ from the last on the
+        // first: a long transcript never traps the reader at an end.
         view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.selected, 0);
         view.handle_key(key(KeyCode::Up));
-        assert_eq!(view.selected, 0, "clamped at the system entry");
+        assert_eq!(view.selected, 6, "wrapped to the last entry");
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.selected, 0, "wrapped back to the first");
+        // A page step cycles by its delta, so on a list shorter than the page
+        // it lands somewhere in the middle rather than clamping to the end.
         view.handle_key(key(KeyCode::PageDown));
-        assert_eq!(view.selected, 6, "paged into the clamp");
+        assert_eq!(view.selected, 4, "11 steps from 0 wrap through 7 entries");
         view.handle_key(key(KeyCode::Char('G')));
         assert_eq!(view.selected, 6);
         view.handle_key(key(KeyCode::Char('g')));
@@ -996,7 +1028,7 @@ mod tests {
     // -- rendering ---------------------------------------------------------
 
     /// Render into a `TestBackend` and return the drawn rows.
-    fn render_rows(view: &ContextView, width: u16, height: u16) -> Vec<String> {
+    fn render_rows(view: &mut ContextView, width: u16, height: u16) -> Vec<String> {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         terminal
@@ -1019,8 +1051,10 @@ mod tests {
 
     #[test]
     fn rows_show_badges_previews_and_the_lock() {
-        let view = view_with(transcript());
-        let rows = render_rows(&view, 60, 12);
+        let mut view = view_with(transcript());
+        // Tall enough for all seven entries plus the inspector panel: the
+        // shared frame gives the list what the panel and footer leave.
+        let rows = render_rows(&mut view, 60, 18);
         let rendered = rows.join("\n");
         assert!(rendered.contains("Context"), "{rendered}");
         assert!(rendered.contains("7 entries"), "{rendered}");
@@ -1039,7 +1073,7 @@ mod tests {
     fn the_inspector_shows_the_full_content_with_an_overflow_marker() {
         let mut view = view_with(transcript());
         view.selected = 1;
-        let rows = render_rows(&view, 40, 8);
+        let rows = render_rows(&mut view, 40, 8);
         let rendered = rows.join("\n");
         assert!(rendered.contains("transcript #0"), "{rendered}");
         assert!(rendered.contains("hello"), "{rendered}");
@@ -1050,7 +1084,7 @@ mod tests {
         ];
         let mut view = view_with(long);
         view.selected = 1;
-        let rows = render_rows(&view, 30, 8);
+        let rows = render_rows(&mut view, 30, 8);
         let rendered = rows.join("\n");
         assert!(rendered.contains("+"), "{rendered}");
         assert!(rendered.contains("more lines"), "{rendered}");
@@ -1061,7 +1095,7 @@ mod tests {
         let mut view = view_with(transcript());
         view.handle_key(key(KeyCode::Down));
         view.handle_key(key(KeyCode::Char('e')));
-        let rows = render_rows(&view, 40, 12);
+        let rows = render_rows(&mut view, 40, 12);
         let rendered = rows.join("\n");
         assert!(rendered.contains("Enter save"), "{rendered}");
         assert!(rendered.contains("hello"), "{rendered}");
@@ -1071,9 +1105,12 @@ mod tests {
     fn an_error_line_shows_in_the_hints_row() {
         let mut view = view_with(transcript());
         view.set_error("rejected: broken tool shape".to_string());
-        let rows = render_rows(&view, 80, 12);
+        let rows = render_rows(&mut view, 80, 12);
         let rendered = rows.join("\n");
-        assert!(rendered.contains("rejected: broken tool shape"), "{rendered}");
+        assert!(
+            rendered.contains("rejected: broken tool shape"),
+            "{rendered}"
+        );
     }
 
     // -- the pre-session report -------------------------------------------
@@ -1161,7 +1198,12 @@ mod tests {
         assert_eq!(entry(request, "effort"), "high → reasoning_effort");
         assert_eq!(entry(request, "temperature"), "0.2");
         assert_eq!(entry(request, "messages"), "3 (system + transcript)");
-        assert!(!request.entries.iter().any(|entry| entry.label == "body_overrides"));
+        assert!(
+            !request
+                .entries
+                .iter()
+                .any(|entry| entry.label == "body_overrides")
+        );
 
         let tools = group(&block, "Tools");
         assert_eq!(tools.heading, "Tools (1/1 enabled)");

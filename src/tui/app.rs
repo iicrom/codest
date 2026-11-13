@@ -84,10 +84,6 @@ use crate::core::rollout;
 use crate::core::rollout::LoadedSession;
 use crate::core::settings::HOST_SETTINGS;
 use crate::core::settings::SettingOwner;
-
-/// The host's own `/settings` fields: re-exported from the core so the screen
-/// and the command table cannot disagree about what the host configures.
-const HOST_SETTING_FIELDS: &[cst_plugin_api::settings::SettingField] = HOST_SETTINGS.fields;
 use crate::plugins::PluginEffect;
 use crate::plugins::PluginHost;
 use crate::plugins::PluginInfo;
@@ -974,10 +970,11 @@ impl App {
         // restores the normal pane, scrollback untouched.
         if self.context_view.is_some() {
             let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-            tui.draw(|frame| {
-                let view = self.context_view.as_ref().expect("checked above");
-                view.render(frame, area);
-            })?;
+            // Taken out and put back: rendering updates the viewport.
+            let mut view = self.context_view.take().expect("checked above");
+            let drawn = tui.draw(|frame| view.render(frame, area));
+            self.context_view = Some(view);
+            drawn?;
             return Ok(());
         }
         // Same for the `/settings` screen.
@@ -1174,7 +1171,22 @@ impl App {
     fn handle_terminal_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.handle_key(key),
+            // A paste goes to whatever owns the keyboard. The full-frame
+            // screens are modal, so with one open the paste is dropped rather
+            // than typed into the composer the user cannot see.
             Event::Paste(text) => {
+                if let Some(view) = self.settings_view.as_mut() {
+                    view.paste(&text);
+                    return;
+                }
+                if let Some(view) = self.context_view.as_mut()
+                    && view.paste(&text)
+                {
+                    return;
+                }
+                if self.context_view.is_some() || self.provider_wizard.is_some() {
+                    return;
+                }
                 self.composer.insert_str(&text);
                 self.command_selection = 0;
                 self.command_menu_dismissed = false;
@@ -1186,6 +1198,25 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.mode != TuiMode::Fullscreen {
+            return;
+        }
+        // Which way the wheel turned, in lines. A full-frame screen scrolls
+        // its own list with it; the transcript below takes the rest.
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return,
+        };
+        // A full-frame screen replaces the transcript, so a wheel notch
+        // scrolls that screen's own list. The selection does not move: the
+        // next ↑↓ re-anchors the window on it, so a wheel browse never
+        // changes what a key would act on.
+        if let Some(view) = self.settings_view.as_mut() {
+            view.wheel(delta * WHEEL_LINES as isize);
+            return;
+        }
+        if let Some(view) = self.context_view.as_mut() {
+            view.wheel(delta * WHEEL_LINES as isize);
             return;
         }
         let amount = if mouse.modifiers.contains(KeyModifiers::ALT) {
@@ -2539,14 +2570,18 @@ impl App {
             }
         };
         let mut sections = vec![crate::tui::settings_view::Section {
-            title: "codest".to_string(),
-            description: "host settings",
+            title: HOST_SETTINGS.title.to_string(),
+            id: None,
+            description: HOST_SETTINGS.description,
             owner: crate::core::settings::SettingOwner::Host,
-            fields: HOST_SETTING_FIELDS,
+            fields: HOST_SETTINGS.fields,
         }];
         for (id, section) in self.plugins.settings_sections() {
             sections.push(crate::tui::settings_view::Section {
-                title: id.to_string(),
+                // The plugin names its own card; the id is kept alongside so
+                // `/settings <id>` still finds it.
+                title: section.title.to_string(),
+                id: Some(id),
                 description: section.description,
                 owner: crate::core::settings::SettingOwner::Plugin(id),
                 fields: section.fields,
@@ -2566,16 +2601,25 @@ impl App {
     /// app applies the file's new values — the footer switch directly, a
     /// plugin pocket through its `on_settings_changed` hook — so the running
     /// session matches the file it will restart from.
+    ///
+    /// A `restart` field is the exception: its value is read once at startup,
+    /// so the file changed but this run must keep what it booted with.
     fn apply_settings_event(&mut self, event: crate::tui::settings_view::SettingsEvent) {
         use crate::tui::settings_view::SettingsEvent;
         match event {
             SettingsEvent::Close => self.settings_view = None,
-            SettingsEvent::Saved { section } => {
+            SettingsEvent::Saved { section, restart } => {
                 let Some(view) = self.settings_view.as_ref() else {
                     return;
                 };
                 let global = view.global().clone();
                 let owner = view.section_owner(section);
+                if restart {
+                    // The value is read once at startup, so this run keeps
+                    // what it booted with: no live apply, no hook. The file
+                    // already has the new value for the next launch.
+                    return;
+                }
                 self.apply_global_config(&global);
                 let SettingOwner::Plugin(id) = owner.unwrap_or(SettingOwner::Host) else {
                     return;
@@ -3261,8 +3305,11 @@ impl App {
         }
 
         // The `/context` viewer takes the whole frame while open.
-        if let Some(view) = self.context_view.as_ref() {
+        if self.context_view.is_some() {
+            // Taken out and put back: rendering updates the viewport.
+            let mut view = self.context_view.take().expect("checked above");
             view.render(frame, area);
+            self.context_view = Some(view);
             return;
         }
         // The `/settings` screen does too, and it mutates its own scroll, so
@@ -5040,12 +5087,19 @@ mod tests {
         // `tps` is the built-in with one.
         let rendered = render_lines(&mut app, 100, 26).join("\n");
         assert!(rendered.contains("Settings"), "{rendered}");
-        assert!(rendered.contains("codest"), "{rendered}");
+        assert!(
+            rendered.contains(cst_plugin_api::settings::HOST_NAMESPACE),
+            "the host card is titled by the reserved namespace: {rendered}"
+        );
         assert!(rendered.contains("tps"), "{rendered}");
         assert!(rendered.contains("Tokens-per-second meter"), "{rendered}");
 
+        // The plugin's own card title wins over its id, so the screen says
+        // what the plugin called the section.
+        assert!(rendered.contains("throughput meter"), "{rendered}");
+
         // Move to the tps card's first row (the toggle) and flip it.
-        let host_rows = HOST_SETTING_FIELDS.len();
+        let host_rows = HOST_SETTINGS.fields.len();
         for _ in 0..host_rows {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
@@ -5068,6 +5122,11 @@ mod tests {
         // Esc gives the frame back to the chat.
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.settings_view.is_none());
+
+        // `TPS` is a process-wide `static` shared by every test that builds
+        // the shipped host, so this one puts the switch back where it found
+        // it: the assertion above flipped it on.
+        crate::plugins::builtin::TPS.reset_for_test();
         std::fs::remove_file(&path).ok();
     }
 

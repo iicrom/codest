@@ -1,12 +1,15 @@
 //! The `/settings` screen.
 //!
 //! One card per section — the host's own settings first, then one card per
-//! plugin that declared a [`SettingsSection`] — with one row per option and a
-//! help bar at the bottom. The layout follows the reference TUI's settings
-//! page: a pointer gutter, a label, a right-aligned value chip, the focused
-//! row's description in the help bar (never a second line on the row, so
-//! moving the focus never reflows the list), and a full-width rule above the
-//! notice line.
+//! plugin that declared a [`SettingsSection`] — with one row per option.
+//!
+//! The chrome is not this module's: the header, section strip, page rule,
+//! notice line, help bar, and scroll-follows-focus rule come from
+//! [`crate::tui::screen`]; the card borders, pointer gutter, and value column
+//! from [`crate::tui::cards`]; the one-line editor from
+//! [`crate::tui::inline_edit`]. What is left here — and all this module should
+//! ever be — is the mapping from a settings field to a row and from a key to
+//! a write.
 //!
 //! Every edit is written immediately through [`SettingsFile`] (validated and
 //! atomic) and reported to the app as a [`SettingsEvent`], which applies the
@@ -16,26 +19,30 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 
 use cst_plugin_api::settings::{SettingField, SettingKind};
 
 use crate::core::config::GlobalConfig;
 use crate::core::settings::{SettingOwner, SettingValue, SettingsFile};
-use crate::tui::composer::Composer;
+use crate::tui::cards::Row;
+use crate::tui::inline_edit::{LineEditor, Outcome};
+use crate::tui::screen::{Document, Screen};
 use crate::tui::theme;
-use crate::tui::wrap::display_width;
 
-/// The pointer gutter of a focused row (`❯ `, padded to two cells).
-const POINTER: &str = "❯ ";
-const POINTER_EMPTY: &str = "  ";
+/// The marker a startup-only row carries, next to its label.
+const RESTART_MARK: &str = "⟲";
 
 /// One card: a title, a one-line subtitle, and the fields it edits.
 pub struct Section {
+    /// The card heading, shown on the border and in the section strip.
     pub title: String,
+    /// The plugin that owns the card, when one does. `/settings <name>`
+    /// accepts the id as well as the title, so a user who knows the id does
+    /// not have to know what the plugin called its card.
+    pub id: Option<&'static str>,
     pub description: &'static str,
     pub owner: SettingOwner,
     pub fields: &'static [SettingField],
@@ -47,21 +54,16 @@ pub enum SettingsEvent {
     /// Esc: give the frame back to the chat.
     Close,
     /// A write landed; `section` names whose value changed so the app can
-    /// apply it (the file is already saved).
-    Saved { section: usize },
+    /// apply it (the file is already saved). `restart` is the edited field's
+    /// startup-only flag: the file changed, the running session must not.
+    Saved { section: usize, restart: bool },
 }
 
-/// A one-line editor for a number/text field.
+/// The row currently being edited.
 struct Editor {
     section: usize,
     field: usize,
-    composer: Composer,
-}
-
-/// A rendered document line and the focus index it belongs to, if any.
-struct DocLine {
-    line: Line<'static>,
-    focus: Option<usize>,
+    line: LineEditor,
 }
 
 pub struct SettingsView {
@@ -78,13 +80,24 @@ pub struct SettingsView {
     editing: Option<Editor>,
     /// The last save outcome: `(text, is_error)`.
     notice: Option<(String, bool)>,
-    /// Top document line currently shown; re-clamped on every render.
-    scroll: usize,
+    screen: Screen,
 }
 
 impl SettingsView {
+    /// Build the screen over `sections` from `file`'s current document.
+    ///
+    /// `SettingsFile::load` already parsed the file as TOML, so the typed
+    /// re-read here is expected to succeed; a failure would mean the raw
+    /// table and `GlobalConfig` disagree, which the validated write path
+    /// prevents. Panicking names the file rather than silently showing
+    /// defaults that are not what is stored.
     pub fn new(file: SettingsFile, sections: Vec<Section>) -> Self {
-        let global = crate::core::config::load_global(file.path()).unwrap_or_default();
+        let global = crate::core::config::load_global(file.path()).unwrap_or_else(|error| {
+            panic!(
+                "{} parsed as TOML but not as a codest config: {error}",
+                file.path().display()
+            )
+        });
         let mut view = Self {
             file,
             global,
@@ -94,7 +107,7 @@ impl SettingsView {
             focus: 0,
             editing: None,
             notice: None,
-            scroll: 0,
+            screen: Screen::default(),
         };
         view.reindex();
         view
@@ -134,14 +147,14 @@ impl SettingsView {
         self.sections.get(section).map(|model| model.owner)
     }
 
-    /// Focus the first field of the card named `name` (a `/settings <name>`
-    /// argument). Returns false when no card carries that title.
+    /// Focus the card named `name` (a `/settings <name>` argument), matching
+    /// the card title or the owning plugin's id, case-insensitively. Returns
+    /// false when no card answers to that name.
     pub fn focus_section(&mut self, name: &str) -> bool {
-        let Some(section) = self
-            .sections
-            .iter()
-            .position(|model| model.title.eq_ignore_ascii_case(name))
-        else {
+        let Some(section) = self.sections.iter().position(|model| {
+            model.title.eq_ignore_ascii_case(name)
+                || model.id.is_some_and(|id| id.eq_ignore_ascii_case(name))
+        }) else {
             return false;
         };
         if let Some(index) = self
@@ -150,12 +163,22 @@ impl SettingsView {
             .position(|(candidate, _)| *candidate == section)
         {
             self.focus = index;
-            return true;
         }
-        // A card with nothing to edit is still worth navigating to: keep the
-        // focus where it is and let the window follow the card instead.
-        self.scroll = 0;
+        // A card with nothing to edit still gets navigated to: the focus
+        // stays where it is and the window moves to the card instead.
+        self.scroll_to_section(section);
         true
+    }
+
+    /// Put the top of card `section` at the top of the viewport; the next
+    /// render clamps it to the last page.
+    fn scroll_to_section(&mut self, section: usize) {
+        let mut line = 0usize;
+        for model in self.sections.iter().take(section) {
+            // Top border, the body (at least the "no options" line), bottom.
+            line += 2 + model.fields.len().max(1);
+        }
+        self.screen.scroll = line;
     }
 
     /// The card titles, for the "no such section" message.
@@ -205,23 +228,15 @@ impl SettingsView {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         // The editor owns the keyboard while it is open.
-        if self.editing.is_some() {
-            match key.code {
-                KeyCode::Enter if !ctrl && !alt => return self.commit_editor(),
-                KeyCode::Esc => {
-                    self.editing = None;
+        if let Some(mut editor) = self.editing.take() {
+            match editor.line.handle_key(key) {
+                None => {
+                    self.editing = Some(editor);
                     return None;
                 }
-                KeyCode::Char('c') if ctrl => {
-                    // Ctrl+C leaves the editor, not the app.
-                    self.editing = None;
-                    return None;
-                }
-                _ => {
-                    if let Some(editor) = self.editing.as_mut() {
-                        apply_edit_key(&mut editor.composer, key);
-                    }
-                    return None;
+                Some(Outcome::Cancelled) => return None,
+                Some(Outcome::Confirmed(text)) => {
+                    return self.commit_editor(editor.section, editor.field, text);
                 }
             }
         }
@@ -244,60 +259,66 @@ impl SettingsView {
         None
     }
 
-    fn move_focus(&mut self, delta: isize) {
-        let len = self.focusable.len();
-        if len == 0 {
-            return;
-        }
-        self.focus = (self.focus as isize + delta).clamp(0, len as isize - 1) as usize;
+    /// Feed a bracketed paste. The editor takes it while it is open; with no
+    /// editor the paste is refused, so text never lands in the composer
+    /// underneath a modal screen. Returns whether it was consumed.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let Some(editor) = self.editing.as_mut() else {
+            return false;
+        };
+        editor.line.insert_paste(text);
+        true
     }
 
-    /// Enter `delta` focus steps, skipping rows of a card the caller filtered
-    /// out (nothing today: every card is shown).
+    /// Scroll the list with the wheel. The focus does not move: the next
+    /// keyboard step re-anchors the viewport on it, and the entry under the
+    /// pointer is not the one a key would act on.
+    pub fn wheel(&mut self, lines: isize) {
+        self.screen.scroll_by(lines);
+    }
+
+    /// Move the focus one row, wrapping at both ends: `↑` on the first row
+    /// lands on the last and `↓` on the last lands on the first.
+    fn move_focus(&mut self, delta: isize) {
+        if let Some(next) = crate::tui::screen::step_focus(self.focus, self.focusable.len(), delta)
+        {
+            self.focus = next;
+        }
+    }
+
+    /// Act on the focused row. `enter` distinguishes `Enter` (which opens a
+    /// text or number editor) from `→`/`Space` (which only step values).
     fn activate(&mut self, enter: bool) -> Option<SettingsEvent> {
         let (section, field) = self.focused()?;
-        let spec = self.sections.get(section)?.fields.get(field)?;
+        let spec = *self.sections.get(section)?.fields.get(field)?;
         let current = self.text_of(section, field);
-        let mut event = None;
         match spec.kind {
             SettingKind::Boolean => {
                 let next = current.as_deref() != Some("true");
-                event = self.save(section, field, Some(bool_value(next)));
+                self.save(section, field, Some(SettingValue::Bool(next)))
             }
-            SettingKind::Select => {
-                if let Some(next) = spec.cycle(current.as_deref(), true) {
-                    event = self.save(section, field, Some(SettingValue::Text(next.to_string())));
-                }
-            }
+            SettingKind::Select => spec.cycle(current.as_deref(), true).and_then(|next| {
+                self.save(section, field, Some(SettingValue::Text(next.to_string())))
+            }),
             SettingKind::Number | SettingKind::Text => {
                 if enter {
-                    let mut composer = Composer::new();
-                    // Seed with what is stored, not with the default: typing
-                    // over a friendly default would otherwise pin it.
-                    if let Some(text) = self.values[section][field].clone() {
-                        composer.set_text(text);
-                    }
-                    self.editing = Some(Editor {
-                        section,
-                        field,
-                        composer,
-                    });
+                    self.open_editor(section, field);
                 }
+                None
             }
         }
-        event
     }
 
     /// ← steps a select (or a boolean) backwards; on a text row it does
     /// nothing, so a stray arrow cannot wipe a value.
     fn activate_previous(&mut self) -> Option<SettingsEvent> {
         let (section, field) = self.focused()?;
-        let spec = self.sections.get(section)?.fields.get(field)?;
+        let spec = *self.sections.get(section)?.fields.get(field)?;
         let current = self.text_of(section, field);
         match spec.kind {
             SettingKind::Boolean => {
                 let next = current.as_deref() != Some("true");
-                self.save(section, field, Some(bool_value(next)))
+                self.save(section, field, Some(SettingValue::Bool(next)))
             }
             SettingKind::Select => spec.cycle(current.as_deref(), false).and_then(|next| {
                 self.save(section, field, Some(SettingValue::Text(next.to_string())))
@@ -306,13 +327,48 @@ impl SettingsView {
         }
     }
 
-    /// Save the editor's text: empty removes the key (the plugin's default),
-    /// anything else is parsed by the field's kind first.
-    fn commit_editor(&mut self) -> Option<SettingsEvent> {
-        let editor = self.editing.take()?;
-        let section = editor.section;
-        let field = editor.field;
-        let text = editor.composer.text();
+    /// Open the one-line editor on a text or number row, seeded with the
+    /// stored value — not the default, since typing over a friendly default
+    /// would pin it as an explicit value.
+    fn open_editor(&mut self, section: usize, field: usize) {
+        let line = match self.stored(section, field) {
+            Some(text) => LineEditor::with_text(text),
+            None => LineEditor::empty(),
+        };
+        self.editing = Some(Editor {
+            section,
+            field,
+            line,
+        });
+    }
+
+    /// Re-open the editor holding `text` (a rejected value the user should
+    /// be able to fix rather than retype).
+    fn open_editor_with(&mut self, section: usize, field: usize, text: String) {
+        self.editing = Some(Editor {
+            section,
+            field,
+            line: LineEditor::with_text(text),
+        });
+    }
+
+    /// The value as stored in the file, ignoring the field's default.
+    fn stored(&self, section: usize, field: usize) -> Option<String> {
+        self.values
+            .get(section)
+            .and_then(|values| values.get(field))
+            .cloned()
+            .flatten()
+    }
+
+    /// Save the editor's text: empty removes the key (restoring the plugin's
+    /// default), anything else is parsed by the field's kind first.
+    fn commit_editor(
+        &mut self,
+        section: usize,
+        field: usize,
+        text: String,
+    ) -> Option<SettingsEvent> {
         let spec = *self.sections.get(section)?.fields.get(field)?;
         let value = if text.trim().is_empty() {
             None
@@ -320,10 +376,10 @@ impl SettingsView {
             match SettingValue::parse(&spec, &text) {
                 Ok(value) => Some(value),
                 Err(message) => {
-                    // Keep the editor open with the offending text: the row is
-                    // not lost, and the notice says what went wrong.
+                    // Keep the editor open holding the offending text: the
+                    // row is not lost and the notice says what went wrong.
                     self.notice = Some((message, true));
-                    self.editing = Some(editor);
+                    self.open_editor_with(section, field, text);
                     return None;
                 }
             }
@@ -344,12 +400,13 @@ impl SettingsView {
         let owner = model.owner;
         let title = model.title.clone();
         let key = spec.key;
+        let restart = spec.restart;
         match self.file.write(owner, key, value) {
             Ok(global) => {
                 self.global = global;
                 self.reindex();
                 self.notice = Some((format!("saved {title}.{key}"), false));
-                Some(SettingsEvent::Saved { section })
+                Some(SettingsEvent::Saved { section, restart })
             }
             Err(error) => {
                 self.notice = Some((format!("save failed: {error}"), true));
@@ -363,295 +420,84 @@ impl SettingsView {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let width = area.width as usize;
-        // Header, section strip, body, rule, notice, help bar. The help bar
-        // takes two rows when there is room (description above, keys below)
-        // so a long hint is not truncated to a stub next to the key list.
-        let hint_height = if area.height >= 6 { 2 } else { 1 };
-        let chunks = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),    // the card list
-            Constraint::Length(1), // the page rule
-            Constraint::Length(1), // the last save's outcome
-            Constraint::Length(hint_height),
-        ])
-        .split(area);
-        let body_height = (chunks[2].height as usize).max(1);
-
-        let doc = self.doc(width);
-        let focused_line = doc
+        let document = self.doc(area.width as usize);
+        let crumb = self
+            .focused()
+            .and_then(|(section, _)| self.sections.get(section))
+            .map(|model| model.title.clone());
+        let titles: Vec<String> = self
+            .sections
             .iter()
-            .position(|line| line.focus == Some(self.focus))
-            .unwrap_or(0);
-        let max_scroll = doc.len().saturating_sub(body_height);
-        if focused_line < self.scroll {
-            self.scroll = focused_line;
-        } else if focused_line >= self.scroll + body_height {
-            self.scroll = focused_line + 1 - body_height;
-        }
-        self.scroll = self.scroll.min(max_scroll);
-
-        self.render_header(frame, chunks[0], width);
-        self.render_strip(frame, chunks[1], width);
-        let visible: Vec<Line<'static>> = doc
-            .into_iter()
-            .skip(self.scroll)
-            .take(body_height)
-            .map(|line| line.line)
+            .map(|model| model.title.clone())
             .collect();
-        frame.render_widget(
-            Paragraph::new(ratatui::text::Text::from(visible)),
-            chunks[2],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "─".repeat(width),
-                Style::default().fg(theme::DIM),
-            ))),
-            chunks[3],
-        );
-        self.render_notice(frame, chunks[4]);
-        self.render_hint(frame, chunks[5], width);
-    }
-
-    fn render_header(&mut self, frame: &mut Frame, area: Rect, _width: usize) {
-        let mut spans = vec![Span::styled(
-            " Settings",
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        )];
-        if let Some((section, _)) = self.focused()
-            && let Some(model) = self.sections.get(section)
-        {
-            spans.push(Span::styled(
-                format!(" › {}", model.title),
-                Style::default().fg(theme::SUBTLE),
-            ));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-        let counter = if self.focusable.is_empty() {
-            String::new()
-        } else {
-            format!("{}/{} ", self.focus + 1, self.focusable.len())
-        };
-        // The counter rides the right edge.
-        if !counter.is_empty() {
-            let counter_width = (display_width(&counter) as u16).min(area.width);
-            let right = Rect::new(
-                area.x + area.width - counter_width,
-                area.y,
-                counter_width,
-                area.height,
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    counter,
-                    Style::default().fg(theme::DIM),
-                ))),
-                right,
-            );
-        }
-    }
-
-    /// The section strip: every card title, the focused one highlighted, so a
-    /// long list still says which card the focus is in.
-    fn render_strip(&self, frame: &mut Frame, area: Rect, width: usize) {
         let active = self.focused().map(|(section, _)| section);
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut used = 0usize;
-        for (index, model) in self.sections.iter().enumerate() {
-            let label = format!(" {} ", model.title);
-            let label_width = display_width(&label);
-            if used + label_width > width {
-                break;
-            }
-            used += label_width;
-            let style = if Some(index) == active {
-                Style::default()
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::DIM)
-            };
-            spans.push(Span::styled(label, style));
-            let gap = " · ";
-            if index + 1 < self.sections.len() && used + 3 <= width {
-                used += 3;
-                spans.push(Span::styled(gap, Style::default().fg(theme::DIM)));
-            }
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
-
-    fn render_notice(&self, frame: &mut Frame, area: Rect) {
-        let line = match &self.notice {
-            None => Line::from(""),
-            Some((text, true)) => Line::from(Span::styled(
-                format!(" ✗ {text}"),
-                Style::default().fg(theme::ERROR),
-            )),
-            Some((text, false)) => Line::from(Span::styled(
-                format!(" ✓ {text}"),
-                Style::default().fg(theme::ASSISTANT),
-            )),
-        };
-        frame.render_widget(Paragraph::new(line), area);
-    }
-
-    /// The help bar: the focused row's description on the left (truncated
-    /// first), the keys pinned to the right — a truncated hint still reads, a
-    /// truncated key list hides the keys nobody can guess. When rows are
-    /// editable the bar takes two lines (description above, keys below) so a
-    /// long explanation is not cut to a stub.
-    fn render_hint(&self, frame: &mut Frame, area: Rect, width: usize) {
-        let keys = if self.editing.is_some() {
-            "Enter save · Esc cancel"
-        } else if self.focused().is_some() {
-            match self.focused_kind() {
-                Some(SettingKind::Boolean) => "↑↓ select · Enter toggle · Esc close",
-                Some(SettingKind::Select) => "↑↓ select · Enter/←→ change · Esc close",
-                Some(SettingKind::Number | SettingKind::Text) => {
-                    "↑↓ select · Enter edit · Esc close"
-                }
-                None => "Esc close",
-            }
-        } else {
-            "Esc close"
-        };
-        if area.height >= 2 {
-            let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-            self.hint_line(frame, rows[0], width, self.focused_description(), "");
-            self.hint_line(frame, rows[1], width, None, keys);
-            return;
-        }
-        self.hint_line(frame, area, width, self.focused_description(), keys);
-    }
-
-    /// One help-bar row: the left text truncated to fit, the right text pinned
-    /// to the edge.
-    fn hint_line(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        width: usize,
-        left: Option<String>,
-        right: &str,
-    ) {
-        let right_width = display_width(right);
-        let budget = width.saturating_sub(right_width + 1);
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut left_width = 0;
-        if let Some(text) = left
-            && budget >= 8
-        {
-            let text = crate::tui::session::truncated(&text, budget);
-            left_width = display_width(&text);
-            spans.push(Span::styled(
-                text,
-                Style::default()
-                    .fg(theme::DIM)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
-        spans.push(Span::raw(
-            " ".repeat(width.saturating_sub(right_width + left_width)),
-        ));
-        spans.push(Span::styled(
-            right.to_string(),
-            Style::default().fg(theme::DIM),
-        ));
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
-
-    /// The kind of the focused row, for the help bar and its height.
-    fn focused_kind(&self) -> Option<SettingKind> {
-        let (section, field) = self.focused()?;
-        Some(self.sections.get(section)?.fields.get(field)?.kind)
-    }
-
-    fn focused_description(&self) -> Option<String> {
-        let (section, field) = self.focused()?;
-        let spec = self.sections.get(section)?.fields.get(field)?;
-        let mut text = spec.description.to_string();
-        if spec.restart {
-            text.push_str(" · restart to apply");
-        }
-        if !self.is_set(section, field) {
-            text.push_str(" · default");
-        }
-        Some(text)
+        let counter = (!self.focusable.is_empty()).then_some((self.focus, self.focusable.len()));
+        let description = self.focused_description();
+        let notice = self
+            .notice
+            .as_ref()
+            .map(|(text, error)| (text.as_str(), *error));
+        let focus = self.focused().map(|_| self.focus);
+        let mut chrome = crate::tui::screen::Chrome::new("Settings");
+        chrome.crumb = crumb.as_deref();
+        chrome.counter = counter;
+        chrome.strip = Some(&titles);
+        chrome.active_section = active;
+        chrome.notice = notice;
+        chrome.description = description.as_deref();
+        chrome.keys = self.keys();
+        self.screen
+            .render(frame, area, &document, focus, &chrome, None);
     }
 
     /// The whole document as lines: one card per section, one line per field.
-    fn doc(&self, width: usize) -> Vec<DocLine> {
-        let mut lines: Vec<DocLine> = Vec::new();
+    fn doc(&self, width: usize) -> Document {
+        let mut document = Document::new();
         for (index, model) in self.sections.iter().enumerate() {
-            lines.push(DocLine {
-                line: card_top(&model.title, model.description, width),
-                focus: None,
-            });
+            document.push(
+                crate::tui::cards::top(&model.title, model.description, width),
+                None,
+            );
             if model.fields.is_empty() {
-                lines.push(DocLine {
-                    line: card_body(
+                document.push(
+                    crate::tui::cards::body(
                         Line::from(Span::styled(
                             "  no configurable options",
                             Style::default().fg(theme::DIM),
                         )),
                         width,
                     ),
-                    focus: None,
-                });
+                    None,
+                );
             }
             for (field_index, spec) in model.fields.iter().enumerate() {
                 let focus = self
                     .focusable
                     .iter()
                     .position(|pair| *pair == (index, field_index));
-                let is_focused =
-                    self.editing.as_ref().is_some_and(|editor| {
-                        editor.section == index && editor.field == field_index
-                    }) || (self.editing.is_none() && focus == Some(self.focus));
-                let row = self.field_line(index, field_index, spec, is_focused, width);
-                lines.push(DocLine {
-                    line: card_body(row, width),
-                    focus,
-                });
+                // While an editor is open it owns the highlight, so the
+                // pointer does not also mark whatever row the focus is on.
+                let is_focused = match &self.editing {
+                    Some(editor) => editor.section == index && editor.field == field_index,
+                    None => focus == Some(self.focus),
+                };
+                let row = self.field_row(index, field_index, spec, is_focused);
+                document.push(crate::tui::cards::body(row.line(width), width), focus);
             }
-            lines.push(DocLine {
-                line: card_bottom(width),
-                focus: None,
-            });
+            document.push(crate::tui::cards::bottom(width), None);
         }
-        lines
+        document
     }
 
-    fn field_line(
-        &self,
-        section: usize,
-        field: usize,
-        spec: &SettingField,
-        focused: bool,
-        width: usize,
-    ) -> Line<'static> {
+    /// One field as a row: its label (plus the restart marker) and the value
+    /// chip, styled by kind and focus.
+    fn field_row(&self, section: usize, field: usize, spec: &SettingField, focused: bool) -> Row {
         let editing = self
             .editing
             .as_ref()
             .filter(|editor| editor.section == section && editor.field == field);
-        let pointer = if focused { POINTER } else { POINTER_EMPTY };
-        let pointer_style = if focused {
-            Style::default().fg(theme::ACCENT)
-        } else {
-            Style::default().fg(theme::DIM)
-        };
-        let label_style = if focused {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
         let value = match editing {
-            Some(editor) => format!("{}▌", editor.composer.text()),
+            Some(editor) => editor.line.display(),
             None => self.value_text(section, field, spec),
         };
         let value_style = match (spec.kind, focused) {
@@ -665,36 +511,20 @@ impl SettingsView {
             (_, true) => Style::default().fg(theme::ACCENT),
             (_, false) => Style::default().fg(theme::SUBTLE),
         };
-        // Card borders (`│ ` + ` │`, 4 cells) and the pointer gutter (2), so
-        // the value column keeps a stable right edge whatever the terminal
-        // width. A long value (a text setting) is truncated rather than
-        // pushing the right wall off screen.
-        let available = width.saturating_sub(4 + 2);
-        let value_budget = (available / 2).max(6);
-        let value = if display_width(&value) > value_budget {
-            crate::tui::session::truncated(&value, value_budget)
-        } else {
-            value
-        };
-        let value_width = display_width(&value);
-        let label_budget = available.saturating_sub(value_width + 2);
-        let label = if display_width(spec.label) > label_budget {
-            crate::tui::session::truncated(spec.label, label_budget.max(4))
+        // A startup-only row says so where the user looks; the help bar
+        // spells it out when the row is focused.
+        let label = if spec.restart {
+            format!("{} {RESTART_MARK}", spec.label)
         } else {
             spec.label.to_string()
         };
-        let pad = label_budget.saturating_sub(display_width(&label)).max(1);
-        let spans = vec![
-            Span::styled(pointer, pointer_style),
-            Span::styled(label, label_style),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(value, value_style),
-        ];
-        Line::from(spans)
+        Row::new(label, value)
+            .focused(focused)
+            .value_style(value_style)
     }
 
     /// The value chip: `[x]`/`[ ]`, `‹ label ›`, the stored text, or the
-    /// unset/default marker.
+    /// default/unset marker.
     fn value_text(&self, section: usize, field: usize, spec: &SettingField) -> String {
         let stored = self.text_of(section, field);
         match spec.kind {
@@ -721,74 +551,38 @@ impl SettingsView {
             }
         }
     }
-}
 
-fn bool_value(flag: bool) -> SettingValue {
-    SettingValue::Bool(flag)
-}
+    /// The focused row's description, plus the qualifiers the row cannot say
+    /// in one line.
+    fn focused_description(&self) -> Option<String> {
+        let (section, field) = self.focused()?;
+        let spec = self.sections.get(section)?.fields.get(field)?;
+        let mut text = spec.description.to_string();
+        if spec.restart {
+            text.push_str(" · restart to apply");
+        }
+        if !self.is_set(section, field) {
+            text.push_str(" · default");
+        }
+        Some(text)
+    }
 
-/// `╭─ title ─ subtitle ─────╮`
-fn card_top(title: &str, subtitle: &str, width: usize) -> Line<'static> {
-    let inner = width.saturating_sub(2);
-    let head = format!("─ {title} ─ {subtitle} ");
-    let head_width = display_width(&head);
-    let fill = inner.saturating_sub(head_width);
-    Line::from(vec![
-        Span::styled("╭", Style::default().fg(theme::DIM)),
-        Span::styled(
-            crate::tui::session::truncated(&head, inner),
-            Style::default()
-                .fg(theme::SUBTLE)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("─".repeat(fill), Style::default().fg(theme::DIM)),
-        Span::styled("╮", Style::default().fg(theme::DIM)),
-    ])
-}
+    /// The help bar's key list for what the keyboard currently does.
+    fn keys(&self) -> &'static str {
+        if self.editing.is_some() {
+            return "Enter save · Esc cancel";
+        }
+        match self.focused_kind() {
+            Some(SettingKind::Boolean) => "↑↓ select · Enter toggle · Esc close",
+            Some(SettingKind::Select) => "↑↓ select · Enter/←→ change · Esc close",
+            Some(SettingKind::Number | SettingKind::Text) => "↑↓ select · Enter edit · Esc close",
+            None => "Esc close",
+        }
+    }
 
-/// `│ <row>  │`, padded to the full width.
-fn card_body(row: Line<'static>, width: usize) -> Line<'static> {
-    let inner = width.saturating_sub(4);
-    let row_width: usize = row
-        .spans
-        .iter()
-        .map(|span| display_width(&span.content))
-        .sum();
-    let mut spans = vec![Span::styled("│ ", Style::default().fg(theme::DIM))];
-    spans.extend(row.spans);
-    spans.push(Span::raw(" ".repeat(inner.saturating_sub(row_width))));
-    spans.push(Span::styled(" │", Style::default().fg(theme::DIM)));
-    Line::from(spans)
-}
-
-/// `╰──────────╯`
-fn card_bottom(width: usize) -> Line<'static> {
-    let style = Style::default().fg(theme::DIM);
-    Line::from(vec![
-        Span::styled("╰", style),
-        Span::styled("─".repeat(width.saturating_sub(2)), style),
-        Span::styled("╯", style),
-    ])
-}
-
-/// The editor's keymap: one line, printable text, the composer's kills.
-fn apply_edit_key(composer: &mut Composer, key: KeyEvent) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    match key.code {
-        KeyCode::Char(c) if !ctrl && !alt => composer.insert_char(c),
-        KeyCode::Backspace => composer.backspace(),
-        KeyCode::Delete => composer.delete(),
-        KeyCode::Left => composer.move_left(),
-        KeyCode::Right => composer.move_right(),
-        KeyCode::Home => composer.home(),
-        KeyCode::End => composer.end(),
-        KeyCode::Char('a') if ctrl => composer.home(),
-        KeyCode::Char('e') if ctrl => composer.end(),
-        KeyCode::Char('u') if ctrl => composer.kill_to_start(),
-        KeyCode::Char('k') if ctrl => composer.kill_to_end(),
-        KeyCode::Char('w') if ctrl => composer.delete_word_backward(),
-        _ => {}
+    fn focused_kind(&self) -> Option<SettingKind> {
+        let (section, field) = self.focused()?;
+        Some(self.sections.get(section)?.fields.get(field)?.kind)
     }
 }
 
@@ -835,12 +629,16 @@ mod tests {
             vec![
                 Section {
                     title: "codest".to_string(),
+                    id: None,
                     description: "host settings",
                     owner: SettingOwner::Host,
                     fields: &HOST_FIELDS,
                 },
                 Section {
-                    title: "tps".to_string(),
+                    // A plugin whose card title differs from its id: both
+                    // must be accepted by `/settings <name>`.
+                    title: "Throughput".to_string(),
+                    id: Some("tps"),
                     description: "throughput meter",
                     owner: SettingOwner::Plugin("tps"),
                     fields: &TPS_FIELDS,
@@ -853,17 +651,40 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn render_view(view: &mut SettingsView, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| view.render(frame, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[test]
-    fn focus_walks_every_row_and_escape_closes() {
+    fn focus_walks_every_row_and_wraps_at_the_ends() {
         let mut view = view("focus", "");
         assert_eq!(view.focused(), Some((0, 0)));
         view.handle_key(key(KeyCode::Down));
         assert_eq!(view.focused(), Some((1, 0)));
         view.handle_key(key(KeyCode::Down));
         assert_eq!(view.focused(), Some((1, 1)));
-        // The end of the list is the last row, not a wrap back to the top.
         view.handle_key(key(KeyCode::Down));
         assert_eq!(view.focused(), Some((1, 2)));
+        // ↓ on the last row wraps to the first, ↑ on the first to the last.
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.focused(), Some((0, 0)), "wrapped to the top");
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.focused(), Some((1, 2)), "wrapped to the bottom");
         view.handle_key(key(KeyCode::Up));
         assert_eq!(view.focused(), Some((1, 1)));
         assert_eq!(
@@ -873,11 +694,28 @@ mod tests {
     }
 
     #[test]
+    fn the_wheel_scrolls_without_moving_the_focus() {
+        let mut view = view("wheel", "");
+        assert_eq!(view.focused(), Some((0, 0)));
+        view.wheel(3);
+        assert_eq!(view.screen.scroll, 3, "the viewport moved");
+        assert_eq!(view.focused(), Some((0, 0)), "the focus did not");
+        view.wheel(-99);
+        assert_eq!(view.screen.scroll, 0, "never negative");
+    }
+
+    #[test]
     fn a_boolean_toggle_saves_and_reports_the_section() {
         let mut view = view("toggle", "");
         view.handle_key(key(KeyCode::Down));
         let event = view.handle_key(key(KeyCode::Enter));
-        assert_eq!(event, Some(SettingsEvent::Saved { section: 1 }));
+        assert_eq!(
+            event,
+            Some(SettingsEvent::Saved {
+                section: 1,
+                restart: false
+            })
+        );
         assert_eq!(
             view.global().plugins["tps"].option_bool("enabled"),
             Some(true)
@@ -887,6 +725,31 @@ mod tests {
         assert_eq!(
             view.global().plugins["tps"].option_bool("enabled"),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn a_startup_only_field_reports_the_restart_flag_so_the_app_skips_it() {
+        let mut view = view("restart", "");
+        // The third row of the tps card is the number field marked restart.
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::End));
+        assert_eq!(view.focused(), Some((1, 2)));
+        view.handle_key(key(KeyCode::Enter));
+        for c in "250".chars() {
+            view.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter)),
+            Some(SettingsEvent::Saved {
+                section: 1,
+                restart: true
+            }),
+            "the app needs the flag to know this one must not apply live"
+        );
+        assert_eq!(
+            view.global().plugins["tps"].option_u64("window_ms"),
+            Some(250)
         );
     }
 
@@ -906,10 +769,10 @@ mod tests {
     fn a_text_row_edits_rejects_garbage_and_clearing_removes_the_key() {
         let mut view = view("text", "");
         view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
-        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::End));
         // Enter opens the editor; typing "abc" is not a number.
         view.handle_key(key(KeyCode::Enter));
+        assert!(view.editing.is_some(), "Enter opens the editor");
         for c in "abc".chars() {
             view.handle_key(key(KeyCode::Char(c)));
         }
@@ -924,7 +787,11 @@ mod tests {
             "the notice explains the rejection"
         );
 
-        // Clearing the box and confirming removes the key again.
+        // The rejected text is still in the box, so a fix does not retype it.
+        assert_eq!(
+            view.editing.as_ref().map(|e| e.line.text()),
+            Some("abc".to_string())
+        );
         for _ in 0..3 {
             view.handle_key(key(KeyCode::Backspace));
         }
@@ -933,7 +800,10 @@ mod tests {
         }
         assert_eq!(
             view.handle_key(key(KeyCode::Enter)),
-            Some(SettingsEvent::Saved { section: 1 })
+            Some(SettingsEvent::Saved {
+                section: 1,
+                restart: true
+            })
         );
         assert_eq!(
             view.global().plugins["tps"].option_u64("window_ms"),
@@ -955,7 +825,10 @@ mod tests {
         let mut view = view("host", "");
         assert_eq!(
             view.handle_key(key(KeyCode::Enter)),
-            Some(SettingsEvent::Saved { section: 0 })
+            Some(SettingsEvent::Saved {
+                section: 0,
+                restart: false
+            })
         );
         assert!(!view.global().status_bar.plugin_segments);
         // The value is on disk in the host's dotted form, and the typed view
@@ -973,7 +846,7 @@ mod tests {
         let text = frame.join("\n");
         // A card per section: title + subtitle on the top border, rows inside.
         assert!(text.contains("╭─ codest ─ host settings"), "{text}");
-        assert!(text.contains("╭─ tps ─ throughput meter"), "{text}");
+        assert!(text.contains("╭─ Throughput ─ throughput meter"), "{text}");
         assert!(text.contains("╰"), "{text}");
         // The first row is focused, so it carries the pointer and its value.
         assert!(text.contains("❯ Plugin segments"), "{text}");
@@ -982,15 +855,13 @@ mod tests {
         // the right wall never drift.
         for line in &frame {
             if line.starts_with('│') || line.ends_with('│') {
-                assert_eq!(display_width(line), 60, "{line:?}\n{text}");
+                assert_eq!(
+                    crate::tui::wrap::display_width(line),
+                    60,
+                    "{line:?}\n{text}"
+                );
             }
         }
-        // The help bar pins its keys to the right edge.
-        assert_eq!(
-            frame.last().map(|line| display_width(line)),
-            Some(60),
-            "{text}"
-        );
         // The description rides the row above the keys, so a long hint is not
         // truncated to a stub next to them.
         assert!(
@@ -1001,32 +872,51 @@ mod tests {
         );
     }
 
-    /// Draw the screen into an off-screen buffer and return its rows as text.
-    fn render_view(view: &mut SettingsView, width: u16, height: u16) -> Vec<String> {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-        terminal
-            .draw(|frame| view.render(frame, frame.area()))
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol().to_string())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+    #[test]
+    fn a_startup_only_row_is_marked_on_the_row_itself() {
+        let mut view = view("badge", "");
+        let frame = render_view(&mut view, 60, 16);
+        let text = frame.join("\n");
+        assert!(
+            text.contains(&format!("Window {RESTART_MARK}")),
+            "the row carries the restart marker: {text}"
+        );
+        // The default row — a plain toggle — carries no marker.
+        assert!(text.contains("Meter"), "{text}");
+        assert!(!text.contains(&format!("Meter {RESTART_MARK}")), "{text}");
     }
 
     #[test]
-    fn a_named_section_is_found_case_insensitively() {
+    fn a_named_section_matches_the_title_or_the_plugin_id() {
         let mut view = view("named", "");
-        assert!(view.focus_section("TPS"));
+        assert!(view.focus_section("THROUGHPUT"), "the title matches");
         assert_eq!(view.focused(), Some((1, 0)));
+        assert!(view.focus_section("tps"), "the plugin id matches too");
+        assert_eq!(view.focused(), Some((1, 0)));
+        assert!(view.focus_section("codest"));
+        assert_eq!(view.focused(), Some((0, 0)));
         assert!(!view.focus_section("nope"));
-        assert_eq!(view.section_titles(), vec!["codest", "tps"]);
+        assert_eq!(view.section_titles(), vec!["codest", "Throughput"]);
+    }
+
+    #[test]
+    fn a_paste_with_no_editor_open_is_refused_so_it_cannot_leak() {
+        let mut view = view("paste", "");
+        // Refused, not swallowed: the app drops the paste instead of feeding
+        // the composer underneath this modal screen.
+        assert!(!view.paste("leaked text"));
+    }
+
+    #[test]
+    fn a_paste_into_the_editor_lands_there_with_newlines_flattened() {
+        let mut view = view("paste-editor", "");
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::End));
+        view.handle_key(key(KeyCode::Enter));
+        assert!(view.paste("12\n34"), "the editor consumes it");
+        assert_eq!(
+            view.editing.as_ref().map(|editor| editor.line.text()),
+            Some("12 34".to_string())
+        );
     }
 }

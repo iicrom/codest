@@ -31,7 +31,8 @@ CST_TUI_MODE=inline codest
 两种模式都从上到下排同样的四段：transcript、菜单带、输入框、footer。
 
 - **Transcript。** 用户回合带 `› ` 前缀；助手回答首行是 `• `，后续行缩进在正文下；错误用 `! `；通知是暗色、无前缀；被中断的回合留下 `■ interrupted` 标记。thinking 卡片、工具卡片以及 `/context` 这类插件报告都是这份列表里的单元格。transcript 按会话保存：切换会话即切换渲染的视图，后台会话重新激活时补上差距。
-- **菜单带。** slash 指令候选弹窗，或打开中的某个选择器（`/sessions`、`/model`、`/effort`、`/tools`）。没有内容需要它时收缩为零行。整帧界面（`/context`、`/provider`、`/settings`）则整体替换布局，而不是占用这条带。
+- **菜单带。** slash 指令候选弹窗，或打开中的某个选择器（`/sessions`、`/model`、`/effort`、`/tools`）。没有内容需要它时收缩为零行。`/provider` 向导也渲染在这里，是一组选项行而不是覆盖层。整帧界面（`/context`、`/settings`）则整体替换布局，而不是占用这条带。
+- **整帧界面。** `/settings` 与 `/context` 共用同一套框架（`src/tui/screen.rs`）：带 `n/m` 计数器的头部、可滚动的列表、可选的固定面板（`/context` 的检视区）、分隔线、提示行和帮助栏。两者都是 `↑`/`↓` 在列表中移动并在两端循环——第一行按 `↑` 跳到末行，末行按 `↓` 跳回首行——滚轮只滚动列表、不移动选择，所以浏览不会改变按键作用的对象；下一次按键会把视口重新锚定到选择上。
 - **输入框。** 多行编辑器，只有一条上边框，`› ` 提示符占自己的两列 gutter，最多显示八行；更长的输入在内部滚动。开启了 bracketed paste，多行粘贴作为文本落入，而不是一串按键。
 - **Footer。** 左侧是 `codest · <provider/model> · effort <等级> · <上下文>`，然后一个 `│` 和状态词——`ready`，或回合进行中的转轮加 `working · Esc interrupt`。上下文读数始终存在：两值都已知时是 `used/window (n%)`，只知道窗口时是 `—/window`，只知道用量时是 `used tok`，两者都未知时是 `—`。它随每个流式回合报出的 usage 更新，长工具轮次期间也不会停在旧值，回合结束后由完成的那次 usage 定稿。右侧是当前情境的提示行；`thinking expanded` 这类短暂反馈会临时占位两秒左右。
 
@@ -109,7 +110,10 @@ CST_TUI_MODE=inline codest
 | 输入框编辑 | [`../src/tui/composer.rs`](../../src/tui/composer.rs) |
 | 整帧的 `/context` 查看器 | [`../src/tui/context_view.rs`](../../src/tui/context_view.rs) |
 | `/provider` 向导状态机 | [`../src/tui/provider_wizard.rs`](../../src/tui/provider_wizard.rs) |
-| 整帧的 `/settings` 界面（卡片、行、编辑器、提示行） | [`../src/tui/settings_view.rs`](../../src/tui/settings_view.rs) |
+| 整帧的 `/settings` 界面（字段 → 行、写入） | [`../src/tui/settings_view.rs`](../../src/tui/settings_view.rs) |
+| 整帧界面框架（头部、分区条、分隔线、提示、帮助栏、滚动） | [`../src/tui/screen.rs`](../../src/tui/screen.rs) |
+| 卡片边框、指针 gutter、行与值列 | [`../src/tui/cards.rs`](../../src/tui/cards.rs) |
+| 列表界面共用的一行编辑器 | [`../src/tui/inline_edit.rs`](../../src/tui/inline_edit.rs) |
 | 调色板 | [`../src/tui/theme.rs`](../../src/tui/theme.rs) |
 
 启动时会往当前会话 transcript 的最前面放三条 notice：一行 banner、一行 `backend: <provider/model> · mode: <模式>`，以及一行按键提示（两种模式内容不同）。恢复会话时，同样三条会接在已恢复的 transcript 之上，后面再跟一行恢复会话数；普通启动且存在已保存会话时，会有一行提示指向 `/sessions`。它们就是普通的通知单元格——`/clear` 会和其余 transcript 一起清掉。

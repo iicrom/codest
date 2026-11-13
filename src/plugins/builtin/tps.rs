@@ -200,6 +200,14 @@ impl Tps {
         self.state.lock().expect("tps state").enabled
     }
 
+    /// Return the shared [`TPS`] instance to its startup state (off, no
+    /// metering). The static is process-wide, so a test that flips it has to
+    /// put it back or it leaks into every other test sharing the shipped host.
+    #[cfg(test)]
+    pub fn reset_for_test(&self) {
+        *self.state.lock().expect("tps state") = TpsState::new();
+    }
+
     fn publish_rate(&self, state: &TpsState, ctx: &mut PluginContext<'_>) {
         match state.live {
             Some(tps) => {

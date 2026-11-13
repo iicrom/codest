@@ -446,7 +446,9 @@ static FIELDS: [SettingField; 2] = [
 ];
 
 fn settings(&self) -> Option<SettingsSection> {
-    Some(SettingsSection::new("my-plugin", "what it does, briefly", &FIELDS))
+    // The title is the card heading; `/settings my-plugin` still finds the
+    // card by its plugin id, so the title is free to be a readable name.
+    Some(SettingsSection::new("Meter", "live throughput", &FIELDS))
 }
 
 fn on_settings_changed(
@@ -454,8 +456,8 @@ fn on_settings_changed(
     settings: Option<&PluginSettings>,
     ctx: &mut PluginContext<'_>,
 ) {
-    // Called after a successful write (and never for a startup-only field
-    // while the run continues): the pocket is the file as it now stands.
+    // Called after a successful write. It is skipped for a field declared
+    // `restart()`, which the host already knows not to apply mid-run.
     let enabled = settings.and_then(|s| s.option_bool("enabled")).unwrap_or(false);
     self.set_enabled(enabled);
 }
@@ -474,8 +476,9 @@ Four rules make a card predictable:
   `(default)`, and clearing a text row removes the key — restoring this value
   rather than pinning a copy of it.
 * **`restart()` marks a startup-only field.** The edit still persists; the row
-  carries a `restart` badge and `on_settings_changed` is the only chance to
-  apply it live. Declare it whenever the value feeds something built once at
+  carries a `⟲` marker and the help bar says `restart to apply`, but the host
+  **skips `on_settings_changed`** for it — the running session keeps the value
+  it booted with. Declare it whenever the value feeds something built once at
   startup (a server address, a protocol choice).
 
 The built-in `tps` plugin ([tps.rs](../src/plugins/builtin/tps.rs)) is the

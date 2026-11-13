@@ -131,7 +131,10 @@ codest/
         ├── composer.rs        # 输入编辑器
         ├── provider_wizard.rs # /provider 向导
         ├── context_view.rs    # /context 查看器
-        ├── settings_view.rs   # /settings 界面（卡片 + 行 + 编辑器）
+        ├── settings_view.rs   # /settings 界面（字段 → 行的映射）
+        ├── screen.rs          # 整帧界面的框架：头部/分区条/分隔线/提示/帮助栏 + 滚动
+        ├── cards.rs           # 卡片边框、指针 gutter、行与值列
+        ├── inline_edit.rs     # 列表界面共用的一行编辑器
         ├── markdown.rs        # Markdown 渲染（pulldown-cmark）
         ├── highlight.rs       # 代码高亮（syntect → TokenKind）
         ├── theme.rs           # 颜色

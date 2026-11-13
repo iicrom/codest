@@ -94,6 +94,8 @@ pub enum PluginHostError {
     EmptyPluginId,
     #[error("plugin id `{id}` is registered more than once")]
     DuplicatePluginId { id: &'static str },
+    #[error("plugin id `{id}` is reserved for the host's own `/settings` card")]
+    ReservedPluginId { id: &'static str },
     #[error("tool `{name}` is declared more than once")]
     DuplicateTool { name: &'static str },
     #[error("tool filter names unknown plugin `{id}` (known: {known})")]
@@ -166,6 +168,12 @@ impl PluginHost {
             let id = plugin.id();
             if id.is_empty() {
                 return Err(PluginHostError::EmptyPluginId);
+            }
+            // `/settings` shows the host's own card under this name and
+            // `[plugins."<id>"]` pockets share one file, so a plugin may not
+            // claim it.
+            if id == cst_plugin_api::settings::HOST_NAMESPACE {
+                return Err(PluginHostError::ReservedPluginId { id });
             }
             if ids.contains(&id) {
                 return Err(PluginHostError::DuplicatePluginId { id });
@@ -1111,6 +1119,28 @@ mod tests {
         assert!(matches!(
             PluginHost::new(TWINS),
             Err(PluginHostError::DuplicatePluginId { id: "twin" })
+        ));
+    }
+
+    /// `/settings` always shows the host's own card under `HOST_NAMESPACE`,
+    /// so a plugin claiming that id would put two cards with one title on
+    /// screen and make `/settings codest` ambiguous.
+    #[test]
+    fn the_host_namespace_is_not_a_plugin_id() {
+        struct Impostor;
+
+        impl Plugin for Impostor {
+            fn id(&self) -> &'static str {
+                cst_plugin_api::settings::HOST_NAMESPACE
+            }
+        }
+
+        static IMPOSTOR: Impostor = Impostor;
+        static IMPOSTORS: &[&dyn Plugin] = &[&IMPOSTOR];
+
+        assert!(matches!(
+            PluginHost::new(IMPOSTORS),
+            Err(PluginHostError::ReservedPluginId { id: "codest" })
         ));
     }
 

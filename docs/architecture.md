@@ -131,7 +131,10 @@ codest/
         ├── composer.rs        # input editor
         ├── provider_wizard.rs # /provider wizard
         ├── context_view.rs    # /context viewer
-        ├── settings_view.rs   # /settings screen (cards + rows + editor)
+        ├── settings_view.rs   # /settings screen (field → row mapping)
+        ├── screen.rs          # full-frame screen chrome: header/strip/rule/notice/hint + scroll
+        ├── cards.rs           # card borders, pointer gutter, row/value column
+        ├── inline_edit.rs     # one-line editor shared by the list screens
         ├── markdown.rs        # Markdown rendering (pulldown-cmark)
         ├── highlight.rs       # code highlighting (syntect → TokenKind)
         ├── theme.rs           # colors

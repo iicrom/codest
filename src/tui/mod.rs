@@ -6,12 +6,15 @@
 //! app-server, approvals, and overlay machinery.
 
 pub mod app;
+pub mod cards;
 pub mod chat;
 pub mod composer;
 pub mod context_view;
 pub mod highlight;
+pub mod inline_edit;
 pub mod markdown;
 pub mod provider_wizard;
+pub mod screen;
 pub mod session;
 pub mod settings_view;
 pub mod theme;

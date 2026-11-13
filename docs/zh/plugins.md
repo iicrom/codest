@@ -405,7 +405,9 @@ static FIELDS: [SettingField; 2] = [
 ];
 
 fn settings(&self) -> Option<SettingsSection> {
-    Some(SettingsSection::new("my-plugin", "一句话说明它做什么", &FIELDS))
+    // title 是卡片标题；`/settings my-plugin` 仍按插件 id 找得到这张卡，所以
+    // 标题可以是一个好读的名字。
+    Some(SettingsSection::new("计量器", "实时吞吐", &FIELDS))
 }
 
 fn on_settings_changed(
@@ -413,8 +415,8 @@ fn on_settings_changed(
     settings: Option<&PluginSettings>,
     ctx: &mut PluginContext<'_>,
 ) {
-    // 写入成功后调用（仅启动生效的字段不会在本轮被调用）：口袋就是文件当前
-    // 的内容。
+    // 写入成功后调用。声明为 `restart()` 的字段会被宿主跳过——宿主已经知道
+    // 它不该在本轮生效。
     let enabled = settings.and_then(|s| s.option_bool("enabled")).unwrap_or(false);
     self.set_enabled(enabled);
 }
@@ -430,9 +432,10 @@ fn on_settings_changed(
   解析不了的数字在碰到文件之前就被拒绝。
 * **`default` 描述「键不存在」的含义。** 行上会标注 `(默认)`，清空文本行会删
   除该键——恢复这个默认值，而不是把它固化下来。
-* **`restart()` 标记只在启动生效的字段。** 编辑仍然持久化；行上带 `restart`
-  标记，`on_settings_changed` 是唯一能即时应用它的机会。凡是喂给启动时只构建
-  一次的东西（监听地址、协议选择），都该这样声明。
+* **`restart()` 标记只在启动生效的字段。** 编辑仍然持久化；行上带 `⟲` 标记、
+  帮助栏补一句 `restart to apply`，但宿主会**跳过 `on_settings_changed`**——
+  当前会话保持启动时读到的值。凡是喂给启动时只构建一次的东西（监听地址、协议
+  选择），都该这样声明。
 
 内置 `tps` 插件（[tps.rs](../../src/plugins/builtin/tps.rs)）是参考实现：一个开
 关，写进 `[plugins.tps] enabled`，并且即时应用，所以不重启也能打开计量器。它
