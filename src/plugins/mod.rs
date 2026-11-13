@@ -54,6 +54,10 @@ pub use cst_plugin_api::plugin::{
     Plugin, PluginBridge, PluginContext, PluginEffect, PluginError, PluginInfo, PluginTask,
     ReportBlock, ReportEntry, ReportGroup, RequestFacts,
 };
+pub use cst_plugin_api::prompt::{
+    PromptAnswer, PromptAnswerKind, PromptForm, PromptHost, PromptOption, PromptQuestion,
+    PromptResponse,
+};
 pub use cst_plugin_api::status::{StatusSegment, StatusTone};
 pub use builtin::BUILTIN_PLUGINS;
 
@@ -137,6 +141,10 @@ pub struct PluginHost {
     /// Cancellation for every spawned plugin task. The front-end cancels it
     /// on exit; tasks are expected to watch it and end promptly.
     cancel: CancellationToken,
+    /// The front-end's prompt service, once installed
+    /// ([`PluginHost::install_prompt_host`]). Tool plugins that ask the user a
+    /// question keep this handle.
+    prompt_host: Mutex<Option<Arc<dyn PromptHost>>>,
 }
 
 impl PluginHost {
@@ -224,6 +232,7 @@ impl PluginHost {
             effects_sink,
             effects_rx,
             cancel: CancellationToken::new(),
+            prompt_host: Mutex::new(None),
         })
     }
 
@@ -554,6 +563,20 @@ impl PluginHost {
             .lock()
             .expect("plugin effects receiver lock")
             .take()
+    }
+
+    /// Install the front-end's prompt service and hand it to every plugin.
+    ///
+    /// Called once at startup, before the first turn: a plugin's tool can then
+    /// put a structured question to the user and block on the answer. A
+    /// front-end without one (a headless runner, a test) simply never calls
+    /// this, and a plugin that asks gets `None` back — the guidance path, not
+    /// a failure.
+    pub fn install_prompt_host(&self, host: Arc<dyn PromptHost>) {
+        *self.prompt_host.lock().expect("plugin prompt host lock") = Some(host.clone());
+        for plugin in &self.plugins {
+            plugin.set_prompt_host(host.clone());
+        }
     }
 
     /// The token that cancels every spawned plugin task. The front-end

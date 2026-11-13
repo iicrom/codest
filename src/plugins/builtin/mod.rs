@@ -4,6 +4,7 @@
 //! registry below is the single place that decides what is compiled in and in
 //! which order hooks run.
 
+mod ask_user;
 mod clear;
 // `continue` is a keyword; the raw identifier keeps the file named after the
 // command like every other plugin here.
@@ -16,6 +17,7 @@ mod tps;
 
 use crate::plugins::Plugin;
 
+pub use ask_user::ASK_USER;
 pub use clear::CLEAR;
 pub use help::HELP;
 pub use r#continue::CONTINUE;
@@ -40,6 +42,7 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &status::STATUS,
     &r#continue::CONTINUE,
     &tps::TPS,
+    &ask_user::ASK_USER,
     &tools::SHELL,
     &tools::FS,
 ];
