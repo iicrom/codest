@@ -164,6 +164,54 @@ pub fn resolve_session_header<'a>(
     }
 }
 
+/// Per-plugin settings from `config.toml`'s `[plugins."<id>"]` table.
+///
+/// The host interprets no plugin key — the whole table is the plugin's
+/// pocket, exactly like [`ProviderInstance::options`] is a protocol's. A
+/// plugin reads its pocket through
+/// [`crate::plugin::PluginContext::plugin_settings`] using the typed readers
+/// below; anything richer stays available as raw JSON.
+///
+/// ```toml
+/// [plugins.tps]
+/// enabled = true
+/// window_ms = 500
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginSettings {
+    /// The table as parsed TOML converted to JSON values (datetimes become
+    /// their RFC 3339 text, like [`ProviderInstance::options`]).
+    pub options: serde_json::Map<String, Value>,
+}
+
+impl<'de> Deserialize<'de> for PluginSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self {
+            options: toml_table_to_json_map(deserializer)?,
+        })
+    }
+}
+
+impl PluginSettings {
+    /// One entry as a string, or `None` when absent/not a string.
+    pub fn option_str(&self, key: &str) -> Option<&str> {
+        self.options.get(key).and_then(Value::as_str)
+    }
+
+    /// One entry as an unsigned integer.
+    pub fn option_u64(&self, key: &str) -> Option<u64> {
+        self.options.get(key).and_then(Value::as_u64)
+    }
+
+    /// One entry as a boolean.
+    pub fn option_bool(&self, key: &str) -> Option<bool> {
+        self.options.get(key).and_then(Value::as_bool)
+    }
+}
+
 /// One provider instance: an endpoint configuration bound to a protocol kind
 /// ([`ProviderInstance::protocol_id`]). This is pure config data — turning it
 /// into a client is the registry's job.
@@ -353,5 +401,26 @@ mod tests {
         )
         .expect_err("unknown keys must fail");
         assert!(error.to_string().contains("nonsense"));
+    }
+
+    #[test]
+    fn plugin_settings_are_a_free_form_pocket() {
+        // The whole `[plugins."<id>"]` table is the plugin's pocket: no
+        // nesting under `options`, no host-known keys to trip over.
+        let settings: PluginSettings = toml::from_str(
+            r#"
+            enabled = true
+            window_ms = 500
+            label = "wire"
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(settings.option_bool("enabled"), Some(true));
+        assert_eq!(settings.option_u64("window_ms"), Some(500));
+        assert_eq!(settings.option_str("label"), Some("wire"));
+        assert_eq!(settings.option_str("absent"), None);
+        // A mistyped scalar kind is not coerced, like provider options.
+        assert_eq!(settings.option_bool("window_ms"), None);
+        assert_eq!(PluginSettings::default().option_str("anything"), None);
     }
 }

@@ -74,6 +74,7 @@ use crate::core::NO_MODEL_SELECTED;
 use crate::core::Selection;
 use crate::core::SessionBootstrap;
 use crate::core::ToolSpec;
+use crate::core::config::StatusBarConfig;
 use crate::core::context_percent;
 use crate::core::format_context_usage;
 use crate::core::format_tokens;
@@ -84,6 +85,10 @@ use crate::core::rollout::LoadedSession;
 use crate::plugins::PluginEffect;
 use crate::plugins::PluginHost;
 use crate::plugins::PluginInfo;
+use crate::plugins::PluginOutput;
+use crate::plugins::PluginSettings;
+use crate::plugins::PluginTask;
+use crate::plugins::StatusTone;
 use crate::tui::RestoreMode;
 use crate::tui::TuiMode;
 use crate::tui::chat;
@@ -131,7 +136,9 @@ pub struct ProfileStartup {
 /// filter is already applied to `plugins`). Providers with models discovery
 /// enabled are refreshed in the background, best-effort: results arrive as
 /// transcript notices. `max_tool_rounds` is `config.toml`'s optional cap on a
-/// turn's tool rounds; `None` leaves the loop unbounded.
+/// turn's tool rounds; `None` leaves the loop unbounded. `status_bar` is the
+/// footer's `[status_bar]` table; `plugin_settings` the per-plugin
+/// `[plugins."<id>"]` pockets, already validated to name existing plugins.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     plugins: Arc<PluginHost>,
@@ -142,7 +149,23 @@ pub async fn run(
     restore: RestoreMode,
     profiles: ProfileStartup,
     max_tool_rounds: Option<usize>,
+    status_bar: StatusBarConfig,
+    plugin_settings: Vec<(String, PluginSettings)>,
 ) -> Result<()> {
+    // A settings pocket naming an unknown plugin id would silently configure
+    // nothing — the same discipline as a typo anywhere else in these files.
+    // The uninstall path is expected to clean the table up; the error says
+    // exactly which table to drop.
+    for (id, _) in &plugin_settings {
+        if !plugins.plugin_ids().contains(&id.as_str()) {
+            anyhow::bail!(
+                "config.toml [plugins.\"{id}\"] names an unknown plugin \
+                 (known: {}); remove the table or install the plugin",
+                plugins.plugin_ids().join(", ")
+            );
+        }
+    }
+
     // Created before setup so a partial setup still restores the terminal.
     let _guard = TerminalGuard { mode };
     let mut terminal = Some(setup_terminal(mode)?);
@@ -234,6 +257,11 @@ pub async fn run(
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
 
+    // The channel plugin background tasks send effects through; the host
+    // built it, this run drains it.
+    let plugin_effects = plugins
+        .take_effects_receiver()
+        .expect("the plugin host always creates its effect channel");
     let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel::<ProviderTask>();
     let model_label = selection
@@ -248,6 +276,7 @@ pub async fn run(
         notice_rx,
         provider_tx,
         provider_tasks,
+        plugin_effects,
         model_label,
         mode,
         plugins,
@@ -257,6 +286,8 @@ pub async fn run(
         profiles.set,
         active_profile,
         initial_effort,
+        status_bar,
+        plugin_settings,
     );
     // The tool set is per session, and the worker restores the adopted
     // session's set silently (no op ran, so no event comes back). Mirror it:
@@ -276,8 +307,12 @@ pub async fn run(
     if restore == RestoreMode::Picker {
         app.open_session_menu();
     }
-    let effects = app.plugins.startup(app.plugin_info());
-    app.apply_effects(effects);
+    let output = app.plugins.startup(app.plugin_info());
+    app.apply_output(output);
+    // Give every event subscriber a picture of the conversation it just
+    // joined: the snapshot arrives as an ordinary event, so monitors and
+    // metrics plugins see the restored transcript without any special path.
+    app.session.inspect_conversation();
 
     // Models discovery for every instance that asked for it. Failures are
     // notices, never errors: the declared models keep the menu usable. An
@@ -590,6 +625,21 @@ struct App {
     busy: bool,
     tick: usize,
     quit: bool,
+    /// Plugin status segments (`plugin:key` → segment), in registration
+    /// order. `[status_bar] order` decides display priority at render time.
+    status_segments: Vec<(String, crate::plugins::StatusSegment)>,
+    /// The footer's `[status_bar]` config: the master switch and the display
+    /// priority for plugin segments.
+    status_bar: StatusBarConfig,
+    /// Per-plugin settings from `config.toml`, handed to every hook through
+    /// [`PluginInfo::plugin_configs`].
+    plugin_settings: Vec<(String, PluginSettings)>,
+    /// Effects plugin background tasks sent through the host's bridge.
+    plugin_effects: tokio::sync::mpsc::UnboundedReceiver<PluginEffect>,
+    plugin_effects_closed: bool,
+    /// Handles of the tasks plugins spawned via `PluginContext::spawn`;
+    /// aborted on exit after the host's cancellation token fires.
+    plugin_tasks: Vec<tokio::task::JoinHandle<()>>,
     prompts: Vec<String>,
     prompt_index: Option<usize>,
     draft: String,
@@ -666,6 +716,17 @@ fn compact_value(value: &serde_json::Value) -> String {
     crate::tui::session::truncated(&text, 120)
 }
 
+/// A plugin segment's tone mapped onto the shared palette: `Dim` is the
+/// quiet default, `Accent` the highlight the state word gets while working,
+/// `Warn` the warning color.
+fn status_tone_style(tone: StatusTone) -> Style {
+    match tone {
+        StatusTone::Dim => Style::default().fg(theme::DIM),
+        StatusTone::Accent => Style::default().fg(theme::ACCENT),
+        StatusTone::Warn => Style::default().fg(theme::WARNING),
+    }
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -675,6 +736,7 @@ impl App {
         notices: tokio::sync::mpsc::UnboundedReceiver<String>,
         provider_tx: tokio::sync::mpsc::UnboundedSender<ProviderTask>,
         provider_tasks: tokio::sync::mpsc::UnboundedReceiver<ProviderTask>,
+        plugin_effects: tokio::sync::mpsc::UnboundedReceiver<PluginEffect>,
         model_label: String,
         mode: TuiMode,
         plugins: Arc<PluginHost>,
@@ -684,6 +746,8 @@ impl App {
         profiles: Arc<crate::core::config::ProfileSet>,
         active_profile: Option<String>,
         initial_effort: Option<Option<String>>,
+        status_bar: StatusBarConfig,
+        plugin_settings: Vec<(String, PluginSettings)>,
     ) -> Self {
         let (inline_columns, inline_rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let inline_height = inline_pane_height(inline_rows, 1, 0, 0);
@@ -747,6 +811,12 @@ impl App {
             busy: false,
             tick: 0,
             quit: false,
+            status_segments: Vec::new(),
+            status_bar,
+            plugin_settings,
+            plugin_effects,
+            plugin_effects_closed: false,
+            plugin_tasks: Vec::new(),
             prompts: Vec::new(),
             prompt_index: None,
             draft: String::new(),
@@ -840,11 +910,26 @@ impl App {
                         None => self.notices_closed = true,
                     }
                 }
+                maybe_effect = self.plugin_effects.recv(), if !self.plugin_effects_closed => {
+                    // What plugin background tasks send lands here, one
+                    // effect at a time, and applies through the same path as
+                    // synchronous dispatch output.
+                    match maybe_effect {
+                        Some(effect) => self.apply_effects(vec![effect]),
+                        None => self.plugin_effects_closed = true,
+                    }
+                }
                 _ = ticker.tick() => self.on_tick(),
             }
         }
 
         self.session.shutdown();
+        // A quit ends plugin work, not just the UI: give tasks the token,
+        // then sweep whatever did not watch it.
+        self.plugins.cancel_token().cancel();
+        for handle in self.plugin_tasks.drain(..) {
+            handle.abort();
+        }
         Ok(())
     }
 
@@ -1546,10 +1631,10 @@ impl App {
             "context" => return self.open_context_view(),
             _ => {}
         }
-        let effects = self
+        let output = self
             .plugins
             .dispatch_command(&invocation, self.plugin_info());
-        self.apply_effects(effects);
+        self.apply_output(output);
     }
 
     /// `/new`: archive the current session and start a fresh one. The view
@@ -2564,8 +2649,8 @@ impl App {
         view.follow = true;
         self.busy = true;
 
-        let effects = self.plugins.user_message(&text, self.plugin_info());
-        self.apply_effects(effects);
+        let output = self.plugins.user_message(&text, self.plugin_info());
+        self.apply_output(output);
 
         if !self.quit {
             self.session.submit_user_turn(text);
@@ -2606,6 +2691,7 @@ impl App {
                         )
                     })
                     .count(),
+            plugin_configs: &self.plugin_settings,
         }
     }
 
@@ -2673,8 +2759,57 @@ impl App {
                     self.busy = true;
                     self.session.continue_turn();
                 }
+                PluginEffect::SetStatus(segment) => {
+                    // Upsert by full `plugin:key`: a re-set segment replaces
+                    // its text and tone in place, so ordering by registration
+                    // is stable across updates.
+                    match self
+                        .status_segments
+                        .iter_mut()
+                        .find(|(key, _)| *key == segment.key)
+                    {
+                        Some(entry) => entry.1 = segment,
+                        None => self.status_segments.push((segment.key.clone(), segment)),
+                    }
+                }
+                PluginEffect::ClearStatus(key) => {
+                    self.status_segments.retain(|(existing, _)| existing != &key);
+                }
             }
         }
+    }
+
+    /// Apply one dispatch's output: start its background tasks, then apply
+    /// its effects. Tasks spawn here — the host is synchronous by contract —
+    /// and a task that panics surfaces as a transcript notice instead of
+    /// taking the UI loop down.
+    fn apply_output(&mut self, output: PluginOutput) {
+        for task in output.tasks {
+            self.spawn_plugin_task(task);
+        }
+        self.apply_effects(output.effects);
+    }
+
+    /// Start one plugin background task. The task's own cancellation is the
+    /// host's token (fired on exit); this wrapper turns an unexpected panic
+    /// into a transcript notice instead of a silently-dead task.
+    fn spawn_plugin_task(&mut self, task: PluginTask) {
+        let notices = self.notice_tx.clone();
+        let task = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task));
+        let handle = tokio::spawn(async move {
+            match task.await {
+                Ok(()) => {}
+                Err(panic) => {
+                    let detail = panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "panic".to_string());
+                    let _ = notices.send(format!("plugin task failed: {detail}"));
+                }
+            }
+        });
+        self.plugin_tasks.push(handle);
     }
 
     fn reset_input_navigation(&mut self) {
@@ -2707,6 +2842,13 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, event: crate::core::Event) {
+        // Subscribed plugins observe the event as it happened, before the
+        // view state moves on: the payload is the event itself, and
+        // `event.at` is the worker's emit stamp, so a meter sees the same
+        // ordering the transcript does. Effects and spawned tasks apply like
+        // any other dispatch.
+        let output = self.plugins.dispatch_event(&event, self.plugin_info());
+        self.apply_output(output);
         match event.msg {
             EventMsg::TurnStarted => {
                 self.busy = true;
@@ -2826,18 +2968,18 @@ impl App {
             EventMsg::TurnComplete => {
                 let message = self.view().live.clone().unwrap_or_default();
                 self.finalize_live();
-                let effects = self.plugins.turn_complete(&message, self.plugin_info());
+                let output = self.plugins.turn_complete(&message, self.plugin_info());
                 self.busy = false;
                 self.last_ctrl_c = None;
-                self.apply_effects(effects);
+                self.apply_output(output);
             }
             EventMsg::ConversationCleared => {
                 // The TUI already reset its transcript synchronously when
                 // `/clear` ran; this confirms the core also dropped the
                 // context and lets plugins observe the reset.
                 self.context_view = None;
-                let effects = self.plugins.conversation_cleared(self.plugin_info());
-                self.apply_effects(effects);
+                let output = self.plugins.conversation_cleared(self.plugin_info());
+                self.apply_output(output);
             }
             EventMsg::SessionStarted { .. } | EventMsg::SessionSwitched { .. } => {
                 // `/new` and the session picker already applied their view
@@ -2845,6 +2987,10 @@ impl App {
                 // the rollout file) did the same. A viewer open across the
                 // switch would show the wrong session's context.
                 self.context_view = None;
+                // The event subscribers just saw a session boundary: re-send
+                // the snapshot so monitors and metrics follow the new
+                // conversation without replaying anything.
+                self.session.inspect_conversation();
             }
             EventMsg::SessionRenamed { .. } => {
                 // `/rename` already applied its view change synchronously;
@@ -2862,6 +3008,28 @@ impl App {
                 self.quit = true;
             }
         }
+    }
+
+    /// The plugin segments to render, in display priority: `[status_bar]
+    /// order` first, then everything else in registration order. Empty when
+    /// `plugin_segments = false`.
+    fn ordered_status_segments(&self) -> Vec<&crate::plugins::StatusSegment> {
+        if !self.status_bar.plugin_segments {
+            return Vec::new();
+        }
+        let mut remaining: Vec<&crate::plugins::StatusSegment> = self
+            .status_segments
+            .iter()
+            .map(|(_, segment)| segment)
+            .collect();
+        let mut ordered = Vec::with_capacity(remaining.len());
+        for key in &self.status_bar.order {
+            if let Some(position) = remaining.iter().position(|segment| &segment.key == key) {
+                ordered.push(remaining.remove(position));
+            }
+        }
+        ordered.extend(remaining);
+        ordered
     }
 
     /// Turn a still-running tool card into a settled error card so an
@@ -3364,12 +3532,37 @@ impl App {
 
         let effort_label = self.effort.as_deref().unwrap_or(reasoning::EFFORT_OFF);
         let (context, context_warn) = self.context_segment();
-        // The left side (label · state) wins: on a narrow terminal the right
-        // hint is what degrades, never the state word.
-        let left_plain = format!(
-            " codest · {} · effort {effort_label} · {context}  │  {state}",
+
+        // Plugin segments sit between the context readout and the state
+        // separator, in `[status_bar]` priority order. The existing priority
+        // holds: the left side (label · state) wins on a narrow terminal,
+        // and the right-hand hint is already the line that degrades — plugin
+        // segments take what is left before the hint, then drop from their
+        // own tail once they stop fitting.
+        let base_plain = format!(
+            " codest · {} · effort {effort_label} · {context}",
             self.model_label
         );
+        let state_width = display_width(&format!("  │  {state}")) as u16 + 1;
+        let mut segment_budget =
+            area.width.saturating_sub(display_width(&base_plain) as u16 + state_width);
+        let mut chosen: Vec<&crate::plugins::StatusSegment> = Vec::new();
+        for segment in self.ordered_status_segments() {
+            // " · " joins each plugin segment to the host's own readouts.
+            let width = display_width(&segment.text) as u16 + 3;
+            if width > segment_budget {
+                break;
+            }
+            segment_budget -= width;
+            chosen.push(segment);
+        }
+        let plugin_plain: String = chosen
+            .iter()
+            .map(|segment| format!(" · {}", segment.text))
+            .collect();
+        // The left side wins: on a narrow terminal the right
+        // hint is what degrades, never the state word.
+        let left_plain = format!("{base_plain}{plugin_plain}  │  {state}");
         let left_width = (display_width(&left_plain) as u16 + 1).min(area.width);
         let hint_width =
             (display_width(hints) as u16 + 1).min(area.width.saturating_sub(left_width));
@@ -3401,6 +3594,12 @@ impl App {
                 }),
             ),
         ];
+        for segment in &chosen {
+            left.push(Span::styled(
+                format!(" · {}", segment.text),
+                status_tone_style(segment.tone),
+            ));
+        }
         left.push(Span::styled("  │  ", Style::default().fg(theme::DIM)));
         left.push(Span::styled(
             state,
@@ -4079,6 +4278,7 @@ mod tests {
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4086,6 +4286,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
+
+            plugin_effects,
             "test/one".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
@@ -4095,6 +4297,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4110,6 +4314,7 @@ mod tests {
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4117,6 +4322,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
+
+            plugin_effects,
             "test/one".to_string(),
             TuiMode::Fullscreen,
             plugins,
@@ -4126,6 +4333,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4144,6 +4353,7 @@ mod tests {
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4151,6 +4361,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
+
+            plugin_effects,
             "test/one".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
@@ -4160,6 +4372,8 @@ mod tests {
             Arc::new(profiles),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4194,6 +4408,7 @@ mod tests {
         .expect("partial selection resolves (gated at send, not spawn)");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4201,7 +4416,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-            "openai/m1".to_string(),
+
+            plugin_effects,            "openai/m1".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -4210,6 +4426,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4247,6 +4465,7 @@ mod tests {
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4254,7 +4473,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-            "test/one".to_string(),
+
+            plugin_effects,            "test/one".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -4263,6 +4483,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4299,6 +4521,7 @@ mod tests {
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4306,7 +4529,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-            "test/one".to_string(),
+
+            plugin_effects,            "test/one".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -4315,6 +4539,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4372,6 +4598,7 @@ mod tests {
         .expect("empty route spawns");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4379,7 +4606,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-            "no model".to_string(),
+
+            plugin_effects,            "no model".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -4388,6 +4616,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4405,6 +4635,7 @@ mod tests {
         .expect("empty route spawns");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             session,
             pool,
@@ -4412,7 +4643,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-            "no model".to_string(),
+
+            plugin_effects,            "no model".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -4421,6 +4653,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -4690,9 +4924,9 @@ mod tests {
 
         // Moving the selection pages the window onto the tail; the longest
         // command name still gets a separating space before its summary.
-        // (Eleven presses put the selection on the /resume alias; /continue
-        // sits between /status and /new.)
-        for _ in 0..11 {
+        // (Twelve presses put the selection on the /resume alias; /tps sits
+        // between /continue and the shipped commands.)
+        for _ in 0..12 {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let lines = render_lines(&mut app, 110, 20);
@@ -5099,6 +5333,78 @@ mod tests {
         assert_eq!(app.view().last_usage, Some((1_000, 200)));
         assert_eq!(app.view().total_input, 1_000);
         assert_eq!(app.view().total_output, 200);
+    }
+
+    #[tokio::test]
+    async fn plugin_status_segments_render_between_context_and_state() {
+        let mut app = test_app();
+        let set = |key: &str, text: &str| {
+            PluginEffect::SetStatus(crate::plugins::StatusSegment {
+                key: key.to_string(),
+                text: text.to_string(),
+                tone: crate::plugins::StatusTone::Accent,
+            })
+        };
+        app.apply_effects(vec![set("tps:rate", "42 t/s")]);
+        let footer = render_lines(&mut app, 110, 20)
+            .pop()
+            .expect("footer line");
+        assert!(footer.contains("42 t/s"), "{footer}");
+        assert!(footer.contains("· 42 t/s  │  ready"), "{footer}");
+
+        // A re-set key upserts in place rather than appending a duplicate.
+        app.apply_effects(vec![set("tps:rate", "7.5 t/s")]);
+        let footer = render_lines(&mut app, 110, 20).pop().expect("footer");
+        assert!(footer.contains("· 7.5 t/s  │"), "{footer}");
+        assert!(!footer.contains("42 t/s"), "{footer}");
+
+        // ClearStatus removes the segment and its separator with it.
+        app.apply_effects(vec![PluginEffect::ClearStatus("tps:rate".to_string())]);
+        let footer = render_lines(&mut app, 110, 20).pop().expect("footer");
+        assert!(!footer.contains("t/s"), "{footer}");
+    }
+
+    #[tokio::test]
+    async fn status_bar_order_reorders_plugin_segments() {
+        let mut app = test_app();
+        let set = |key: &str, text: &str| {
+            PluginEffect::SetStatus(crate::plugins::StatusSegment {
+                key: key.to_string(),
+                text: text.to_string(),
+                tone: crate::plugins::StatusTone::Dim,
+            })
+        };
+        app.apply_effects(vec![set("a:first", "AAA"), set("b:second", "BBB")]);
+        // Registration order by default.
+        let footer = render_lines(&mut app, 110, 20).pop().expect("footer");
+        let (first, second) = (
+            footer.find("AAA").expect("AAA"),
+            footer.find("BBB").expect("BBB"),
+        );
+        assert!(first < second, "{footer}");
+
+        // `[status_bar] order` flips the display priority.
+        app.status_bar.order = vec!["b:second".to_string(), "a:first".to_string()];
+        let footer = render_lines(&mut app, 110, 20).pop().expect("footer");
+        let (first, second) = (
+            footer.find("AAA").expect("AAA"),
+            footer.find("BBB").expect("BBB"),
+        );
+        assert!(second < first, "{footer}");
+    }
+
+    #[tokio::test]
+    async fn status_bar_plugin_segments_can_be_turned_off() {
+        let mut app = test_app();
+        app.apply_effects(vec![PluginEffect::SetStatus(crate::plugins::StatusSegment {
+            key: "tps:rate".to_string(),
+            text: "42 t/s".to_string(),
+            tone: crate::plugins::StatusTone::Dim,
+        })]);
+        app.status_bar.plugin_segments = false;
+        let footer = render_lines(&mut app, 110, 20).pop().expect("footer");
+        assert!(!footer.contains("42 t/s"), "{footer}");
+        assert!(footer.contains("│  ready"), "{footer}");
     }
 
     #[tokio::test]
@@ -5950,8 +6256,8 @@ mod tests {
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            19,
-            "fifteen commands plus four aliases"
+            20,
+            "sixteen commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -5998,9 +6304,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 18);
+        assert_eq!(app.command_selection, 19);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 17);
+        assert_eq!(app.command_selection, 18);
     }
 
     #[tokio::test]
@@ -6410,6 +6716,7 @@ mod tests {
         .expect("initial selection resolves");
         let (notice_tx, notice_rx) = tokio::sync::mpsc::unbounded_channel();
         let (provider_tx, provider_tasks) = tokio::sync::mpsc::unbounded_channel();
+        let (_plugin_effect_tx, plugin_effects) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             session,
             pool,
@@ -6417,6 +6724,7 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
+            plugin_effects,
             "test/one".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
@@ -6426,6 +6734,8 @@ mod tests {
             SessionBootstrap::empty_profiles(),
             None,
             None,
+            StatusBarConfig::default(),
+            Vec::new(),
         );
         app.provider_wizard = Some(crate::tui::provider_wizard::Wizard {
             step: crate::tui::provider_wizard::Step::AddConfirm,

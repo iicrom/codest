@@ -13,15 +13,29 @@
 //!   └──────────── PluginEffect (data) ───────────┘
 //! ```
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::SignInFuture;
 use crate::auth::SignInNotifier;
 use crate::commands::CommandSpec;
 use crate::commands::Invocation;
+use crate::config::PluginSettings;
+use crate::event::EventSubscription;
+use crate::event::PluginEvent;
 use crate::providers::ProtocolFactory;
+use crate::status::StatusSegment;
 use crate::tools::ToolCall;
 use crate::tools::ToolSpec;
+
+/// A background task a plugin handed to the host via
+/// [`PluginContext::spawn`]. The host drives it on its own runtime and
+/// cancels it on exit; a long-lived task should watch
+/// [`PluginBridge::cancelled`] and end when it fires.
+pub type PluginTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// One compile-time extension.
 ///
@@ -118,6 +132,24 @@ pub trait Plugin: Sync {
     /// Called after the core confirms that the conversation was cleared.
     fn on_conversation_cleared(&self, _ctx: &mut PluginContext<'_>) {}
 
+    /// Which event categories this plugin wants on [`Plugin::on_event`].
+    ///
+    /// The default subscribes to nothing: the host filters before dispatching,
+    /// so an uninterested plugin never sees a copy of a stream delta. Declare
+    /// the narrowest set that serves the plugin — `DELTAS` events arrive once
+    /// per streamed chunk.
+    fn subscriptions(&self) -> EventSubscription {
+        EventSubscription::NONE
+    }
+
+    /// Called for every core event in a subscribed category, in emit order.
+    ///
+    /// `event.at` is the host's monotonic emit stamp; payload borrows end
+    /// when the dispatch returns, so a plugin that must keep a delta copies
+    /// it. Effects collected here (transcript cells, status segments, spawned
+    /// tasks) apply like any other hook's — see [`PluginContext`].
+    fn on_event(&self, _event: &PluginEvent<'_>, _ctx: &mut PluginContext<'_>) {}
+
     /// Handle one invocation. Returning `Err` becomes a visible error effect;
     /// returning `Ok` with no effects is a silent no-op.
     fn run_command(
@@ -158,6 +190,15 @@ pub enum PluginEffect {
     /// the recovery path for an interrupted turn. Honored only while the
     /// agent is idle and a model is usable.
     ContinueTurn,
+    /// Set or replace one status-bar segment. `segment.key` is already the
+    /// full `plugin:key` id — the [`PluginContext`] and [`PluginBridge`]
+    /// helpers resolve the prefix, so effects always carry the scoped form.
+    /// The host owns layout and truncation; a segment that no longer fits is
+    /// dropped, not drawn over its neighbors.
+    SetStatus(StatusSegment),
+    /// Remove one status-bar segment by its full `plugin:key` id. Removing
+    /// an absent key is a no-op.
+    ClearStatus(String),
 }
 
 /// A plugin-authored report (e.g. `/context`): a bold title over titled
@@ -242,25 +283,51 @@ pub struct PluginInfo<'a> {
     /// Approximate message count of the active session's conversation: the
     /// system prompt plus one entry per user/assistant/tool transcript cell.
     pub message_count: usize,
+    /// This run's per-plugin settings, parsed from `config.toml`'s
+    /// `[plugins."<id>"]` tables, in table order. The host interprets no
+    /// plugin key; a plugin reads its own pocket through
+    /// [`PluginContext::plugin_settings`].
+    pub plugin_configs: &'a [(String, PluginSettings)],
 }
 
 /// Mutable context handed to a plugin while it runs.
 ///
 /// The context exposes read-only session facts and collects effects. It never
-/// gives the plugin direct access to the terminal or the agent worker.
+/// gives the plugin direct access to the terminal or the agent worker. One
+/// context serves one plugin: `plugin_id` scopes the status-bar helpers, and
+/// `plugin_settings` is that plugin's own `[plugins."<id>"]` pocket.
 pub struct PluginContext<'a> {
     table: &'a crate::commands::CommandTable,
     info: PluginInfo<'a>,
+    plugin_id: &'static str,
+    settings: Option<&'a PluginSettings>,
+    bridge: PluginBridge,
     effects: Vec<PluginEffect>,
+    tasks: Vec<PluginTask>,
 }
 
 impl<'a> PluginContext<'a> {
     /// Build a context. The host calls this; plugins only ever receive one.
-    pub fn new(table: &'a crate::commands::CommandTable, info: PluginInfo<'a>) -> Self {
+    /// `settings` is resolved from `info.plugin_configs` by `plugin_id`.
+    pub fn new(
+        table: &'a crate::commands::CommandTable,
+        info: PluginInfo<'a>,
+        plugin_id: &'static str,
+        bridge: PluginBridge,
+    ) -> Self {
+        let settings = info
+            .plugin_configs
+            .iter()
+            .find(|(id, _)| id == plugin_id)
+            .map(|(_, settings)| settings);
         Self {
             table,
             info,
+            plugin_id,
+            settings,
+            bridge,
             effects: Vec::new(),
+            tasks: Vec::new(),
         }
     }
 
@@ -372,9 +439,142 @@ impl<'a> PluginContext<'a> {
         self.effects.push(PluginEffect::ContinueTurn);
     }
 
-    /// Take the collected effects. The host calls this after dispatch.
+    /// This plugin's stable id — useful for attributing diagnostics.
+    pub fn plugin_id(&self) -> &'static str {
+        self.plugin_id
+    }
+
+    /// This plugin's own settings from `config.toml`'s `[plugins."<id>"]`
+    /// table, when the user declared one. The host interprets none of the
+    /// keys; see [`PluginSettings`].
+    pub fn plugin_settings(&self) -> Option<&'a PluginSettings> {
+        self.settings
+    }
+
+    /// A handle background tasks can use after this dispatch returns. Clone
+    /// it into a [`PluginContext::spawn`] future to keep sending effects from
+    /// there.
+    pub fn bridge(&self) -> PluginBridge {
+        self.bridge.clone()
+    }
+
+    /// Set or replace one status-bar segment. `segment.key` is the
+    /// plugin-local key (`"rate"`); the stored full key becomes
+    /// `plugin_id:key`.
+    pub fn set_status(&mut self, segment: StatusSegment) {
+        self.effects
+            .push(PluginEffect::SetStatus(self.scope_segment(segment)));
+    }
+
+    /// Remove one of this plugin's status-bar segments, by its plugin-local
+    /// key. Removing an absent segment is a no-op.
+    pub fn clear_status(&mut self, key: &str) {
+        self.effects
+            .push(PluginEffect::ClearStatus(self.scope_key(key)));
+    }
+
+    /// Hand a background task to the host. The task outlives this dispatch:
+    /// the host spawns it on its own runtime, cancels it on exit, and applies
+    /// whatever it sends through [`PluginContext::bridge`]. A long-lived task
+    /// (a monitor server, a refresh loop) should select on
+    /// [`PluginBridge::cancelled`] so a quit ends it promptly.
+    pub fn spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) {
+        self.tasks.push(Box::pin(task));
+    }
+
+    /// Prefix a segment's local key with this plugin's id.
+    fn scope_segment(&self, mut segment: StatusSegment) -> StatusSegment {
+        segment.key = self.scope_key(&segment.key);
+        segment
+    }
+
+    /// The full `plugin:key` id for a plugin-local key.
+    fn scope_key(&self, key: &str) -> String {
+        format!("{}:{key}", self.plugin_id)
+    }
+
+    /// Take the collected effects and spawned tasks. The host calls this
+    /// after dispatch.
+    pub fn into_parts(self) -> (Vec<PluginEffect>, Vec<PluginTask>) {
+        (self.effects, self.tasks)
+    }
+
+    /// Take the collected effects, dropping any spawned tasks. Prefer
+    /// [`PluginContext::into_parts`] — the host must forward tasks for them
+    /// to run.
     pub fn into_effects(self) -> Vec<PluginEffect> {
         self.effects
+    }
+}
+
+/// A cheap, clonable handle for a plugin's background tasks.
+///
+/// A task spawned through [`PluginContext::spawn`] outlives the dispatch that
+/// created it, so it cannot borrow the (single-use, `&mut`) context. The
+/// bridge is what it keeps instead: an effect sink scoped to the plugin, and
+/// the host's cancellation token. Sends land on the host's effect channel
+/// and are applied like any other effect.
+#[derive(Clone)]
+pub struct PluginBridge {
+    sink: Arc<dyn Fn(PluginEffect) + Send + Sync>,
+    owner: &'static str,
+    cancel: CancellationToken,
+}
+
+impl PluginBridge {
+    /// Build a bridge from a sink and the host's cancellation token. The host
+    /// calls this; plugins receive clones from
+    /// [`PluginContext::bridge`].
+    pub fn new(
+        owner: &'static str,
+        cancel: CancellationToken,
+        sink: Arc<dyn Fn(PluginEffect) + Send + Sync>,
+    ) -> Self {
+        Self { sink, owner, cancel }
+    }
+
+    /// Send one effect from a background task. Transcript-cell effects append
+    /// to the active session's view; status segments upsert by key.
+    pub fn send(&self, effect: PluginEffect) {
+        (self.sink)(effect);
+    }
+
+    /// Set or replace one status-bar segment from a background task.
+    /// `segment.key` is the plugin-local key.
+    pub fn set_status(&self, mut segment: StatusSegment) {
+        segment.key = self.scope_key(&segment.key);
+        self.send(PluginEffect::SetStatus(segment));
+    }
+
+    /// Remove one status-bar segment from a background task, by its
+    /// plugin-local key.
+    pub fn clear_status(&self, key: &str) {
+        self.send(PluginEffect::ClearStatus(self.scope_key(key)));
+    }
+
+    /// Append a transcript notice from a background task.
+    pub fn notice(&self, text: impl Into<String>) {
+        self.send(PluginEffect::Notice(text.into()));
+    }
+
+    /// The token the host cancels on exit. A long-lived task should select on
+    /// this so a quit ends it promptly — cancellation is cooperative, and the
+    /// host's final `abort` is not graceful.
+    pub fn cancelled(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// The full `plugin:key` id for a plugin-local key.
+    fn scope_key(&self, key: &str) -> String {
+        format!("{}:{key}", self.owner)
+    }
+}
+
+impl std::fmt::Debug for PluginBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginBridge")
+            .field("owner", &self.owner)
+            .finish()
     }
 }
 

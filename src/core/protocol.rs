@@ -168,11 +168,20 @@ pub struct Submission {
 pub struct Event {
     pub id: String,
     pub msg: EventMsg,
+    /// The worker's monotonic emit time, stamped once here in `Event::new`
+    /// so every emit site gets a consistent clock without touching them.
+    /// Forwarded to plugins as `PluginEvent::at`; a throughput meter or a
+    /// monitor's batching derives its timing from it.
+    pub at: std::time::Instant,
 }
 
 impl Event {
     pub fn new(id: impl Into<String>, msg: EventMsg) -> Self {
-        Self { id: id.into(), msg }
+        Self {
+            id: id.into(),
+            msg,
+            at: std::time::Instant::now(),
+        }
     }
 }
 

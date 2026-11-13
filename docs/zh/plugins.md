@@ -20,6 +20,9 @@ core、不碰终端：`/help`、`/clear`、`/quit`、`/status`、`/continue` 以
 | 工具 | `tools()` + `run_tool()` | 模型可调用的能力（`bash`、`read`…） |
 | 协议工厂 | `protocols()` | 给 `providers.toml` 实例接新线协议 |
 | 登录入口 | `auth_providers()` / `auth_status()` / `begin_sign_in()` | `/provider` 后面的浏览器/PAT 登录 |
+| 事件流 | `subscriptions()` + `on_event()` | 计量器、监控端、对 agent 运行的响应 |
+| 状态栏分段 | `ctx.set_status()` / `ctx.clear_status()` | 页脚读数（`tps:rate`、时钟、倒计时） |
+| 后台任务 | `ctx.spawn(future)` + `ctx.bridge()` | 长驻工作：监控服务器、刷新循环 |
 
 插件是**编译期静态**的：插件是一个带 `static` 值的 `struct`，注册在一个
 `static` 切片里。运行时没有任何发现或加载——注册表就是一个可读的数组。收益
@@ -48,6 +51,8 @@ trait 及其交换的数据都在契约 crate
 | `auth_status(&str)` | 实例名 | `AuthStatus` | `Unsupported` |
 | `begin_sign_in(...)` | 实例、方法、secret、notifier、取消 token | `Option<SignInFuture>` | `None` |
 | `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` | `&mut PluginContext` | — | 无操作 |
+| `subscriptions()` | — | `EventSubscription` | `NONE` |
+| `on_event(&PluginEvent, &mut PluginContext)` | 单个核心事件 + 上下文 | — | 无操作 |
 | `run_command(&Invocation, &mut PluginContext)` | 解析后的命令 + 参数 | `Result<(), PluginError>` | 报错 |
 
 插件以 `&'static dyn Plugin` 共享，所以全部方法只拿 `&self`；有状态的插件用
@@ -70,6 +75,8 @@ trait 及其交换的数据都在契约 crate
 | `SetComposer(String)` | `ctx.set_composer(text)` | 替换输入框内容 |
 | `SubmitUserTurn(String)` | `ctx.submit_user_turn(text)` | 提交一轮用户消息——仅空闲时生效 |
 | `ContinueTurn` | `ctx.continue_turn()` | 不追加新消息、直接驱动当前 transcript（`/continue`）——仅空闲时生效 |
+| `SetStatus(StatusSegment)` | `ctx.set_status(segment)` | 按键 upsert 一个页脚分段（`plugin:key`） |
+| `ClearStatus(key)` | `ctx.clear_status(key)` | 移除一个页脚分段 |
 
 副作用按插件顺序收集、按同一顺序应用。受空闲门控的效果让递归不可能：
 `on_user_message` 在 `busy` 置位之后运行，`on_turn_complete` 在其清除之前
@@ -95,7 +102,7 @@ transcript 显示一行失败（工具）；注册表层面的问题是启动错
 ```rust
 pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &help::HELP, &clear::CLEAR, &quit::QUIT, &status::STATUS,
-    &r#continue::CONTINUE, &tools::BASH, &tools::FS,
+    &r#continue::CONTINUE, &tps::TPS, &tools::BASH, &tools::FS,
 ];
 ```
 
@@ -109,6 +116,7 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
 | `quit` | `/quit`（`/exit`） | 请求 `Quit` |
 | `status` | `/status` | backend、模式、transcript 大小、上下文用量、token 合计、插件列表 |
 | `continue` | `/continue` | 请求 `ContinueTurn`——恢复被打断的回合 |
+| `tps` | `/tps` | 页脚的实时 tokens-per-second 计量（默认关闭） |
 | `bash` | `bash` 工具 + 提示词段落 | 执行一条 shell 命令 |
 | `fs` | `read`、`write`、`edit` 工具 | 文件操作 |
 
@@ -231,7 +239,146 @@ cargo clippy --all-targets -- -D warnings
 原始 JSON-Schema 文本，这样它能放进 `const`。状态放在 `Mutex` 里，与内置
 插件一样走内部可变性。
 
-## 6. 设计笔记
+## 6. 观测 agent：事件流、状态栏分段、后台任务
+
+四个生命周期钩子覆盖了回合边界。响应式插件需要的其余能力由三个原语承担，
+而且每一个都是有意做成通用形态：它们的存在是为了撑起一**族**插件，而不是
+每来一个想法就给宿主加一条 API。
+
+### 事件流
+
+声明想要的类别，然后实现一个钩子：
+
+```rust
+use crate::plugins::{
+    DeltaKind, EventSubscription, Plugin, PluginContext, PluginEvent, PluginEventKind,
+};
+
+impl Plugin for MyMeter {
+    fn id(&self) -> &'static str {
+        "my-meter"
+    }
+
+    fn subscriptions(&self) -> EventSubscription {
+        EventSubscription::DELTAS
+            .union(EventSubscription::USAGE)
+            .union(EventSubscription::LIFECYCLE)
+    }
+
+    fn on_event(&self, event: &PluginEvent<'_>, ctx: &mut PluginContext<'_>) {
+        match event.kind {
+            // `event.at` 是宿主的单调发射时间戳。
+            PluginEventKind::MessageDelta { kind: DeltaKind::Text, text, .. } => {
+                let _ = (text, ctx);
+            }
+            // 后端上报的真实 token 数。
+            PluginEventKind::TurnUsage { output, .. } => {
+                let _ = output;
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+类别：`LIFECYCLE`（回合开始/落定/中止/结束、错误、清空、关闭）、
+`DELTAS`（正文与思考的流式增量）、`USAGE`（每轮与每回合的 token 数）、
+`TOOLS`（工具调用生命周期，含耗时）、`SESSION`（会话/模型/effort/profile/
+工具集切换）、`SNAPSHOT`（完整会话快照）。未订阅的类别零开销：宿主在派发
+前就完成过滤，只要回合边界的插件永远不会收到一份流式增量的拷贝。
+
+两个事实让这条流"可计量"：
+
+* **`event.at` 是宿主的单调发射时间戳**，在 `Event::new` 里统一打点——
+  吞吐计量器据此取时钟，而不是靠到达顺序去猜。
+* **`SNAPSHOT` 事件携带完整会话**——宿主在插件启动时和每次会话切换后都会
+  向 worker 索取一份，监控端可以从中途接入而无需重放历史。"拿不准就重新
+  快照"就是预期的恢复策略，与参考监控端一致。
+
+载荷是从事件借用来的；插件想留存增量就自己拷贝。四个生命周期钩子原样
+保留——`on_event` 是它们的超集，内置的 `tps` 插件
+（[tps.rs](../../src/plugins/builtin/tps.rs)）是参考实现：delta 做 live
+估算、usage 事件做修正、每回合落一个样本喂给空闲时的 sparkline。
+
+它的上报契约值得照抄，因为那是页脚读数的一般规则，而不是 tps 的细节：
+
+* **实时值随回合退场。** `tps:rate` 在 `TurnComplete` 时清除；冻结的数字
+  会声称 agent 还在流式输出。
+* **sparkline 是形态，不是数字。** 从第二个样本起才出现（单样本不成趋势），
+  且不带任何数字；数值读数归 live rate 管。
+* **会话边界清空计量。** `SessionStarted`、`SessionSwitched`、
+  `ConversationCleared` 都丢弃历史——吞吐量必须描述屏幕上这段对话。
+  `enabled` 开关保留，所以切换会话后计量继续运行。
+* **一个回合的 token 按轮求和。** `TurnUsage` 只带最后一轮，而 decode span
+  覆盖所有轮；计量器把每轮的 `RoundUsage` 存下来，后端不报分轮用量时再退回
+  `TurnUsage`。
+
+### 状态栏分段
+
+插件提交**数据**，像素归宿主：`ctx.set_status(StatusSegment::new("rate",
+"42 t/s"))` 会按键 upsert 存储为 `tps:rate` 的分段（`plugin:key` 完整键由
+插件 id 解析），`ctx.clear_status("rate")` 移除它。色调——`Dim`、`Accent`、
+`Warn`——映射到宿主调色板。没有任意绘制，这是有意的（见第 7 节）。分段
+渲染在上下文读数与状态词之间，优先级由用户配置：
+
+```toml
+[status_bar]
+plugin_segments = false             # 总开关（默认开启）
+order = ["tps:rate", "tps:spark"]   # 显示优先级，从左到右
+```
+
+未列出的分段保持注册顺序；当前没有东西在显示的键会被忽略，所以过期的条目
+没有代价。窄终端上，本就是最低优先级的右侧提示先退化，随后插件分段按自身
+尾部顺序丢弃，宿主自己的读数与状态词永远不动。页脚每 90 ms 重绘一次，所以
+插件一设置新文本，分段立即动起来——倒计时和仪表不需要宿主任何改动。
+
+### 后台任务与插件配置口袋
+
+`ctx.spawn(future)` 把任务交给宿主的运行时：它活得比派发更久，它发出的
+副作用经插件的 bridge 到达 UI，宿主在退出时统一取消。future 里只留一个
+`PluginBridge`——可克隆的副作用出口加取消 token：
+
+```rust
+fn on_startup(&self, ctx: &mut PluginContext<'_>) {
+    let bridge = ctx.bridge();
+    ctx.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+                    bridge.set_status(StatusSegment::new("clock", local_time()));
+                }
+                _ = bridge.cancelled() => break, // 合作式关闭
+            }
+        }
+    });
+}
+```
+
+长驻任务必须监听 `bridge.cancelled()`——取消是合作式的，宿主在其后的
+`abort` 清扫并不优雅。任务 panic 会变成一条 transcript 通知，不会带倒 UI
+循环。这就是同步钩子做不了的慢工作的正门：监控端的 WebSocket 服务器、
+刷新循环、看门狗。
+
+配置来自 `config.toml` 的插件口袋——宿主不解释任何键，与
+`providers.toml` 的 `options` 给协议的自由度相同：
+
+```toml
+[plugins.my-plugin]
+enabled = true
+listen = "127.0.0.1:8737"
+```
+
+`ctx.plugin_settings()` 返回口袋对应的 `PluginSettings`，带
+`option_str` / `option_u64` / `option_bool` 读取器与原始 JSON map。命名
+未知插件 id 的表是**启动错误**——静默无操作会掩盖拼写错误——所以卸载
+插件时请顺手删掉对应的表。
+
+**监控插件端到端：**订阅 `EventSubscription::ALL`，把 `SNAPSHOT` 事件当作
+权威 transcript，在 spawn 出的 WebSocket 服务器里尽力转发分批的增量，用
+`ctx.submit_user_turn()` 支持远端提交 prompt。参考监控端（pi-monitor）的
+线协议所做的每一件事都能用这些原语组合出来——宿主不需要任何新东西。
+
+## 7. 设计笔记
 
 **为什么编译期静态而不是动态加载 `.so`？** 动态加载需要自建 C ABI、版本
 协商、panic/FFI 桥接——在当前规模下风险远大于收益。静态注册表给出确定性
@@ -243,13 +390,26 @@ cargo clippy --all-targets -- -D warnings
 ——都可以按自己的方式应用，这正是插件不依赖 ratatui、整个系统不需要终端就能
 测试的原因。
 
-**有意设置的边界：** 钩子在前端线程上同步执行，必须快速返回（慢工作走工具
-调用这条正道）；没有沙箱与崩溃隔离——插件以宿主权限运行；状态在进程内，随
-进程退出而消失；插件不能画自定义 widget、不能注册键位。外部插件沿用同一份
-契约，由生成的 wrapper crate 编译进二进制（
-[local-plugins.md](../local-plugins.md)）。
+**有意设置的边界：** 钩子与 `on_event` 在前端线程上同步执行，必须快速返回
+——慢工作属于 `run_tool` 或 `ctx.spawn` 出的任务，永远不属于钩子。没有沙箱
+与崩溃隔离——插件以宿主权限运行（spawn 出的任务 panic 只波及该任务，那是
+调度问题不是安全问题）。状态在进程内，随进程退出而消失。插件不能画自定义
+widget、不能注册键位、不能碰终端：状态栏是"文本加色调"，transcript 是
+cell，这些都是刻意的。外部插件沿用同一份契约，由生成的 wrapper crate 编译
+进二进制（[local-plugins.md](../local-plugins.md)）。
 
-## 7. 相关文档
+**为什么状态栏是声明式分段而不是绘制回调？** 把 ratatui 类型放进契约
+crate，意味着每次页脚升级都要让所有插件重新编译，还会把布局仲裁权交给
+"最后画的那个插件"。文本加色调已经覆盖计量器与监控端需要的所有读数；而
+draw 级 API 将来可以作为又一条带默认实现的 trait 方法加入而不破坏任何
+东西——事件流就是这样与生命周期钩子并存的，规则相同。
+
+**增长守则：** 每个框架特性必须是一个能撑起一**族**插件的原语——事件流、
+状态分段、`spawn`、配置口袋——而不是为某一个想法加的一次性钩子。内置插件
+就是验证场：如果一个提议中的 API 无法由其中某个插件来检验，那它多半还不
+是原语。
+
+## 8. 相关文档
 
 - [local-plugins.md](../local-plugins.md) —— 安装与管理外部插件
 - [multi-provider.md](../multi-provider.md) —— provider 实例、wire quirks、自定义协议

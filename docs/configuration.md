@@ -8,7 +8,7 @@ Everything codest stores lives under `~/.codest` (override the root with `CODEST
 
 | Path | Purpose |
 | --- | --- |
-| `config.toml` | Global settings: `default = "provider/model"`, `max_tool_rounds`. |
+| `config.toml` | Global settings: `default = "provider/model"`, `max_tool_rounds`, the `[status_bar]` footer table, per-plugin `[plugins."<id>"]` pockets. |
 | `providers.toml` | Provider instances (endpoints, keys, models). |
 | `profiles.toml` | Named session presets. |
 | `plugins.toml` | Installed external plugins (machine-managed). |
@@ -29,22 +29,35 @@ Only `config.toml`, `providers.toml`, and `profiles.toml` are meant to be hand-e
 
 ## `config.toml`
 
-The global file currently holds two keys:
+The global file holds two top-level keys plus two tables:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `default` | string | — | Initial model selection, `"provider/model"`. |
 | `max_tool_rounds` | integer | absent | Optional cap on model → tool → model rounds per user turn. |
+| `[status_bar]` | table | segments on | The footer: `plugin_segments` master switch and `order` display priority for plugin segments. |
+| `[plugins."<id>"]` | table | — | A plugin's private settings pocket; the host interprets no key. |
 
 ```toml
 # ~/.codest/config.toml
 default = "openai/gpt-4o-mini"
 # max_tool_rounds = 64
+
+[status_bar]
+plugin_segments = true                # plugin segments in the footer (default on)
+order = ["tps:rate", "tps:spark"]     # display priority, left to right
+
+[plugins.tps]                         # the built-in tps meter's pocket
+enabled = true                        # start with the meter on (default off)
 ```
 
 `max_tool_rounds` is **unbounded by default**, following codex: the turn ends when the model stops calling tools, errors, or you press `Esc`. Set a value to re-enable the runaway guard — the turn then ends with a `tool round limit reached` error once that many rounds have completed. `64` is the commonly used guardrail.
 
 `default` is the third step of the startup selection chain: `--provider`/`--model` > active profile's `default` > `config.toml` `default` > first model of first instance. It names one model of one instance as `"provider/model"`, parsed at the first slash, so model ids may themselves contain `/`.
+
+**`[status_bar]`** controls only the plugin side of the footer — the host's own segments (model, effort, context, state) always render. `order` lists full segment keys (`plugin:key`) in display priority; unlisted segments keep their registration order, and keys nothing currently displays are ignored, so a stale entry costs nothing. On a narrow terminal the lowest-priority segments drop first.
+
+**`[plugins."<id>"]`** is the per-plugin settings pocket — the whole table is handed to the plugin verbatim ([plugins.md](plugins.md), section 6); a plugin reads it through `PluginContext::plugin_settings()`. A table naming an unknown plugin id is a **startup error** (a silent no-op would hide a typo), so remove the table when you uninstall a plugin.
 
 ## Provider instances
 

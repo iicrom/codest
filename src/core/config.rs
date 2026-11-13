@@ -1,8 +1,9 @@
 //! Configuration files under `codest_home()` (see [`codest_home`]), kept as
 //! separate files with separate concerns:
 //!
-//! * `config.toml` — global settings. Today that is one key, the default
-//!   model selection; the file is reserved for future global options.
+//! * `config.toml` — global settings: the default model selection, the
+//!   optional tool-round cap, the footer's `[status_bar]` table, and the
+//!   per-plugin `[plugins."<id>"]` settings pockets.
 //! * `providers.toml` — the provider instances (endpoints, keys, models).
 //!   Keeping instances in their own file lets the `/model` UI manage them
 //!   later without touching global settings.
@@ -50,6 +51,43 @@ pub struct GlobalConfig {
     /// error once that many rounds have completed).
     #[serde(default)]
     pub max_tool_rounds: Option<usize>,
+    /// Footer configuration (`[status_bar]`). Absent keeps the defaults:
+    /// plugin segments on, in the order the plugins set them.
+    #[serde(default)]
+    pub status_bar: StatusBarConfig,
+    /// Per-plugin settings (`[plugins."<id>"]`). The host interprets no
+    /// plugin key — each table is that plugin's pocket
+    /// ([`cst_plugin_api::config::PluginSettings`]); a plugin reads its own
+    /// through `PluginContext::plugin_settings`. A table naming an unknown
+    /// plugin id is a startup error, with the same discipline as a typo
+    /// anywhere else in these files: silent no-ops hide mistakes.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, cst_plugin_api::config::PluginSettings>,
+}
+
+/// The footer's `[status_bar]` table. Absent fields and an absent table both
+/// resolve to [`StatusBarConfig::default`]: segments on, plugin order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatusBarConfig {
+    /// Whether plugin status segments render at all. The host's own segments
+    /// (model, effort, context, state) always render.
+    pub plugin_segments: bool,
+    /// Plugin segment full keys (`plugin:key`) in display priority, left to
+    /// right. Segments not listed keep their registration order after the
+    /// listed ones; keys nothing currently displays are ignored, so a stale
+    /// entry costs nothing. On a narrow terminal the lowest-priority segments
+    /// drop first.
+    pub order: Vec<String>,
+}
+
+impl Default for StatusBarConfig {
+    fn default() -> Self {
+        Self {
+            plugin_segments: true,
+            order: Vec::new(),
+        }
+    }
 }
 
 /// The `/profile` command: with a name, switch this run's active profile;
@@ -312,6 +350,48 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_and_plugin_pockets_parse_with_defaults() {
+        // Neither section present: segments on, no plugin settings.
+        let plain = write_temp("global-plain.toml", "default = \"a/b\"\n");
+        let global = load_global(&plain).unwrap();
+        assert!(global.status_bar.plugin_segments);
+        assert!(global.status_bar.order.is_empty());
+        assert!(global.plugins.is_empty());
+
+        // Both sections present: the pocket is free-form, the order is a
+        // display priority.
+        let path = write_temp(
+            "global-status.toml",
+            r#"
+[status_bar]
+plugin_segments = false
+order = ["tps:rate", "tps:spark"]
+
+[plugins.tps]
+enabled = true
+window_ms = 250
+
+[plugins.monitor]
+listen = "127.0.0.1:8737"
+"#,
+        );
+        let global = load_global(&path).unwrap();
+        assert!(!global.status_bar.plugin_segments);
+        assert_eq!(global.status_bar.order, ["tps:rate", "tps:spark"]);
+        let tps = &global.plugins["tps"];
+        assert_eq!(tps.option_bool("enabled"), Some(true));
+        assert_eq!(tps.option_u64("window_ms"), Some(250));
+        assert_eq!(
+            global.plugins["monitor"].option_str("listen"),
+            Some("127.0.0.1:8737")
+        );
+
+        // Unknown keys are still rejected, everywhere the strict rule holds.
+        let path = write_temp("global-status-unknown.toml", "[status_bar]\nnope = 1\n");
+        assert!(load_global(&path).is_err());
+    }
+
+    #[test]
     fn parses_global_and_provider_files() {
         let global = write_temp("global.toml", "default = \"glm/glm-5.3\"\n");
         assert_eq!(
@@ -319,6 +399,8 @@ mod tests {
             GlobalConfig {
                 default: Some("glm/glm-5.3".to_string()),
                 max_tool_rounds: None,
+                status_bar: StatusBarConfig::default(),
+                plugins: BTreeMap::new(),
             }
         );
 

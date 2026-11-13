@@ -12,6 +12,7 @@ mod help;
 mod quit;
 mod status;
 mod tools;
+mod tps;
 
 use crate::plugins::Plugin;
 
@@ -22,6 +23,7 @@ pub use quit::QUIT;
 pub use status::STATUS;
 pub use tools::BASH;
 pub use tools::FS;
+pub use tps::TPS;
 
 /// Every plugin compiled into the binary, in hook and menu order. The tool
 /// plugins come last so their system-prompt section lands after the command
@@ -34,6 +36,7 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &quit::QUIT,
     &status::STATUS,
     &r#continue::CONTINUE,
+    &tps::TPS,
     &tools::BASH,
     &tools::FS,
 ];

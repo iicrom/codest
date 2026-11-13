@@ -21,6 +21,9 @@ One plugin can contribute any subset of the following, all through the
 | Tools | `tools()` + `run_tool()` | Model-invoked capabilities (`bash`, `read`, …) |
 | Protocol factories | `protocols()` | A new wire protocol for `providers.toml` instances |
 | Sign-in entries | `auth_providers()` / `auth_status()` / `begin_sign_in()` | Browser/PAT sign-in behind `/provider` |
+| Event stream | `subscriptions()` + `on_event()` | Meters, monitors, reactions to the agent's run |
+| Status-bar segments | `ctx.set_status()` / `ctx.clear_status()` | Footer readouts (`tps:rate`, a clock, a countdown) |
+| Background tasks | `ctx.spawn(future)` + `ctx.bridge()` | Long-lived work: a monitor server, a refresh loop |
 
 Plugins are **compile-time static**: a plugin is a `struct` with a `static`
 value, registered in one `static` slice. Nothing is discovered or loaded at
@@ -50,6 +53,8 @@ binary. The host side lives in [`src/plugins/mod.rs`](../src/plugins/mod.rs).
 | `auth_status(&str)` | instance name | `AuthStatus` | `Unsupported` |
 | `begin_sign_in(...)` | instance, method, secret, notifier, cancel token | `Option<SignInFuture>` | `None` |
 | `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` | `&mut PluginContext` | — | no-op |
+| `subscriptions()` | — | `EventSubscription` | `NONE` |
+| `on_event(&PluginEvent, &mut PluginContext)` | one core event + context | — | no-op |
 | `run_command(&Invocation, &mut PluginContext)` | parsed command + args | `Result<(), PluginError>` | error |
 
 Plugins are shared as `&'static dyn Plugin`, so everything takes `&self`;
@@ -74,6 +79,8 @@ collects them and applies each one. This is the only way a plugin can act:
 | `SetComposer(String)` | `ctx.set_composer(text)` | Replace the composer text |
 | `SubmitUserTurn(String)` | `ctx.submit_user_turn(text)` | Submit a user turn — only while idle |
 | `ContinueTurn` | `ctx.continue_turn()` | Drive the current transcript without a new message (`/continue`) — only while idle |
+| `SetStatus(StatusSegment)` | `ctx.set_status(segment)` | Upsert one footer segment (`plugin:key`) |
+| `ClearStatus(key)` | `ctx.clear_status(key)` | Remove one footer segment |
 
 Effects are collected in plugin order and applied in that order. The
 idle-gated effects make recursion impossible: `on_user_message` runs after
@@ -102,7 +109,7 @@ The registry is [`src/plugins/builtin/mod.rs`](../src/plugins/builtin/mod.rs):
 ```rust
 pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
     &help::HELP, &clear::CLEAR, &quit::QUIT, &status::STATUS,
-    &r#continue::CONTINUE, &tools::BASH, &tools::FS,
+    &r#continue::CONTINUE, &tps::TPS, &tools::BASH, &tools::FS,
 ];
 ```
 
@@ -117,6 +124,7 @@ prompt section lands after the command plugins' contributions.
 | `quit` | `/quit` (`/exit`) | Requests `Quit` |
 | `status` | `/status` | Backend, mode, transcript size, context usage, token totals, plugin list |
 | `continue` | `/continue` | Requests `ContinueTurn` — resume an interrupted turn |
+| `tps` | `/tps` | Live tokens-per-second meter for the footer (off by default) |
 | `bash` | `bash` tool + prompt section | Runs one shell command |
 | `fs` | `read`, `write`, `edit` tools | File operations |
 
@@ -247,7 +255,167 @@ A hooks-only plugin skips `commands()` entirely and implements, say,
 raw JSON-Schema text so it can live in a `const`. State goes in a `Mutex`,
 via interior mutability like the shipped plugins.
 
-## 6. Design notes
+## 6. Observing the agent: events, status segments, background tasks
+
+The four lifecycle hooks cover turn boundaries. Three primitives cover
+everything else a reactive plugin needs, and each is general on purpose:
+they exist so a *family* of plugins is possible without new host API per
+idea.
+
+### The event stream
+
+Declare the categories you want and implement one hook:
+
+```rust
+use crate::plugins::{
+    DeltaKind, EventSubscription, Plugin, PluginContext, PluginEvent, PluginEventKind,
+};
+
+impl Plugin for MyMeter {
+    fn id(&self) -> &'static str {
+        "my-meter"
+    }
+
+    fn subscriptions(&self) -> EventSubscription {
+        EventSubscription::DELTAS
+            .union(EventSubscription::USAGE)
+            .union(EventSubscription::LIFECYCLE)
+    }
+
+    fn on_event(&self, event: &PluginEvent<'_>, ctx: &mut PluginContext<'_>) {
+        match event.kind {
+            // `event.at` is the host's monotonic emit stamp.
+            PluginEventKind::MessageDelta { kind: DeltaKind::Text, text, .. } => {
+                let _ = (text, ctx);
+            }
+            // Real token counts as the backend reported them.
+            PluginEventKind::TurnUsage { output, .. } => {
+                let _ = output;
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+Categories: `LIFECYCLE` (turn started/settled/aborted/complete, errors,
+cleared, shutdown), `DELTAS` (text and thinking deltas), `USAGE` (per-round
+and per-turn token counts), `TOOLS` (tool-call lifecycle with durations),
+`SESSION` (session/model/effort/profile/tool switches), `SNAPSHOT` (full
+conversation snapshots). Unsubscribed categories cost nothing: the host
+filters before dispatching, so a plugin that wants only turn boundaries
+never sees a copy of a stream delta.
+
+Two facts make the stream meterable:
+
+* **`event.at` is the host's monotonic emit stamp**, taken once in
+  `Event::new` — a throughput meter derives its clock from it instead of
+  guessing from arrival order.
+* **`SNAPSHOT` events carry the whole conversation** — the host asks the
+  worker for one at plugin startup and after every session switch, so a
+  monitor joins mid-stream without replaying history. "When in doubt,
+  re-snapshot" is the intended recovery strategy, same as the reference
+  monitors.
+
+The payload borrows from the event; a plugin that must keep a delta copies
+it. The four lifecycle hooks keep working unchanged — `on_event` is the
+superset, and the built-in `tps` plugin ([tps.rs](../src/plugins/builtin/tps.rs))
+is the reference implementation: a live estimate from deltas, corrected by
+the usage event, with one sample per turn feeding an idle sparkline.
+
+Its reporting contract is worth copying, because it is a general rule for
+footer readouts rather than a tps detail:
+
+* **A live value retires with its turn.** `tps:rate` is cleared on
+  `TurnComplete`; a frozen number would claim the agent is still streaming.
+* **A sparkline is a shape, not a number.** It appears from the second
+  sample on (one sample is not a trend) and carries no digits; the numeric
+  readout is the live rate's job.
+* **Session boundaries clear the meter.** `SessionStarted`,
+  `SessionSwitched` and `ConversationCleared` all drop the history — a
+  throughput figure must describe the conversation on screen. The enabled
+  switch survives, so the meter keeps running across the switch.
+* **A turn's tokens are summed over its rounds.** `TurnUsage` carries only
+  the last round while the decode span covers all of them; the meter banks
+  each round's `RoundUsage` and falls back to `TurnUsage` when a backend
+  reports no per-round counts.
+
+### Status-bar segments
+
+A plugin submits *data*, the host owns the pixels:
+`ctx.set_status(StatusSegment::new("rate", "42 t/s"))` upserts the segment
+stored as `tps:rate` (the `plugin:key` id is resolved from the plugin id),
+and `ctx.clear_status("rate")` removes it. A tone — `Dim`, `Accent`,
+`Warn` — maps onto the host palette. There is no arbitrary drawing, on
+purpose (section 7). Segments render between the context readout and the
+state word, in the priority the user sets:
+
+```toml
+[status_bar]
+plugin_segments = false             # master switch (default on)
+order = ["tps:rate", "tps:spark"]   # display priority, left to right
+```
+
+Segments not listed keep registration order; keys nothing currently
+displays are ignored, so a stale entry costs nothing. On a narrow terminal
+the right-hand hint — already the lowest-priority line on screen — degrades
+first, then plugin segments drop from their own tail, and the host's own
+readouts and the state word never move. Because the footer
+repaints on the 90 ms tick, a segment animates the moment its plugin sets
+new text — countdowns and gauges need no host change.
+
+### Background tasks and per-plugin settings
+
+`ctx.spawn(future)` hands a task to the host's runtime: it outlives the
+dispatch, its effects reach the UI through the plugin's bridge, and the
+host cancels it on exit. The future keeps nothing but a `PluginBridge` —
+a clonable effect sink plus the cancellation token:
+
+```rust
+fn on_startup(&self, ctx: &mut PluginContext<'_>) {
+    let bridge = ctx.bridge();
+    ctx.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+                    bridge.set_status(StatusSegment::new("clock", local_time()));
+                }
+                _ = bridge.cancelled() => break, // cooperative shutdown
+            }
+        }
+    });
+}
+```
+
+A long-lived task must select on `bridge.cancelled()` — cancellation is
+cooperative, and the host's final `abort` sweep after it is not graceful.
+A task that panics surfaces as a transcript notice; it cannot take the UI
+loop down. This is the sanctioned home for the slow work a synchronous
+hook cannot do: a monitor's WebSocket server, a refresh loop, a watchdog.
+
+Settings come from `config.toml`'s per-plugin pocket — the host
+interprets no key, the same freedom `providers.toml`'s `options` gives
+protocols:
+
+```toml
+[plugins.my-plugin]
+enabled = true
+listen = "127.0.0.1:8737"
+```
+
+`ctx.plugin_settings()` returns the pocket as a `PluginSettings` with
+`option_str` / `option_u64` / `option_bool` readers plus the raw JSON map.
+A table naming an unknown plugin id is a **startup error** — a silent
+no-op hides typos — so remove the table when you uninstall a plugin.
+
+**A monitoring plugin, end to end:** subscribe to `EventSubscription::ALL`,
+treat `SNAPSHOT` events as the authoritative transcript, forward batched
+deltas best-effort from a spawned WebSocket server, and use
+`ctx.submit_user_turn()` for remote prompts. What the reference monitors
+(pi-monitor) do over their wire protocol composes from exactly these
+primitives — nothing new in the host is required.
+
+## 7. Design notes
 
 **Why compile-time instead of dynamic `.so` loading?** Dynamic loading would
 need a hand-rolled C ABI, version negotiation, and panic/FFI bridges — real
@@ -262,14 +430,32 @@ that is ever revisited.
 runner, tests — applies them however it wants, which is why plugins need no
 ratatui dependency and the system is testable without a terminal.
 
-**Boundaries, on purpose:** hooks run synchronously on the front-end thread
-and must return quickly (tool calls are the sanctioned way to do slow work);
-there is no sandboxing or crash isolation — plugins run with host privileges;
-state is in-process and dies with the process; plugins cannot draw custom
-widgets or register key bindings. External plugins keep the same contract and
-get compiled in by a generated wrapper crate ([local-plugins.md](local-plugins.md)).
+**Boundaries, on purpose:** hooks and `on_event` run synchronously on the
+front-end thread and must return quickly — slow work belongs in `run_tool`
+or a `ctx.spawn` task, never in a hook. There is no sandboxing or crash
+isolation — plugins run with host privileges (a spawned task's panic is
+contained to that task, that is scheduling, not security). State is
+in-process and dies with the process. Plugins cannot draw custom widgets,
+register key bindings, or touch the terminal: the status bar is text plus a
+tone, the transcript is cells, and that is deliberate. External plugins keep
+the same contract and get compiled in by a generated wrapper crate
+([local-plugins.md](local-plugins.md)).
 
-## 7. Related docs
+**Why declarative status segments instead of draw callbacks?** ratatui
+types in the contract crate would turn every footer upgrade into a recompile
+for every plugin and hand layout arbitration to whichever plugin draws last.
+Text plus a tone covers every readout a meter or monitor needs, and a
+draw-level API can be added later as another default trait method without
+breaking anything — the same compatibility rule that let the event stream
+slip in beside the lifecycle hooks.
+
+**Growth rule:** every framework feature must be a primitive that enables a
+family of plugins — the event stream, status segments, `spawn`, the settings
+pocket — not a one-off hook for one idea. The built-in plugins are the
+validation: if a proposed API cannot be exercised by one of them, it is
+probably not a primitive yet.
+
+## 8. Related docs
 
 - [local-plugins.md](local-plugins.md) — installing and managing external plugins
 - [multi-provider.md](multi-provider.md) — provider instances, wire quirks, custom protocols

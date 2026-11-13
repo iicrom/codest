@@ -19,11 +19,13 @@ Types only — no HTTP client, no configuration loading, no terminal code:
 
 | Module | Contents |
 |---|---|
-| `plugin` | `Plugin`, `PluginEffect`, `PluginInfo`, `PluginContext`, `ReportBlock` |
+| `plugin` | `Plugin`, `PluginEffect`, `PluginInfo`, `PluginContext`, `PluginBridge`, `PluginTask`, `ReportBlock` |
+| `event` | `PluginEvent`, `PluginEventKind`, `EventSubscription`, `DeltaKind` |
+| `status` | `StatusSegment`, `StatusTone` |
 | `providers` | `ProtocolFactory`, `ListModelsFuture` |
 | `model` | `ModelClient`, `StreamItem`, `TurnOptions`, `ModelError` |
 | `message` | `Message`, `Role` |
-| `config` | `ProviderInstance`, `ModelInfo`, `WireQuirks` |
+| `config` | `ProviderInstance`, `ModelInfo`, `WireQuirks`, `PluginSettings` |
 | `commands` | `CommandSpec`, `CommandTable`, `Invocation`, `ArgsPolicy` |
 | `tools` | `ToolSpec`, `ToolCall`, `ToolExecutor`, `ToolCallAccumulator` |
 | `sse` | `SseDecoder`, `SseFrame` |

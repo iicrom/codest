@@ -1116,6 +1116,7 @@ mod tests {
             tools: &TEST_TOOLS,
             enabled_tools: &ENABLED_PING,
             message_count: 3,
+            plugin_configs: &[],
         }
     }
 

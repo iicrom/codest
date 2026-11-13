@@ -8,7 +8,7 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 
 | 路径 | 用途 |
 | --- | --- |
-| `config.toml` | 全局设置：`default = "provider/model"`、`max_tool_rounds`。 |
+| `config.toml` | 全局设置：`default = "provider/model"`、`max_tool_rounds`、`[status_bar]` 页脚表、按插件的 `[plugins."<id>"]` 配置口袋。 |
 | `providers.toml` | Provider 实例（端点、密钥、模型）。 |
 | `profiles.toml` | 命名会话预设。 |
 | `plugins.toml` | 已安装的外部插件（机器管理）。 |
@@ -29,22 +29,38 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 
 ## `config.toml`
 
-全局文件目前有两个键：
+全局文件有两个顶层键加两张表：
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `default` | string | — | 初始模型选择，`"provider/model"`。 |
 | `max_tool_rounds` | integer | 缺省 | 每个用户回合「模型 → 工具 → 模型」轮数的可选上限。 |
+| `[status_bar]` | table | 分段开启 | 页脚：`plugin_segments` 总开关与插件分段的 `order` 显示优先级。 |
+| `[plugins."<id>"]` | table | — | 插件私有的配置口袋；宿主不解释任何键。 |
 
 ```toml
 # ~/.codest/config.toml
 default = "openai/gpt-4o-mini"
 # max_tool_rounds = 64
+
+[status_bar]
+plugin_segments = true                # 页脚显示插件分段（默认开启）
+order = ["tps:rate", "tps:spark"]     # 显示优先级，从左到右
+
+[plugins.tps]                         # 内置 tps 计量器的口袋
+enabled = true                        # 启动即开启计量（默认关闭）
 ```
 
 `max_tool_rounds` **默认不设上限**（与 codex 一致）：模型不再调工具、出错或按 `Esc` 才结束回合。设置数值即重新启用失控兜底——完成该轮数后回合以 `tool round limit reached` 错误结束。`64` 是常用的兜底值。
 
 `default` 是启动选择链的第三环：`--provider`/`--model` > 激活 profile 的 `default` > `config.toml` 的 `default` > 第一个实例的第一个模型。它以 `"provider/model"` 指名某个实例的某个模型，在第一个 `/` 处解析，因此模型 id 本身可以带 `/`。
+
+**`[status_bar]`** 只控制页脚的插件一侧——宿主自己的分段（模型、effort、上下文、状态）始终渲染。`order` 以显示优先级列出完整分段键（`plugin:key`）；未列出的分段保持注册顺序，当前没有东西在显示的键会被忽略，所以过期条目没有代价。窄终端上优先级最低的分段先丢弃。
+
+**`[plugins."<id>"]`** 是按插件的配置口袋——整张表原样交给插件
+（[plugins.md](plugins.md) 第 6 节），插件经 `PluginContext::plugin_settings()`
+读取。命名未知插件 id 的表是**启动错误**（静默无操作会掩盖拼写错误），所以
+卸载插件时请顺手删掉对应的表。
 
 ## Provider 实例
 

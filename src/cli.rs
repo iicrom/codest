@@ -248,6 +248,12 @@ pub async fn run_with(
             active: active.map(|(name, _)| name.to_string()),
         },
         global.max_tool_rounds,
+        global.status_bar,
+        global
+            .plugins
+            .iter()
+            .map(|(id, settings)| (id.clone(), settings.clone()))
+            .collect(),
     )
     .await
 }
@@ -794,6 +800,7 @@ mod tests {
         let global = config::GlobalConfig {
             default: Some("q/m2".to_string()),
             max_tool_rounds: None,
+            ..Default::default()
         };
         let profile = config::Profile {
             default: Some("p/m2".to_string()),
@@ -927,6 +934,7 @@ mod tests {
         let global = config::GlobalConfig {
             default: Some("p/m1".to_string()),
             max_tool_rounds: None,
+            ..Default::default()
         };
 
         let (instances, pinned) =
@@ -947,6 +955,7 @@ mod tests {
         let global = config::GlobalConfig {
             default: Some("gone/m2".to_string()),
             max_tool_rounds: None,
+            ..Default::default()
         };
 
         let selection = initial_selection(

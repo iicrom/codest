@@ -34,6 +34,8 @@ pub mod builtin;
 pub mod install;
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use cst_plugin_api::auth::AuthProvider;
 use cst_plugin_api::auth::AuthStatus;
@@ -43,13 +45,47 @@ use cst_plugin_api::providers::ProtocolFactory;
 use cst_plugin_api::tools::ToolCall;
 use cst_plugin_api::tools::ToolExecutor;
 use cst_plugin_api::tools::ToolSpec;
+use tokio_util::sync::CancellationToken;
 
 pub use cst_plugin_api::commands::{ArgsPolicy, CommandCandidate, CommandSpec, Invocation};
+pub use cst_plugin_api::config::PluginSettings;
+pub use cst_plugin_api::event::{DeltaKind, EventSubscription, PluginEvent, PluginEventKind};
 pub use cst_plugin_api::plugin::{
-    Plugin, PluginContext, PluginEffect, PluginError, PluginInfo, ReportBlock, ReportEntry,
-    ReportGroup, RequestFacts,
+    Plugin, PluginBridge, PluginContext, PluginEffect, PluginError, PluginInfo, PluginTask,
+    ReportBlock, ReportEntry, ReportGroup, RequestFacts,
 };
+pub use cst_plugin_api::status::{StatusSegment, StatusTone};
 pub use builtin::BUILTIN_PLUGINS;
+
+/// The effect sink every dispatch's bridges share: sends land on the host's
+/// effect channel for the front-end to apply.
+type EffectSink = Arc<dyn Fn(PluginEffect) + Send + Sync>;
+
+/// The paired receiver, held until the front-end claims it exactly once.
+type EffectsReceiver = Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PluginEffect>>>;
+
+/// What one dispatch pass produced: transcript/UI effects in plugin order,
+/// plus the background tasks plugins asked to spawn
+/// ([`PluginContext::spawn`]). The front-end applies the effects and drives
+/// the tasks on its own runtime; the host is synchronous and owns no runtime.
+pub struct PluginOutput {
+    pub effects: Vec<PluginEffect>,
+    pub tasks: Vec<PluginTask>,
+}
+
+impl PluginOutput {
+    fn empty() -> Self {
+        Self {
+            effects: Vec::new(),
+            tasks: Vec::new(),
+        }
+    }
+
+    fn from_ctx(ctx: PluginContext<'_>) -> Self {
+        let (effects, tasks) = ctx.into_parts();
+        Self { effects, tasks }
+    }
+}
 
 /// Why the plugin registry could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +126,14 @@ pub struct PluginHost {
     /// plugin's tools; `Some(ids)` keeps only the named plugins'. Commands,
     /// hooks, prompts, and protocols are never filtered.
     tool_filter: Option<Vec<String>>,
+    /// The sink background tasks send their effects through
+    /// ([`PluginBridge`]). Shared by every dispatch; the paired receiver is
+    /// claimed once by the front-end via [`PluginHost::take_effects_receiver`].
+    effects_sink: EffectSink,
+    effects_rx: EffectsReceiver,
+    /// Cancellation for every spawned plugin task. The front-end cancels it
+    /// on exit; tasks are expected to watch it and end promptly.
+    cancel: CancellationToken,
 }
 
 impl PluginHost {
@@ -161,13 +205,30 @@ impl PluginHost {
             }
         }
 
+        let (effects_sink, effects_rx) = Self::build_effects_channel();
         Ok(Self {
             plugins,
             table,
             ids,
             tools,
             tool_filter,
+            effects_sink,
+            effects_rx,
+            cancel: CancellationToken::new(),
         })
+    }
+
+    /// The effect channel every background task sends through, created per
+    /// host. The sink is shared by all dispatches; the receiver is handed to
+    /// the front-end exactly once.
+    fn build_effects_channel() -> (EffectSink, EffectsReceiver) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PluginEffect>();
+        let sink = Arc::new(move |effect: PluginEffect| {
+            // A closed receiver means the front-end is gone; dropping the
+            // effect is the right response, not a panic in a task.
+            let _ = tx.send(effect);
+        });
+        (sink, Mutex::new(Some(rx)))
     }
 
     /// The plugins compiled into the binary, plus the built-in front-end
@@ -348,53 +409,124 @@ impl PluginHost {
         self.table.help_text()
     }
 
-    /// Run the owning plugin for an invocation and collect its effects.
+    /// Run the owning plugin for an invocation and collect its output.
     pub fn dispatch_command(
         &self,
         invocation: &Invocation,
         info: PluginInfo<'_>,
-    ) -> Vec<PluginEffect> {
-        let mut ctx = PluginContext::new(&self.table, info);
+    ) -> PluginOutput {
         match self.owner(invocation.spec.name) {
             Some(plugin) => {
+                let mut ctx = self.context(plugin.id(), info);
                 if let Err(error) = plugin.run_command(invocation, &mut ctx) {
                     ctx.error(error.to_string());
                 }
+                PluginOutput::from_ctx(ctx)
             }
-            None => ctx.error(format!(
-                "no plugin owns `/{}`; the command table is inconsistent",
-                invocation.spec.name
-            )),
+            None => {
+                let mut ctx = self.context("__host__", info);
+                ctx.error(format!(
+                    "no plugin owns `/{}`; the command table is inconsistent",
+                    invocation.spec.name
+                ));
+                PluginOutput::from_ctx(ctx)
+            }
         }
-        ctx.into_effects()
     }
 
-    pub fn startup(&self, info: PluginInfo<'_>) -> Vec<PluginEffect> {
+    pub fn startup(&self, info: PluginInfo<'_>) -> PluginOutput {
         self.run_hooks(info, |plugin, ctx| plugin.on_startup(ctx))
     }
 
-    pub fn user_message(&self, text: &str, info: PluginInfo<'_>) -> Vec<PluginEffect> {
+    pub fn user_message(&self, text: &str, info: PluginInfo<'_>) -> PluginOutput {
         self.run_hooks(info, |plugin, ctx| plugin.on_user_message(text, ctx))
     }
 
-    pub fn turn_complete(&self, message: &str, info: PluginInfo<'_>) -> Vec<PluginEffect> {
+    pub fn turn_complete(&self, message: &str, info: PluginInfo<'_>) -> PluginOutput {
         self.run_hooks(info, |plugin, ctx| plugin.on_turn_complete(message, ctx))
     }
 
-    pub fn conversation_cleared(&self, info: PluginInfo<'_>) -> Vec<PluginEffect> {
+    pub fn conversation_cleared(&self, info: PluginInfo<'_>) -> PluginOutput {
         self.run_hooks(info, |plugin, ctx| plugin.on_conversation_cleared(ctx))
+    }
+
+    /// Fan one core event out to the plugins that subscribed to its category,
+    /// in registration order.
+    ///
+    /// The payload borrows from `event`, so this costs nothing per event; the
+    /// host is expected to filter through [`Plugin::subscriptions`] first,
+    /// which happens here. A plugin that returned no subscription never sees
+    /// the dispatch at all.
+    pub fn dispatch_event(&self, event: &crate::core::Event, info: PluginInfo<'_>) -> PluginOutput {
+        let plugin_event = PluginEvent {
+            at: event.at,
+            kind: plugin_event_kind(&event.msg),
+        };
+        let mut output = PluginOutput::empty();
+        for plugin in &self.plugins {
+            if !plugin
+                .subscriptions()
+                .contains(plugin_event.kind.subscription())
+            {
+                continue;
+            }
+            let mut ctx = self.context(plugin.id(), info);
+            plugin.on_event(&plugin_event, &mut ctx);
+            let (mut effects, tasks) = ctx.into_parts();
+            output.effects.append(&mut effects);
+            output.tasks.extend(tasks);
+        }
+        output
+    }
+
+    /// Build one plugin's context: its id scopes the status helpers, its
+    /// settings resolve from `info.plugin_configs`, and its bridge clones the
+    /// host's effect sink and cancellation token.
+    fn context<'a>(
+        &'a self,
+        plugin_id: &'static str,
+        info: PluginInfo<'a>,
+    ) -> PluginContext<'a> {
+        let bridge = PluginBridge::new(
+            plugin_id,
+            self.cancel.clone(),
+            Arc::clone(&self.effects_sink),
+        );
+        PluginContext::new(&self.table, info, plugin_id, bridge)
+    }
+
+    /// Claim the receiver background tasks send effects through. The
+    /// front-end calls this once, at startup; later calls return `None`.
+    pub fn take_effects_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PluginEffect>> {
+        self.effects_rx
+            .lock()
+            .expect("plugin effects receiver lock")
+            .take()
+    }
+
+    /// The token that cancels every spawned plugin task. The front-end
+    /// cancels it on exit, after which an `abort` sweep cleans up whatever
+    /// did not watch the token.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     fn run_hooks(
         &self,
         info: PluginInfo<'_>,
-        mut hook: impl FnMut(&dyn Plugin, &mut PluginContext<'_>),
-    ) -> Vec<PluginEffect> {
-        let mut ctx = PluginContext::new(&self.table, info);
+        hook: impl Fn(&dyn Plugin, &mut PluginContext<'_>),
+    ) -> PluginOutput {
+        let mut output = PluginOutput::empty();
         for plugin in &self.plugins {
+            let mut ctx = self.context(plugin.id(), info);
             hook(*plugin, &mut ctx);
+            let (mut effects, tasks) = ctx.into_parts();
+            output.effects.append(&mut effects);
+            output.tasks.extend(tasks);
         }
-        ctx.into_effects()
+        output
     }
 
     fn owner(&self, name: &str) -> Option<&'static dyn Plugin> {
@@ -416,6 +548,73 @@ impl ToolExecutor for PluginHost {
     }
 }
 
+/// Mirror one host-internal bus message into the contract's event vocabulary,
+/// borrowing the payload (`String` fields become `&str`). The mirror is
+/// total: every [`EventMsg`] variant has exactly one kind, so a monitor
+/// never loses a step of the stream.
+fn plugin_event_kind(msg: &crate::core::EventMsg) -> PluginEventKind<'_> {
+    use crate::core::EventMsg;
+    match msg {
+        EventMsg::TurnStarted => PluginEventKind::TurnStarted,
+        EventMsg::AgentMessageDelta { delta } => PluginEventKind::MessageDelta {
+            kind: DeltaKind::Text,
+            text: delta,
+        },
+        EventMsg::AgentThinkingDelta { delta } => PluginEventKind::MessageDelta {
+            kind: DeltaKind::Thinking,
+            text: delta,
+        },
+        EventMsg::AgentMessage { message } => PluginEventKind::AgentMessage { text: message },
+        EventMsg::AgentToolCallStarted { name, arguments } => {
+            PluginEventKind::ToolCallStarted { name, arguments }
+        }
+        EventMsg::AgentToolCall {
+            name,
+            result,
+            error,
+            duration_ms,
+            ..
+        } => PluginEventKind::ToolCallFinished {
+            name,
+            result,
+            error: error.as_deref(),
+            duration_ms: *duration_ms,
+        },
+        EventMsg::ContextUsage { input, output } => PluginEventKind::RoundUsage {
+            input: *input,
+            output: *output,
+        },
+        EventMsg::TurnUsage { input, output } => PluginEventKind::TurnUsage {
+            input: *input,
+            output: *output,
+        },
+        EventMsg::TurnAborted { reason } => PluginEventKind::TurnAborted { reason },
+        EventMsg::Error { message } => PluginEventKind::Error { message },
+        EventMsg::TurnComplete => PluginEventKind::TurnComplete,
+        EventMsg::ConversationCleared => PluginEventKind::ConversationCleared,
+        EventMsg::ConversationSnapshot { messages } => {
+            PluginEventKind::ConversationSnapshot { messages }
+        }
+        EventMsg::SessionStarted { session } => PluginEventKind::SessionStarted {
+            session: *session,
+        },
+        EventMsg::SessionSwitched { session } => PluginEventKind::SessionSwitched {
+            session: *session,
+        },
+        EventMsg::SessionRenamed { session, name } => PluginEventKind::SessionRenamed {
+            session: *session,
+            name,
+        },
+        EventMsg::ModelSwitched { model } => PluginEventKind::ModelSwitched { model },
+        EventMsg::ReasoningEffortSwitched { effort } => PluginEventKind::EffortSwitched {
+            effort: effort.as_deref(),
+        },
+        EventMsg::ProfileSwitched { name } => PluginEventKind::ProfileSwitched { name },
+        EventMsg::ToolsSwitched { enabled } => PluginEventKind::ToolsSwitched { enabled },
+        EventMsg::ShutdownComplete => PluginEventKind::Shutdown,
+    }
+}
+
 impl fmt::Debug for PluginHost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PluginHost")
@@ -432,6 +631,8 @@ mod tests {
     use crate::core::config::ProviderInstance;
     use crate::core::echo_model::EchoModelClient;
     use crate::core::model::ModelError;
+    use crate::core::Event;
+    use crate::core::EventMsg;
 
     static ECHO_COMMAND: CommandSpec = CommandSpec::new(
         "echo",
@@ -543,6 +744,7 @@ mod tests {
 
     fn info(host: &PluginHost) -> PluginInfo<'_> {
         static NO_TOOLS: [ToolSpec; 0] = [];
+        static NO_CONFIGS: [(String, PluginSettings); 0] = [];
         PluginInfo {
             model: "test-model",
             mode: "fullscreen",
@@ -563,6 +765,7 @@ mod tests {
             tools: &NO_TOOLS,
             enabled_tools: &[],
             message_count: 1,
+            plugin_configs: &NO_CONFIGS,
         }
     }
 
@@ -576,35 +779,203 @@ mod tests {
     #[test]
     fn dispatch_runs_the_owning_plugin() {
         let host = host();
-        let effects = host.dispatch_command(&invocation(&host, "/echo hi"), info(&host));
-        assert_eq!(effects, vec![PluginEffect::Notice("echo: hi".to_string())]);
+        let output = host.dispatch_command(&invocation(&host, "/echo hi"), info(&host));
+        assert_eq!(output.effects, vec![PluginEffect::Notice("echo: hi".to_string())]);
     }
 
     #[test]
     fn plugin_errors_become_error_effects() {
         let host = PluginHost::new(FAILING_PLUGINS).expect("valid plugins");
-        let effects = host.dispatch_command(&invocation(&host, "/fail"), info(&host));
-        assert_eq!(effects, vec![PluginEffect::Error("boom".to_string())]);
+        let output = host.dispatch_command(&invocation(&host, "/fail"), info(&host));
+        assert_eq!(output.effects, vec![PluginEffect::Error("boom".to_string())]);
     }
 
     #[test]
     fn hooks_run_in_registration_order() {
         let host = host();
         assert_eq!(
-            host.startup(info(&host)),
+            host.startup(info(&host)).effects,
             vec![PluginEffect::Notice("audit:startup".to_string())]
         );
         assert_eq!(
-            host.user_message("hello", info(&host)),
+            host.user_message("hello", info(&host)).effects,
             vec![PluginEffect::Notice("audit:user:hello".to_string())]
         );
         assert_eq!(
-            host.turn_complete("done", info(&host)),
+            host.turn_complete("done", info(&host)).effects,
             vec![PluginEffect::Notice("audit:complete:done".to_string())]
         );
         assert_eq!(
-            host.conversation_cleared(info(&host)),
+            host.conversation_cleared(info(&host)).effects,
             vec![PluginEffect::Notice("audit:cleared".to_string())]
+        );
+    }
+
+    /// Subscribes to deltas and session facts; publishes a scoped status
+    /// segment and one background task on demand.
+    struct Meter;
+
+    impl Plugin for Meter {
+        fn id(&self) -> &'static str {
+            "meter"
+        }
+
+        fn subscriptions(&self) -> EventSubscription {
+            EventSubscription::DELTAS.union(EventSubscription::SESSION)
+        }
+
+        fn on_event(&self, event: &PluginEvent<'_>, ctx: &mut PluginContext<'_>) {
+            match event.kind {
+                PluginEventKind::MessageDelta { text, .. } => {
+                    ctx.notice(format!("meter:delta:{}", text.len()));
+                    if text.contains("status") {
+                        ctx.set_status(StatusSegment::new("rate", "42 t/s"));
+                        // A background task keeps only its bridge: sends land
+                        // on the host's receiver after the dispatch returns.
+                        let bridge = ctx.bridge();
+                        ctx.spawn(async move {
+                            bridge.notice("meter:from-task");
+                        });
+                    }
+                }
+                PluginEventKind::ModelSwitched { model } => {
+                    ctx.notice(format!("meter:model:{model}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    static METER: Meter = Meter;
+    static METER_PLUGINS: &[&dyn Plugin] = &[&METER];
+
+    #[test]
+    fn dispatch_event_delivers_subscribed_kinds_only() {
+        let host = PluginHost::new(METER_PLUGINS).expect("valid plugins");
+        // Usage is not in the meter's subscription: it never sees the event.
+        let usage = Event::new(
+            "t",
+            EventMsg::TurnUsage {
+                input: 10,
+                output: 2,
+            },
+        );
+        assert!(host.dispatch_event(&usage, info(&host)).effects.is_empty());
+
+        // Deltas are.
+        let delta = Event::new(
+            "t",
+            EventMsg::AgentMessageDelta {
+                delta: "hi".into(),
+            },
+        );
+        assert_eq!(
+            host.dispatch_event(&delta, info(&host)).effects,
+            vec![PluginEffect::Notice("meter:delta:2".to_string())]
+        );
+    }
+
+    #[test]
+    fn dispatch_event_scopes_status_keys_and_collects_tasks() {
+        let host = PluginHost::new(METER_PLUGINS).expect("valid plugins");
+        let delta = Event::new(
+            "t",
+            EventMsg::AgentMessageDelta {
+                delta: "status".into(),
+            },
+        );
+        let output = host.dispatch_event(&delta, info(&host));
+        assert_eq!(
+            output.effects,
+            vec![
+                PluginEffect::Notice("meter:delta:6".to_string()),
+                PluginEffect::SetStatus(StatusSegment {
+                    key: "meter:rate".to_string(),
+                    text: "42 t/s".to_string(),
+                    tone: StatusTone::Dim,
+                }),
+            ]
+        );
+        assert_eq!(output.tasks.len(), 1, "the spawned task rides the output");
+        // A second dispatch of the same event spawns nothing extra by
+        // itself — tasks come only from what the handler asked for.
+        assert_eq!(
+            host.dispatch_event(&delta, info(&host)).tasks.len(),
+            1,
+            "dispatch is stateless per call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spawned_tasks_effects_reach_the_host_receiver() {
+        let host = Arc::new(PluginHost::new(METER_PLUGINS).expect("valid plugins"));
+        // Claim the receiver before dispatching, then run what the dispatch
+        // spawned: its bridge send lands on this end of the channel.
+        let mut rx = host.take_effects_receiver().expect("receiver");
+        let delta = Event::new(
+            "t",
+            EventMsg::AgentMessageDelta {
+                delta: "status".into(),
+            },
+        );
+        let output = host.dispatch_event(&delta, info(&host));
+        for task in output.tasks {
+            task.await;
+        }
+        assert_eq!(
+            rx.recv().await,
+            Some(PluginEffect::Notice("meter:from-task".to_string()))
+        );
+    }
+
+    #[test]
+    fn events_are_stamped_at_construction() {
+        let first = Event::new("t", EventMsg::TurnStarted);
+        let second = Event::new("t", EventMsg::TurnComplete);
+        assert!(first.at <= second.at, "emit stamps advance monotonically");
+    }
+
+    #[test]
+    fn plugin_settings_resolve_per_plugin() {
+        struct Reader;
+
+        impl Plugin for Reader {
+            fn id(&self) -> &'static str {
+                "reader"
+            }
+
+            fn on_startup(&self, ctx: &mut PluginContext<'_>) {
+                let enabled = ctx
+                    .plugin_settings()
+                    .and_then(|settings| settings.option_bool("enabled"))
+                    .unwrap_or(false);
+                ctx.notice(format!("reader:enabled:{enabled}"));
+            }
+        }
+
+        static READER: Reader = Reader;
+        static READER_PLUGINS: &[&dyn Plugin] = &[&READER];
+        let host = PluginHost::new(READER_PLUGINS).expect("valid plugins");
+
+        let configs = vec![(
+            "reader".to_string(),
+            {
+                let mut options = serde_json::Map::new();
+                options.insert("enabled".to_string(), serde_json::json!(true));
+                PluginSettings { options }
+            },
+        )];
+        let mut configured = info(&host);
+        configured.plugin_configs = &configs;
+        assert_eq!(
+            host.startup(configured).effects,
+            vec![PluginEffect::Notice("reader:enabled:true".to_string())]
+        );
+
+        // Without a pocket the same hook sees the default.
+        assert_eq!(
+            host.startup(info(&host)).effects,
+            vec![PluginEffect::Notice("reader:enabled:false".to_string())]
         );
     }
 
@@ -869,8 +1240,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "clear", "quit", "status", "continue", "new", "rename", "sessions",
-                "model", "provider", "effort", "thinking", "profile", "tools", "context"
+                "help", "clear", "quit", "status", "continue", "tps", "new", "rename",
+                "sessions", "model", "provider", "effort", "thinking", "profile", "tools",
+                "context"
             ]
         );
     }
@@ -960,7 +1332,7 @@ mod tests {
         // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
         // must not break the shipped-table assertion.
         let host = PluginHost::shipped().expect("shipped plugins");
-        let effects = host.dispatch_command(&invocation(&host, "/help"), info(&host));
+        let effects = host.dispatch_command(&invocation(&host, "/help"), info(&host)).effects;
         let [PluginEffect::Notice(text)] = effects.as_slice() else {
             panic!("expected one help notice, got {effects:?}");
         };
@@ -974,15 +1346,15 @@ mod tests {
         // must not break the shipped-table assertion.
         let host = PluginHost::shipped().expect("shipped plugins");
         assert_eq!(
-            host.dispatch_command(&invocation(&host, "/clear"), info(&host)),
+            host.dispatch_command(&invocation(&host, "/clear"), info(&host)).effects,
             vec![PluginEffect::ClearConversation]
         );
         assert_eq!(
-            host.dispatch_command(&invocation(&host, "/quit"), info(&host)),
+            host.dispatch_command(&invocation(&host, "/quit"), info(&host)).effects,
             vec![PluginEffect::Quit]
         );
         assert_eq!(
-            host.dispatch_command(&invocation(&host, "/continue"), info(&host)),
+            host.dispatch_command(&invocation(&host, "/continue"), info(&host)).effects,
             vec![PluginEffect::ContinueTurn]
         );
     }
@@ -992,7 +1364,7 @@ mod tests {
         // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
         // must not break the shipped-table assertion.
         let host = PluginHost::shipped().expect("shipped plugins");
-        let effects = host.dispatch_command(&invocation(&host, "/status"), info(&host));
+        let effects = host.dispatch_command(&invocation(&host, "/status"), info(&host)).effects;
         let [PluginEffect::Notice(text)] = effects.as_slice() else {
             panic!("expected one status notice, got {effects:?}");
         };
