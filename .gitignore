@@ -2,3 +2,5 @@
 .DS_Store
 __pycache__/
 *.pyc
+# Editor/agent tool state, not project source.
+/.zcode/

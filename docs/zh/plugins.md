@@ -54,6 +54,8 @@ trait 及其交换的数据都在契约 crate
 | `subscriptions()` | — | `EventSubscription` | `NONE` |
 | `on_event(&PluginEvent, &mut PluginContext)` | 单个核心事件 + 上下文 | — | 无操作 |
 | `run_command(&Invocation, &mut PluginContext)` | 解析后的命令 + 参数 | `Result<(), PluginError>` | 报错 |
+| `settings()` | — | `Option<SettingsSection>` | `None` |
+| `on_settings_changed(Option<&PluginSettings>, &mut PluginContext)` | 写入后的配置口袋 | — | 无操作 |
 
 插件以 `&'static dyn Plugin` 共享，所以全部方法只拿 `&self`；有状态的插件用
 内部可变性（`Mutex`、原子类型）。命令规格、提示词片段、工具规格都是
@@ -116,7 +118,7 @@ pub static BUILTIN_PLUGINS: &[&dyn Plugin] = &[
 | `quit` | `/quit`（`/exit`） | 请求 `Quit` |
 | `status` | `/status` | backend、模式、transcript 大小、上下文用量、token 合计、插件列表 |
 | `continue` | `/continue` | 请求 `ContinueTurn`——恢复被打断的回合 |
-| `tps` | `/tps` | 页脚的实时 tokens-per-second 计量（默认关闭） |
+| `tps` | `/tps`、`/settings` 开关 | 页脚的实时 tokens-per-second 计量（默认关闭） |
 | `shell`（`bash` / `pwsh`） | 同名工具 + 提示词段落 | 执行一条 shell 命令 |
 | `fs` | `read`、`write`、`edit` 工具 | 文件操作 |
 
@@ -388,6 +390,56 @@ listen = "127.0.0.1:8737"
 `option_str` / `option_u64` / `option_bool` 读取器与原始 JSON map。命名
 未知插件 id 的表是**启动错误**——静默无操作会掩盖拼写错误——所以卸载
 插件时请顺手删掉对应的表。
+
+### 在 `/settings` 里暴露设置
+
+有选项的插件应当**声明**它们，而不是只写文档：从 `Plugin::settings()` 返回
+一个 `SettingsSection`，`/settings` 就会为它渲染一张卡，每个字段一行，任何编
+辑都变成对该插件口袋的一次写入。渲染、校验、持久化归宿主；每个键的含义归插
+件。
+
+```rust
+static FIELDS: [SettingField; 2] = [
+    SettingField::toggle("enabled", "计量器", "实时 tokens/秒 读数", false),
+    SettingField::select("mode", "模式", "读数何时折叠", &MODES, "auto"),
+];
+
+fn settings(&self) -> Option<SettingsSection> {
+    // title 是卡片标题；`/settings my-plugin` 仍按插件 id 找得到这张卡，所以
+    // 标题可以是一个好读的名字。
+    Some(SettingsSection::new("计量器", "实时吞吐", &FIELDS))
+}
+
+fn on_settings_changed(
+    &self,
+    settings: Option<&PluginSettings>,
+    ctx: &mut PluginContext<'_>,
+) {
+    // 写入成功后调用。声明为 `restart()` 的字段会被宿主跳过——宿主已经知道
+    // 它不该在本轮生效。
+    let enabled = settings.and_then(|s| s.option_bool("enabled")).unwrap_or(false);
+    self.set_enabled(enabled);
+}
+```
+
+四条规则让一张卡可预测：
+
+* **键就是口袋的键。** `SettingField::key` 指向 `[plugins."<id>"]` 里的一项
+  ——与 `ctx.plugin_settings()` 读的是同一项，所以界面写下的值就是下次启动解
+  析到的值。没有第二种格式。
+* **值是文本加类型。** `Boolean`、`Select`（配 `SettingOption`）、`Number`、
+  `Text` 决定行的编辑方式，以及文本如何存成 TOML（`true`、`64`、`"high"`）。
+  解析不了的数字在碰到文件之前就被拒绝。
+* **`default` 描述「键不存在」的含义。** 行上会标注 `(默认)`，清空文本行会删
+  除该键——恢复这个默认值，而不是把它固化下来。
+* **`restart()` 标记只在启动生效的字段。** 编辑仍然持久化；行上带 `⟲` 标记、
+  帮助栏补一句 `restart to apply`，但宿主会**跳过 `on_settings_changed`**——
+  当前会话保持启动时读到的值。凡是喂给启动时只构建一次的东西（监听地址、协议
+  选择），都该这样声明。
+
+内置 `tps` 插件（[tps.rs](../../src/plugins/builtin/tps.rs)）是参考实现：一个开
+关，写进 `[plugins.tps] enabled`，并且即时应用，所以不重启也能打开计量器。它
+的 `/tps` 命令仍是同一个开关的「仅本次运行」快捷方式。
 
 **监控插件端到端：**订阅 `EventSubscription::ALL`，把 `SNAPSHOT` 事件当作
 权威 transcript，在 spawn 出的 WebSocket 服务器里尽力转发分批的增量，用

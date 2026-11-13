@@ -94,6 +94,8 @@ pub enum PluginHostError {
     EmptyPluginId,
     #[error("plugin id `{id}` is registered more than once")]
     DuplicatePluginId { id: &'static str },
+    #[error("plugin id `{id}` is reserved for the host's own `/settings` card")]
+    ReservedPluginId { id: &'static str },
     #[error("tool `{name}` is declared more than once")]
     DuplicateTool { name: &'static str },
     #[error("tool filter names unknown plugin `{id}` (known: {known})")]
@@ -113,6 +115,7 @@ static SHIPPED_COMMAND_GROUPS: &[&[CommandSpec]] = &[
     crate::core::config::PROFILE_COMMANDS,
     crate::core::tools_switch::TOOLS_COMMANDS,
     crate::core::context::CONTEXT_COMMANDS,
+    crate::core::settings::SETTINGS_COMMANDS,
 ];
 
 /// Owns the static plugin list and the command table they contribute.
@@ -165,6 +168,12 @@ impl PluginHost {
             let id = plugin.id();
             if id.is_empty() {
                 return Err(PluginHostError::EmptyPluginId);
+            }
+            // `/settings` shows the host's own card under this name and
+            // `[plugins."<id>"]` pockets share one file, so a plugin may not
+            // claim it.
+            if id == cst_plugin_api::settings::HOST_NAMESPACE {
+                return Err(PluginHostError::ReservedPluginId { id });
             }
             if ids.contains(&id) {
                 return Err(PluginHostError::DuplicatePluginId { id });
@@ -448,6 +457,47 @@ impl PluginHost {
 
     pub fn conversation_cleared(&self, info: PluginInfo<'_>) -> PluginOutput {
         self.run_hooks(info, |plugin, ctx| plugin.on_conversation_cleared(ctx))
+    }
+
+    /// The settings sections the loaded plugins declare, in registration
+    /// order. `/settings` renders one section per entry; a plugin that
+    /// returned `None` (the default) contributes nothing.
+    pub fn settings_sections(
+        &self,
+    ) -> Vec<(&'static str, cst_plugin_api::settings::SettingsSection)> {
+        self.plugins
+            .iter()
+            .filter_map(|plugin| {
+                let section = plugin.settings()?;
+                (!section.fields.is_empty()).then_some((plugin.id(), section))
+            })
+            .collect()
+    }
+
+    /// Tell one plugin that its settings pocket changed. The front-end calls
+    /// this after a successful write; `settings` is the pocket as the file now
+    /// reads (`None` once the last key was removed).
+    pub fn settings_changed(
+        &self,
+        plugin_id: &str,
+        settings: Option<&PluginSettings>,
+        info: PluginInfo<'_>,
+    ) -> PluginOutput {
+        match self.owner_of_id(plugin_id) {
+            Some(plugin) => {
+                let mut ctx = self.context(plugin.id(), info);
+                plugin.on_settings_changed(settings, &mut ctx);
+                PluginOutput::from_ctx(ctx)
+            }
+            None => PluginOutput::empty(),
+        }
+    }
+
+    fn owner_of_id(&self, plugin_id: &str) -> Option<&'static dyn Plugin> {
+        self.plugins
+            .iter()
+            .copied()
+            .find(|plugin| plugin.id() == plugin_id)
     }
 
     /// Fan one core event out to the plugins that subscribed to its category,
@@ -980,6 +1030,65 @@ mod tests {
     }
 
     #[test]
+    fn settings_sections_come_from_the_plugins_that_declare_one() {
+        use cst_plugin_api::settings::SettingField;
+        use cst_plugin_api::settings::SettingsSection;
+
+        struct Tunable;
+
+        static FIELDS: [SettingField; 1] = [SettingField::toggle("enabled", "Meter", "…", false)];
+        static SECTION: SettingsSection = SettingsSection::new("tunable", "…", &FIELDS);
+
+        impl Plugin for Tunable {
+            fn id(&self) -> &'static str {
+                "tunable"
+            }
+
+            fn settings(&self) -> Option<SettingsSection> {
+                Some(SECTION)
+            }
+
+            fn on_settings_changed(
+                &self,
+                settings: Option<&PluginSettings>,
+                ctx: &mut PluginContext<'_>,
+            ) {
+                let enabled = settings.and_then(|settings| settings.option_bool("enabled"));
+                ctx.notice(format!("tunable:{enabled:?}"));
+            }
+        }
+
+        static TUNABLE: Tunable = Tunable;
+        static TUNABLE_PLUGINS: &[&dyn Plugin] = &[&TUNABLE];
+        let host = PluginHost::new(TUNABLE_PLUGINS).expect("valid plugins");
+
+        // Only the plugins that declared a section appear, in order.
+        let sections = host.settings_sections();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, "tunable");
+        assert_eq!(sections[0].1.fields[0].key, "enabled");
+
+        // The plugin is told the pocket as written, `None` once it is empty —
+        // and an id nothing owns is a silent no-op, not a panic.
+        let mut options = serde_json::Map::new();
+        options.insert("enabled".to_string(), serde_json::json!(true));
+        let pocket = PluginSettings { options };
+        assert_eq!(
+            host.settings_changed("tunable", Some(&pocket), info(&host)).effects,
+            vec![PluginEffect::Notice("tunable:Some(true)".to_string())]
+        );
+        assert_eq!(
+            host.settings_changed("tunable", None, info(&host)).effects,
+            vec![PluginEffect::Notice("tunable:None".to_string())]
+        );
+        assert!(
+            host.settings_changed("absent", None, info(&host))
+                .effects
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn system_prompt_appends_fragments() {
         let host = PluginHost::new(PERSONA_PLUGINS).expect("valid plugins");
         assert_eq!(host.system_prompt("base"), "base\n\nBe terse.");
@@ -1010,6 +1119,28 @@ mod tests {
         assert!(matches!(
             PluginHost::new(TWINS),
             Err(PluginHostError::DuplicatePluginId { id: "twin" })
+        ));
+    }
+
+    /// `/settings` always shows the host's own card under `HOST_NAMESPACE`,
+    /// so a plugin claiming that id would put two cards with one title on
+    /// screen and make `/settings codest` ambiguous.
+    #[test]
+    fn the_host_namespace_is_not_a_plugin_id() {
+        struct Impostor;
+
+        impl Plugin for Impostor {
+            fn id(&self) -> &'static str {
+                cst_plugin_api::settings::HOST_NAMESPACE
+            }
+        }
+
+        static IMPOSTOR: Impostor = Impostor;
+        static IMPOSTORS: &[&dyn Plugin] = &[&IMPOSTOR];
+
+        assert!(matches!(
+            PluginHost::new(IMPOSTORS),
+            Err(PluginHostError::ReservedPluginId { id: "codest" })
         ));
     }
 
@@ -1242,7 +1373,7 @@ mod tests {
             vec![
                 "help", "clear", "quit", "status", "continue", "tps", "new", "rename",
                 "sessions", "model", "provider", "effort", "thinking", "profile", "tools",
-                "context"
+                "context", "settings"
             ]
         );
     }

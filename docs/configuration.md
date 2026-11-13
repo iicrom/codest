@@ -59,6 +59,29 @@ enabled = true                        # start with the meter on (default off)
 
 **`[plugins."<id>"]`** is the per-plugin settings pocket — the whole table is handed to the plugin verbatim ([plugins.md](plugins.md), section 6); a plugin reads it through `PluginContext::plugin_settings()`. A table naming an unknown plugin id is a **startup error** (a silent no-op would hide a typo), so remove the table when you uninstall a plugin.
 
+### `/settings`
+
+`/settings` is the screen that edits this file: one card for the host's own options (`[status_bar] plugin_segments` today) and one card per plugin that declared settings, each row showing the stored value or the default. `↑`/`↓` walk the rows, `Enter` flips a switch / advances a list / opens a one-line editor, `←`/`→` step a list (and a switch) backwards/forwards, `Esc` closes; `/settings tps` opens with that card focused.
+
+```text
+ Settings › tps                                            1/2
+ codest  ·  tps
+╭─ codest ─ host settings ─────────────────────────────────╮
+│ ❯ Plugin segments                                  [x]   │
+╰──────────────────────────────────────────────────────────╯
+╭─ tps ─ throughput meter ─────────────────────────────────╮
+│   Tokens-per-second meter                          [x]   │
+╰──────────────────────────────────────────────────────────╯
+```
+
+Every edit is written immediately — there is no unsaved-draft state — and a value lands in exactly the table it came from: a host row in its dotted `config.toml` path, a plugin row in that plugin's `[plugins."<id>"]` pocket. Three consequences are worth knowing:
+
+* **The write is validated and atomic.** The rewritten document is parsed back into the strict `GlobalConfig` first; anything it would reject is refused with the reason in the notice line, and the file is replaced through a temporary sibling, so a failure never leaves a half-written `config.toml`.
+* **Comments and hand formatting are lost on the first save.** The file becomes machine-managed from then on, exactly like a `/provider` wizard write.
+* **Clearing a text row removes the key**, restoring the plugin's default; toggling a switch writes `true`/`false` explicitly. Most edits apply to the running session immediately (the plugin is told through `Plugin::on_settings_changed`); a row declared startup-only carries a `⟲` marker (the help bar adds `restart to apply`) and persists without applying — the host skips the hook for it.
+
+`/tps` remains the keyboard shortcut for the same meter: it flips this run only and never rewrites the file. `/settings` is where the choice is recorded.
+
 ## Provider instances
 
 `providers.toml` is optional. A missing file contributes no instances; if flags or env then name an endpoint, codest synthesizes a single `openai-compat` instance for that run, and with nothing at all the route is empty and the TUI guides you to add a provider.

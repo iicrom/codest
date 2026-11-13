@@ -28,11 +28,19 @@
 //! enabled = true
 //! ```
 //!
-//! starts it on.
+//! starts it on. `/settings` edits that same key: the row writes
+//! `[plugins.tps] enabled` through the host, the file is the record, and
+//! [`Plugin::on_settings_changed`] flips the meter in place — no restart, and
+//! the choice survives the next run. `/tps` stays the keyboard shortcut for
+//! the same switch; it only changes this run (the file is not rewritten from
+//! a slash command).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Instant;
+
+use cst_plugin_api::settings::SettingField;
+use cst_plugin_api::settings::SettingsSection;
 
 use crate::plugins::ArgsPolicy;
 use crate::plugins::CommandSpec;
@@ -76,6 +84,21 @@ static COMMANDS: [CommandSpec; 1] = [CommandSpec::new(
     "toggle the tokens-per-second status meter",
     ArgsPolicy::None,
 )];
+
+/// What `/settings` offers for this plugin: the one key it reads at startup
+/// and applies live. The description says both, because the row is the only
+/// place the user learns that `/tps` leaves the file alone.
+static SETTINGS_FIELDS: [SettingField; 1] = [SettingField::toggle(
+    "enabled",
+    "Tokens-per-second meter",
+    "Show the live t/s readout while streaming and the per-turn sparkline \
+     while idle. Saved here, so it survives a restart; /tps flips the meter \
+     for this run only.",
+    false,
+)];
+
+static SETTINGS_SECTION: SettingsSection =
+    SettingsSection::new("tps", "throughput meter", &SETTINGS_FIELDS);
 
 /// One turn's metering: decode time from closed steps, the streamed-text
 /// estimate, and the backend's real output once it arrives.
@@ -171,6 +194,20 @@ pub struct Tps {
 }
 
 impl Tps {
+    /// Whether the meter is on for this run — the reading `/tps` flips and
+    /// `/settings` persists.
+    pub fn is_enabled(&self) -> bool {
+        self.state.lock().expect("tps state").enabled
+    }
+
+    /// Return the shared [`TPS`] instance to its startup state (off, no
+    /// metering). The static is process-wide, so a test that flips it has to
+    /// put it back or it leaks into every other test sharing the shipped host.
+    #[cfg(test)]
+    pub fn reset_for_test(&self) {
+        *self.state.lock().expect("tps state") = TpsState::new();
+    }
+
     fn publish_rate(&self, state: &TpsState, ctx: &mut PluginContext<'_>) {
         match state.live {
             Some(tps) => {
@@ -208,6 +245,42 @@ impl Plugin for Tps {
 
     fn commands(&self) -> &'static [CommandSpec] {
         &COMMANDS
+    }
+
+    fn settings(&self) -> Option<SettingsSection> {
+        Some(SETTINGS_SECTION)
+    }
+
+    fn on_settings_changed(
+        &self,
+        settings: Option<&crate::plugins::PluginSettings>,
+        ctx: &mut PluginContext<'_>,
+    ) {
+        // The file is the record; this is the live half. A pocket with no
+        // `enabled` (the key was removed) means the plugin's default: off.
+        let enabled = settings
+            .and_then(|settings| settings.option_bool("enabled"))
+            .unwrap_or(false);
+        let mut state = self.state.lock().expect("tps state");
+        if state.enabled == enabled {
+            // Idempotent: a save that repeats the stored value says nothing.
+            return;
+        }
+        state.enabled = enabled;
+        if enabled {
+            // Anything streamed before the switch was never metered, so the
+            // turn starts from here rather than reporting a bogus span.
+            state.turn = None;
+            state.live = None;
+            ctx.notice("tps meter on");
+            self.publish_spark(&state, ctx);
+        } else {
+            state.turn = None;
+            state.live = None;
+            ctx.notice("tps meter off");
+            ctx.clear_status("rate");
+            ctx.clear_status("spark");
+        }
     }
 
     fn subscriptions(&self) -> EventSubscription {
@@ -826,5 +899,61 @@ mod tests {
             &event(EventMsg::AgentMessageDelta { delta: "c".repeat(48) }, 800),
         );
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// The `/settings` toggle and `/tps` are the same switch: the persisted
+    /// hook applies live, and turning it off retires the segments it drew.
+    #[test]
+    fn the_settings_toggle_applies_live_and_clears_when_switched_off() {
+        let tps = fresh();
+        let table = CommandTable::new(std::iter::empty()).expect("empty table");
+        let bridge = || {
+            PluginBridge::new(tps.id(), CancellationToken::new(), Arc::new(|_| {}))
+        };
+
+        // Switching on is a notice plus the switch itself.
+        let mut ctx = PluginContext::new(&table, info(), tps.id(), bridge());
+        let on = cst_plugin_api::config::PluginSettings {
+            options: serde_json::json!({ "enabled": true })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        };
+        tps.on_settings_changed(Some(&on), &mut ctx);
+        let effects = ctx.into_effects();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, PluginEffect::Notice(text) if text.contains("on"))),
+            "{effects:?}"
+        );
+        assert!(tps.is_enabled());
+
+        // It meters from here on, exactly like `/tps` had been typed.
+        dispatch(&tps, &event(EventMsg::TurnStarted, 0));
+        stream_a_round(&tps, 100);
+        assert!(
+            set_segment(
+                &dispatch(
+                    &tps,
+                    &event(EventMsg::AgentMessageDelta { delta: "b".repeat(4) }, 800),
+                ),
+                "rate",
+            ),
+            "the meter publishes once the settings toggle is on"
+        );
+
+        // Switching off through the same hook clears what it drew.
+        let mut ctx = PluginContext::new(&table, info(), tps.id(), bridge());
+        tps.on_settings_changed(None, &mut ctx);
+        let effects = ctx.into_effects();
+        assert!(cleared(&effects, "rate"), "{effects:?}");
+        assert!(cleared(&effects, "spark"), "{effects:?}");
+        assert!(!tps.is_enabled());
+
+        // A repeat of the stored value is a no-op.
+        let mut ctx = PluginContext::new(&table, info(), tps.id(), bridge());
+        tps.on_settings_changed(None, &mut ctx);
+        assert!(ctx.into_effects().is_empty());
     }
 }

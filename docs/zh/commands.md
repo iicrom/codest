@@ -23,6 +23,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | `/effort [level]` | — | 查看或设置推理等级（默认 `minimal`/`low`/`medium`/`high`，`off` 清除），以 `reasoning_effort` 下发。 |
 | `/thinking` | — | 切换 thinking 卡片展开/折叠（等同 `Ctrl+T`）。 |
 | `/tools [name] [on\|off]` | — | 查看或设置本会话启用的工具；禁用的工具从请求中移除。 |
+| `/settings [section]` | — | 打开设置界面：宿主与插件选项，保存进 `config.toml`。参数可直接聚焦某个分区。 |
 
 与会话相关的指令、回合边界规则以及切换后恢复什么，见 [sessions.md](sessions.md)；`/tools` 与工具链路见 [tools.md](tools.md)。
 
@@ -37,7 +38,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | 策略 | 指令 | 多出的参数 |
 | --- | --- | --- |
 | 无 | `/help`、`/clear`、`/quit`、`/status`、`/context`、`/new`、`/sessions`、`/continue`、`/model`、`/provider`、`/thinking` | 报错并指明该指令 |
-| 可选 | `/profile`、`/effort`、`/tools` | 属于指令本身（profile 名、等级、工具名） |
+| 可选 | `/profile`、`/effort`、`/tools`、`/settings` | 属于指令本身（profile 名、等级、工具名、分区名） |
 | 必需 | `/rename` | — 参数为空时报错 |
 
 - 只有 `/`（没有名字）与未知名字都是打印到 transcript 的错误，不会发给模型。
@@ -50,7 +51,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | 分组 | 指令 | 归属 |
 | --- | --- | --- |
 | 内置插件 | `/help`、`/clear`、`/quit`、`/status`、`/continue` | `src/plugins/builtin/` —— 同时作为插件示例。 |
-| 前端指令 | `/new`、`/rename`、`/sessions`、`/model`、`/provider`、`/profile`、`/effort`、`/thinking`、`/tools`、`/context` | core/TUI，在插件宿主之前派发。 |
+| 前端指令 | `/new`、`/rename`、`/sessions`、`/model`、`/provider`、`/profile`、`/effort`、`/thinking`、`/tools`、`/context`、`/settings` | core/TUI，在插件宿主之前派发。 |
 
 插件贡献的指令进入同一张表，因此自动获得候选菜单与 `/help`；名字与别名在启动时校验且必须全局唯一。见 [plugins.md](../plugins.md)。
 

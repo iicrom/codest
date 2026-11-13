@@ -110,6 +110,7 @@ codest/
     │   ├── context_store.rs   # context browse/edit state
     │   ├── tools.rs           # tool dispatch
     │   ├── tools_switch.rs    # /tools session toggles
+    │   ├── settings.rs        # /settings command + config.toml writes
     │   ├── conversation.rs    # linear conversation history
     │   ├── model.rs           # ModelClient trait + StreamItem + errors
     │   ├── openai_compat.rs   # HTTP + SSE streaming client (openai-compat protocol)
@@ -122,7 +123,7 @@ codest/
     ├── plugins/
     │   ├── mod.rs             # Plugin trait host / effects / protocol collection
     │   ├── install.rs         # codest plugin install|uninstall|list|build
-    │   └── builtin/           # static registry: help, clear, quit, status, continue, tools/{shell,bash,pwsh,fs,truncate}
+    │   └── builtin/           # static registry: help, clear, quit, status, continue, tps, tools/{shell,bash,pwsh,fs,truncate}
     └── tui/
         ├── app.rs             # event loop / fullscreen & inline rendering / menus
         ├── session.rs         # per-session view state
@@ -130,6 +131,10 @@ codest/
         ├── composer.rs        # input editor
         ├── provider_wizard.rs # /provider wizard
         ├── context_view.rs    # /context viewer
+        ├── settings_view.rs   # /settings screen (field → row mapping)
+        ├── screen.rs          # full-frame screen chrome: header/strip/rule/notice/hint + scroll
+        ├── cards.rs           # card borders, pointer gutter, row/value column
+        ├── inline_edit.rs     # one-line editor shared by the list screens
         ├── markdown.rs        # Markdown rendering (pulldown-cmark)
         ├── highlight.rs       # code highlighting (syntect → TokenKind)
         ├── theme.rs           # colors

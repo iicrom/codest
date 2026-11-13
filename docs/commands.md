@@ -23,6 +23,7 @@ Slash commands are the local control surface of the TUI: they are parsed and exe
 | `/effort [level]` | — | Show or set the reasoning effort (`minimal`/`low`/`medium`/`high` by default, `off` unsets); sent as `reasoning_effort`. |
 | `/thinking` | — | Toggle whether thinking cards expand when settled (same as `Ctrl+T`). |
 | `/tools [name] [on\|off]` | — | Show or set this session's enabled tools; disabled tools are removed from the request. |
+| `/settings [section]` | — | Open the settings screen: host and plugin options, saved to `config.toml`. An argument focuses that section. |
 
 Session-related commands, their turn-boundary rules, and what a switch restores are covered in [sessions.md](sessions.md); `/tools` and the tool loop in [tools.md](tools.md).
 
@@ -37,7 +38,7 @@ A submission is classified once, when it is sent:
 | Policy | Commands | A stray argument is |
 | --- | --- | --- |
 | none | `/help`, `/clear`, `/quit`, `/status`, `/context`, `/new`, `/sessions`, `/continue`, `/model`, `/provider`, `/thinking` | rejected with an error naming the command |
-| optional | `/profile`, `/effort`, `/tools` | part of the command (a profile name, a level, a tool name) |
+| optional | `/profile`, `/effort`, `/tools`, `/settings` | part of the command (a profile name, a level, a tool name, a section name) |
 | required | `/rename` | — an empty argument list is rejected |
 
 - A bare `/` (no name) and an unknown name are errors printed in the transcript, not sent to the model.
@@ -50,7 +51,7 @@ The shipped table merges two groups, and parsing, the popup, and `/help` all rea
 | Group | Commands | Owned by |
 | --- | --- | --- |
 | Built-in plugins | `/help`, `/clear`, `/quit`, `/status`, `/continue` | `src/plugins/builtin/` — they double as plugin examples. |
-| Front-end commands | `/new`, `/rename`, `/sessions`, `/model`, `/provider`, `/profile`, `/effort`, `/thinking`, `/tools`, `/context` | Core/TUI, dispatched before the plugin host. |
+| Front-end commands | `/new`, `/rename`, `/sessions`, `/model`, `/provider`, `/profile`, `/effort`, `/thinking`, `/tools`, `/context`, `/settings` | Core/TUI, dispatched before the plugin host. |
 
 Plugin-contributed commands join the same table, so they get the popup and `/help` for free; names and aliases are validated and must be globally unique at startup. See [plugins.md](plugins.md).
 
