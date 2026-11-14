@@ -22,9 +22,9 @@
 //!   context entries to local files — the future "index" externalization.
 
 pub mod commands;
+pub mod config;
 pub mod context;
 pub mod context_store;
-pub mod config;
 pub mod conversation;
 pub mod echo_model;
 pub mod model;
@@ -41,20 +41,20 @@ pub mod sse;
 pub mod tokens;
 pub mod tools;
 pub mod tools_switch;
+pub mod usage;
 
 pub use commands::{
     ArgsPolicy, CommandCandidate, CommandError, CommandInput, CommandSpec, CommandTable,
     CommandTableError, Invocation,
 };
-pub use config::{
-    GlobalConfig, ModelInfo, ProviderInstance, expand_env_template, providers_path,
-};
+pub use config::{GlobalConfig, ModelInfo, ProviderInstance, expand_env_template, providers_path};
+pub use context::CONTEXT_COMMANDS;
 pub use conversation::{Conversation, DEFAULT_SYSTEM_PROMPT};
 pub use echo_model::EchoModelClient;
 pub use model::{ModelClient, ModelError, StreamItem, TurnOptions};
 pub use protocol::{Event, EventMsg, Message, Op, Role, Submission};
 pub use providers::{
-    NO_MODEL_GUIDANCE, NO_MODEL_SELECTED, ModelPool, ProtocolFactory, ProviderRegistry,
+    ModelPool, NO_MODEL_GUIDANCE, NO_MODEL_SELECTED, ProtocolFactory, ProviderRegistry,
     RegistryError, Selection, missing_credential_guidance,
 };
 pub use reasoning::{DEFAULT_EFFORT_LEVELS, EFFORT_COMMAND, REASONING_COMMANDS, THINKING_COMMAND};
@@ -62,8 +62,12 @@ pub use rollout::{LoadedSession, RolloutItem, RolloutWriter, SessionMeta};
 pub use session::{AgentSession, SessionBootstrap};
 pub use session_id::{is_session_id, new_session_id};
 pub use sessions::SESSION_COMMANDS;
-pub use context::CONTEXT_COMMANDS;
 pub use settings::SETTINGS_COMMANDS;
-pub use tokens::{context_percent, format_context_usage, format_tokens};
-pub use tools_switch::TOOLS_COMMANDS;
+pub use tokens::{
+    cache_percent, context_percent, format_cache_rate, format_context_usage, format_tokens,
+};
 pub use tools::{DEFAULT_MAX_TOOL_ROUNDS, ToolCall, ToolExecutor, ToolSpec};
+pub use tools_switch::TOOLS_COMMANDS;
+pub use usage::{
+    ContextComposition, USAGE_COMMANDS, attribute_composition, estimate_tokens, render_usage_bar,
+};

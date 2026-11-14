@@ -9,6 +9,7 @@
 
 use crate::core::protocol::Role;
 use crate::core::rollout::LoadedSession;
+use crate::core::rollout::UsageTurn;
 use crate::tui::TuiMode;
 use crate::tui::chat::{CardDisplay, HistoryCell};
 use crate::tui::wrap::char_width;
@@ -107,9 +108,22 @@ pub struct SessionView {
     /// follows a running turn) and is settled by the completed turn's
     /// `TurnUsage`. `None` until this run measures anything.
     pub last_usage: Option<(u64, u64)>,
+    /// The prompt-cache subset of `last_usage`'s input, as the backend
+    /// reported it. `None` when the backend reports no cache accounting —
+    /// "unknown", never zero. Like `last_usage`, it moves with every
+    /// measured round and settles with the completed turn.
+    pub last_cached: Option<u64>,
     /// Cumulative measured tokens across the session's completed turns.
     pub total_input: u64,
     pub total_output: u64,
+    /// Cumulative cached input across the session's completed turns. Lags
+    /// `total_input` legitimately: many providers report no cache
+    /// accounting.
+    pub total_cached: u64,
+    /// One record per completed turn, oldest first — what `/usage`'s
+    /// per-turn and per-model breakdowns show. Mirrors the rollout's
+    /// `TurnUsage` records.
+    pub turns: Vec<UsageTurn>,
 }
 
 impl SessionView {
@@ -300,8 +314,11 @@ impl SessionView {
         // resumed session shows its restored context size before the first
         // new turn measures it again.
         view.last_usage = loaded.last_usage;
+        view.last_cached = loaded.last_cached;
         view.total_input = loaded.total_input;
         view.total_output = loaded.total_output;
+        view.total_cached = loaded.total_cached;
+        view.turns = loaded.turns.clone();
         view.printed_cells = view.history.len();
         view
     }
@@ -322,8 +339,11 @@ impl SessionView {
             live_committed: 0,
             inline_final_text: None,
             last_usage: None,
+            last_cached: None,
             total_input: 0,
             total_output: 0,
+            total_cached: 0,
+            turns: Vec::new(),
         }
     }
 
@@ -450,8 +470,11 @@ mod tests {
             name: None,
             model: None,
             last_usage: None,
+            last_cached: None,
             total_input: 0,
             total_output: 0,
+            total_cached: 0,
+            turns: Vec::new(),
             profile: None,
             tools: None,
         };
@@ -512,8 +535,11 @@ mod tests {
             name: None,
             model: None,
             last_usage: None,
+            last_cached: None,
             total_input: 0,
             total_output: 0,
+            total_cached: 0,
+            turns: Vec::new(),
             profile: None,
             tools: None,
         };

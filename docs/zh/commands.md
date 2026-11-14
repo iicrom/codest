@@ -11,7 +11,8 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | `/help` | `/h`、`/?` | 显示指令列表（含插件贡献的指令）。 |
 | `/clear` | — | 清空会话上下文与屏幕 transcript。 |
 | `/quit` | `/exit` | 退出 codest。 |
-| `/status` | — | 显示 backend、模式、transcript 大小与已加载插件。 |
+| `/status` | — | 显示 backend、模式、transcript 大小、上下文用量、缓存命中率与已加载插件。 |
+| `/usage` | — | 显示详细的 context 消耗统计：按内容类型拆分窗口占用（system / prompt / assistant / thinking / tools / free）、token 条形图、缓存命中率与逐轮历史。 |
 | `/context` | — | 显示模型实际收到的内容：工具及启用状态、组装后的系统提示词（逐段标注出处）、请求配置与 token 用量。会话中可浏览、删除、编辑上下文条目。 |
 | `/new` | — | 归档当前对话，开启新的空会话。 |
 | `/rename <name>` | — | 重命名当前会话（默认名取第一句用户输入）。 |
@@ -37,7 +38,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 
 | 策略 | 指令 | 多出的参数 |
 | --- | --- | --- |
-| 无 | `/help`、`/clear`、`/quit`、`/status`、`/context`、`/new`、`/sessions`、`/continue`、`/model`、`/provider`、`/thinking` | 报错并指明该指令 |
+| 无 | `/help`、`/clear`、`/quit`、`/status`、`/context`、`/usage`、`/new`、`/sessions`、`/continue`、`/model`、`/provider`、`/thinking` | 报错并指明该指令 |
 | 可选 | `/profile`、`/effort`、`/tools`、`/settings` | 属于指令本身（profile 名、等级、工具名、分区名） |
 | 必需 | `/rename` | — 参数为空时报错 |
 
@@ -51,7 +52,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | 分组 | 指令 | 归属 |
 | --- | --- | --- |
 | 内置插件 | `/help`、`/clear`、`/quit`、`/status`、`/continue` | `src/plugins/builtin/` —— 同时作为插件示例。 |
-| 前端指令 | `/new`、`/rename`、`/sessions`、`/model`、`/provider`、`/profile`、`/effort`、`/thinking`、`/tools`、`/context`、`/settings` | core/TUI，在插件宿主之前派发。 |
+| 前端指令 | `/new`、`/rename`、`/sessions`、`/model`、`/provider`、`/profile`、`/effort`、`/thinking`、`/tools`、`/context`、`/settings`、`/usage` | core/TUI，在插件宿主之前派发。 |
 
 插件贡献的指令进入同一张表，因此自动获得候选菜单与 `/help`；名字与别名在启动时校验且必须全局唯一。见 [plugins.md](../plugins.md)。
 

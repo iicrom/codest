@@ -28,8 +28,16 @@ pub enum StreamItem {
     /// argument fragments have been reassembled (typically at
     /// `finish_reason: "tool_calls"` or `[DONE]`).
     ToolCalls(Vec<crate::tools::ToolCall>),
-    /// Token usage reported for the turn.
-    Usage { input: u64, output: u64 },
+    /// Token usage reported for one streaming round. `cached` is the
+    /// prompt-prefix subset of `input` the provider served from its prompt
+    /// cache (`prompt_tokens_details.cached_tokens` on OpenAI-compatible
+    /// APIs), when it reports one — `None` means the backend does not
+    /// expose cache accounting, not zero.
+    Usage {
+        input: u64,
+        output: u64,
+        cached: Option<u64>,
+    },
 }
 
 /// Boxed delta stream. `Err` terminates the turn with an error event.

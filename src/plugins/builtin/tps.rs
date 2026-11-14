@@ -477,15 +477,15 @@ mod tests {
     use std::time::Duration;
 
     use crate::core::EventMsg;
+    use crate::core::protocol::Event;
     use crate::plugins::DeltaKind;
     use crate::plugins::PluginBridge;
     use crate::plugins::PluginEffect;
-    use tokio_util::sync::CancellationToken;
-    use crate::core::protocol::Event;
     use crate::plugins::PluginEventKind;
     use crate::plugins::RequestFacts;
     use cst_plugin_api::commands::CommandTable;
     use cst_plugin_api::plugin::PluginInfo;
+    use tokio_util::sync::CancellationToken;
 
     fn info() -> PluginInfo<'static> {
         static NO_TOOLS: [crate::core::ToolSpec; 0] = [];
@@ -496,8 +496,10 @@ mod tests {
             transcript_len: 0,
             context_window: None,
             last_usage: None,
+            last_cached: None,
             total_input: 0,
             total_output: 0,
+            total_cached: 0,
             plugin_ids: &["tps"],
             system_sections: &[],
             effort: None,
@@ -517,11 +519,7 @@ mod tests {
     /// A context whose collected effects are returned after the dispatch.
     fn dispatch(plugin: &Tps, event: &Event) -> Vec<PluginEffect> {
         let table = CommandTable::new(std::iter::empty()).expect("empty table");
-        let bridge = PluginBridge::new(
-            plugin.id(),
-            CancellationToken::new(),
-            Arc::new(|_| {}),
-        );
+        let bridge = PluginBridge::new(plugin.id(), CancellationToken::new(), Arc::new(|_| {}));
         let mut ctx = PluginContext::new(&table, info(), plugin.id(), bridge);
         plugin.on_event(
             &PluginEvent {
@@ -545,12 +543,14 @@ mod tests {
                 kind: DeltaKind::Thinking,
                 text: delta,
             },
-            EventMsg::TurnUsage { input, output } => {
-                PluginEventKind::TurnUsage { input: *input, output: *output }
-            }
-            EventMsg::ContextUsage { input, output } => {
-                PluginEventKind::RoundUsage { input: *input, output: *output }
-            }
+            EventMsg::TurnUsage { input, output, .. } => PluginEventKind::TurnUsage {
+                input: *input,
+                output: *output,
+            },
+            EventMsg::ContextUsage { input, output, .. } => PluginEventKind::RoundUsage {
+                input: *input,
+                output: *output,
+            },
             EventMsg::AgentToolCallStarted { name, arguments } => {
                 PluginEventKind::ToolCallStarted { name, arguments }
             }
@@ -602,17 +602,15 @@ mod tests {
         let tps = fresh();
         // Enable, then feed a turn that produced a few tokens over 100 ms.
         let table = CommandTable::new(std::iter::empty()).expect("empty table");
-        let bridge = PluginBridge::new(
-            tps.id(),
-            CancellationToken::new(),
-            Arc::new(|_| {}),
-        );
+        let bridge = PluginBridge::new(tps.id(), CancellationToken::new(), Arc::new(|_| {}));
         let mut ctx = PluginContext::new(&table, info(), tps.id(), bridge);
         tps.run_command(&toggle(), &mut ctx).expect("toggle");
         let effects = ctx.into_effects();
-        assert!(effects.iter().any(
-            |effect| matches!(effect, PluginEffect::Notice(text) if text.contains("on"))
-        ));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, PluginEffect::Notice(text) if text.contains("on")))
+        );
 
         let out = dispatch(&tps, &event(EventMsg::TurnStarted, 0));
         let out = {
@@ -624,7 +622,8 @@ mod tests {
             combined
         };
         assert!(
-            !out.iter().any(|effect| matches!(effect, PluginEffect::SetStatus(_))),
+            !out.iter()
+                .any(|effect| matches!(effect, PluginEffect::SetStatus(_))),
             "a 100 ms decode span is below the noise floor: {out:?}"
         );
     }
@@ -657,18 +656,34 @@ mod tests {
 
     /// The meter's per-turn sample ring.
     fn samples(tps: &Tps) -> Vec<f64> {
-        tps.state.lock().expect("tps state").samples.iter().copied().collect()
+        tps.state
+            .lock()
+            .expect("tps state")
+            .samples
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// One streamed round: 48 ASCII chars (12 estimated tokens) over 600 ms.
     fn stream_a_round(tps: &Tps, start_ms: u64) {
         dispatch(
             tps,
-            &event(EventMsg::AgentMessageDelta { delta: "a".repeat(24) }, start_ms),
+            &event(
+                EventMsg::AgentMessageDelta {
+                    delta: "a".repeat(24),
+                },
+                start_ms,
+            ),
         );
         dispatch(
             tps,
-            &event(EventMsg::AgentMessageDelta { delta: "a".repeat(24) }, start_ms + 600),
+            &event(
+                EventMsg::AgentMessageDelta {
+                    delta: "a".repeat(24),
+                },
+                start_ms + 600,
+            ),
         );
     }
 
@@ -680,7 +695,12 @@ mod tests {
         stream_a_round(&tps, 100);
         let out = dispatch(
             &tps,
-            &event(EventMsg::AgentMessageDelta { delta: "a".repeat(4) }, 700),
+            &event(
+                EventMsg::AgentMessageDelta {
+                    delta: "a".repeat(4),
+                },
+                700,
+            ),
         );
         let rate = segment(&out, "rate");
         assert_eq!(rate.text, "22 t/s");
@@ -688,7 +708,18 @@ mod tests {
 
         // The backend's real count corrects the estimate: 60 output tokens
         // over the same 600 ms → 100 t/s, which reads as fast.
-        let out = dispatch(&tps, &event(EventMsg::TurnUsage { input: 1_000, output: 60 }, 700));
+        let out = dispatch(
+            &tps,
+            &event(
+                EventMsg::TurnUsage {
+                    input: 1_000,
+                    output: 60,
+                    cached: None,
+                    model: None,
+                },
+                700,
+            ),
+        );
         let rate = segment(&out, "rate");
         assert_eq!(rate.text, "100 t/s");
         assert_eq!(rate.tone, StatusTone::Accent);
@@ -741,7 +772,10 @@ mod tests {
 
         // Switching sessions swaps in another conversation: its throughput
         // must not report turns that session never ran.
-        let out = dispatch(&tps, &event(EventMsg::SessionSwitched { session: 0 }, 2_000));
+        let out = dispatch(
+            &tps,
+            &event(EventMsg::SessionSwitched { session: 0 }, 2_000),
+        );
         assert!(cleared(&out, "rate"), "{out:?}");
         assert!(cleared(&out, "spark"), "{out:?}");
         assert!(samples(&tps).is_empty());
@@ -784,15 +818,32 @@ mod tests {
         dispatch(&tps, &event(EventMsg::TurnStarted, 0));
         dispatch(
             &tps,
-            &event(EventMsg::AgentMessageDelta { delta: "a".repeat(24) }, 100),
+            &event(
+                EventMsg::AgentMessageDelta {
+                    delta: "a".repeat(24),
+                },
+                100,
+            ),
         );
         dispatch(
             &tps,
-            &event(EventMsg::AgentMessageDelta { delta: "a".repeat(24) }, 700),
+            &event(
+                EventMsg::AgentMessageDelta {
+                    delta: "a".repeat(24),
+                },
+                700,
+            ),
         );
         dispatch(
             &tps,
-            &event(EventMsg::ContextUsage { input: 10, output: 50 }, 700),
+            &event(
+                EventMsg::ContextUsage {
+                    input: 10,
+                    output: 50,
+                    cached: None,
+                },
+                700,
+            ),
         );
         dispatch(
             &tps,
@@ -807,15 +858,35 @@ mod tests {
         // The tool runs for five seconds — never part of the decode span.
         dispatch(
             &tps,
-            &event(EventMsg::AgentMessageDelta { delta: "b".repeat(8) }, 5_800),
+            &event(
+                EventMsg::AgentMessageDelta {
+                    delta: "b".repeat(8),
+                },
+                5_800,
+            ),
         );
         dispatch(
             &tps,
-            &event(EventMsg::ContextUsage { input: 20, output: 50 }, 6_200),
+            &event(
+                EventMsg::ContextUsage {
+                    input: 20,
+                    output: 50,
+                    cached: None,
+                },
+                6_200,
+            ),
         );
         dispatch(
             &tps,
-            &event(EventMsg::TurnUsage { input: 20, output: 50 }, 6_200),
+            &event(
+                EventMsg::TurnUsage {
+                    input: 20,
+                    output: 50,
+                    cached: None,
+                    model: None,
+                },
+                6_200,
+            ),
         );
         let out = dispatch(&tps, &event(EventMsg::TurnComplete, 6_200));
 
@@ -833,7 +904,15 @@ mod tests {
         // No `ContextUsage` at all this turn: `TurnUsage` is the only count.
         dispatch(
             &tps,
-            &event(EventMsg::TurnUsage { input: 1_000, output: 60 }, 700),
+            &event(
+                EventMsg::TurnUsage {
+                    input: 1_000,
+                    output: 60,
+                    cached: None,
+                    model: None,
+                },
+                700,
+            ),
         );
         dispatch(&tps, &event(EventMsg::TurnComplete, 700));
         assert_eq!(samples(&tps), vec![100.0]);
@@ -859,7 +938,15 @@ mod tests {
         );
         dispatch(
             &tps,
-            &event(EventMsg::TurnUsage { input: 100, output: 12 }, 5_700),
+            &event(
+                EventMsg::TurnUsage {
+                    input: 100,
+                    output: 12,
+                    cached: None,
+                    model: None,
+                },
+                5_700,
+            ),
         );
         dispatch(&tps, &event(EventMsg::TurnComplete, 5_700));
         assert_eq!(samples(&tps), vec![20.0]);
@@ -883,7 +970,12 @@ mod tests {
         assert!(set_segment(
             &dispatch(
                 &tps,
-                &event(EventMsg::AgentMessageDelta { delta: "b".repeat(4) }, 800)
+                &event(
+                    EventMsg::AgentMessageDelta {
+                        delta: "b".repeat(4)
+                    },
+                    800
+                )
             ),
             "rate"
         ));
@@ -896,7 +988,12 @@ mod tests {
         // And nothing further publishes.
         let out = dispatch(
             &tps,
-            &event(EventMsg::AgentMessageDelta { delta: "c".repeat(48) }, 800),
+            &event(
+                EventMsg::AgentMessageDelta {
+                    delta: "c".repeat(48),
+                },
+                800,
+            ),
         );
         assert!(out.is_empty(), "{out:?}");
     }
@@ -907,9 +1004,7 @@ mod tests {
     fn the_settings_toggle_applies_live_and_clears_when_switched_off() {
         let tps = fresh();
         let table = CommandTable::new(std::iter::empty()).expect("empty table");
-        let bridge = || {
-            PluginBridge::new(tps.id(), CancellationToken::new(), Arc::new(|_| {}))
-        };
+        let bridge = || PluginBridge::new(tps.id(), CancellationToken::new(), Arc::new(|_| {}));
 
         // Switching on is a notice plus the switch itself.
         let mut ctx = PluginContext::new(&table, info(), tps.id(), bridge());
@@ -936,7 +1031,12 @@ mod tests {
             set_segment(
                 &dispatch(
                     &tps,
-                    &event(EventMsg::AgentMessageDelta { delta: "b".repeat(4) }, 800),
+                    &event(
+                        EventMsg::AgentMessageDelta {
+                            delta: "b".repeat(4)
+                        },
+                        800
+                    ),
                 ),
                 "rate",
             ),

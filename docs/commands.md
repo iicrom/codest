@@ -11,7 +11,8 @@ Slash commands are the local control surface of the TUI: they are parsed and exe
 | `/help` | `/h`, `/?` | Show the command list (including plugin-provided ones). |
 | `/clear` | — | Clear the conversation context and on-screen transcript. |
 | `/quit` | `/exit` | Quit codest. |
-| `/status` | — | Show backend, mode, transcript size, and loaded plugins. |
+| `/status` | — | Show backend, mode, transcript size, context usage, cache hit rates, and loaded plugins. |
+| `/usage` | — | Show detailed context consumption: a per-type composition of the window (system / prompt / assistant / thinking / tools / free), a token bar, cache hit rates, and the per-turn history. |
 | `/context` | — | Show what the model actually receives: tools and their enabled state, the assembled system prompt (per-source), request config, and token usage. In a session: browse, delete, and edit context entries. |
 | `/new` | — | Archive the current conversation and start a fresh session. |
 | `/rename <name>` | — | Rename the current session (default name: its first user message). |
@@ -37,7 +38,7 @@ A submission is classified once, when it is sent:
 
 | Policy | Commands | A stray argument is |
 | --- | --- | --- |
-| none | `/help`, `/clear`, `/quit`, `/status`, `/context`, `/new`, `/sessions`, `/continue`, `/model`, `/provider`, `/thinking` | rejected with an error naming the command |
+| none | `/help`, `/clear`, `/quit`, `/status`, `/context`, `/usage`, `/new`, `/sessions`, `/continue`, `/model`, `/provider`, `/thinking` | rejected with an error naming the command |
 | optional | `/profile`, `/effort`, `/tools`, `/settings` | part of the command (a profile name, a level, a tool name, a section name) |
 | required | `/rename` | — an empty argument list is rejected |
 
@@ -51,7 +52,7 @@ The shipped table merges two groups, and parsing, the popup, and `/help` all rea
 | Group | Commands | Owned by |
 | --- | --- | --- |
 | Built-in plugins | `/help`, `/clear`, `/quit`, `/status`, `/continue` | `src/plugins/builtin/` — they double as plugin examples. |
-| Front-end commands | `/new`, `/rename`, `/sessions`, `/model`, `/provider`, `/profile`, `/effort`, `/thinking`, `/tools`, `/context`, `/settings` | Core/TUI, dispatched before the plugin host. |
+| Front-end commands | `/new`, `/rename`, `/sessions`, `/model`, `/provider`, `/profile`, `/effort`, `/thinking`, `/tools`, `/context`, `/settings`, `/usage` | Core/TUI, dispatched before the plugin host. |
 
 Plugin-contributed commands join the same table, so they get the popup and `/help` for free; names and aliases are validated and must be globally unique at startup. See [plugins.md](plugins.md).
 

@@ -609,6 +609,26 @@ mod tests {
         true,
     )];
 
+    /// The real host section, so the shipped toggles (context readout, cache
+    /// rate) are exercised by the same write-through-parse machinery.
+    static REAL_HOST_FIELDS: &[SettingField] = crate::core::settings::HOST_SETTINGS.fields;
+
+    fn real_host_view(name: &str, seed: &str) -> SettingsView {
+        let path = temp_path(name);
+        std::fs::write(&path, seed).expect("seed");
+        let file = SettingsFile::load(&path).expect("load");
+        SettingsView::new(
+            file,
+            vec![Section {
+                title: "codest".to_string(),
+                id: None,
+                description: "host settings",
+                owner: SettingOwner::Host,
+                fields: REAL_HOST_FIELDS,
+            }],
+        )
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "codest-settings-view-{}-{:x}-{name}.toml",
@@ -837,6 +857,34 @@ mod tests {
         assert!(text.contains("plugin_segments = false"), "{text}");
         let reread = crate::core::config::load_global(view.file.path()).expect("parse");
         assert!(!reread.status_bar.plugin_segments);
+    }
+
+    /// The shipped host toggles write their dotted keys: stepping to the
+    /// cache-rate row and flipping it lands `status_bar.cache_rate` on disk
+    /// and parses back through the strict global config.
+    #[test]
+    fn the_shipped_host_toggles_write_their_dotted_keys() {
+        let mut view = real_host_view("host-toggles", "");
+        // Rows: plugin segments, context readout, cache hit rate.
+        assert_eq!(REAL_HOST_FIELDS.len(), 3);
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            view.handle_key(key(KeyCode::Enter)),
+            Some(SettingsEvent::Saved {
+                section: 0,
+                restart: false
+            })
+        );
+        // The default is on, so the flip lands off — and `context` stays on
+        // its default (absent from the file, like every untouched field).
+        assert!(!view.global().status_bar.cache_rate);
+        assert!(view.global().status_bar.context);
+        let text = std::fs::read_to_string(view.file.path()).expect("read");
+        assert!(text.contains("cache_rate = false"), "{text}");
+        let reread = crate::core::config::load_global(view.file.path()).expect("parse");
+        assert!(!reread.status_bar.cache_rate);
+        assert!(reread.status_bar.context);
     }
 
     #[test]

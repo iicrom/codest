@@ -215,6 +215,11 @@ pub enum RolloutItem {
         model: Option<String>,
         input: u64,
         output: u64,
+        /// The prompt-cache subset of `input` the backend reported, when it
+        /// reports cache accounting at all. Absent on older records and on
+        /// providers without the field; both deserialize as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached: Option<u64>,
     },
     /// The named profile became active (`Op::SwitchProfile`). Metadata for
     /// attribution — it tracks which preset produced the session's tail, not
@@ -271,6 +276,19 @@ pub struct ThinkingRecord {
     pub duration_ms: Option<u64>,
 }
 
+/// One completed turn's token usage, as [`RolloutItem::TurnUsage`] records
+/// it — the per-turn granularity `/usage`'s breakdowns replay from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageTurn {
+    /// The selection that served the turn (`"provider/model"`); `None` on a
+    /// fixed backend.
+    pub model: Option<String>,
+    pub input: u64,
+    pub output: u64,
+    /// The prompt-cache subset of `input`, when the backend reported it.
+    pub cached: Option<u64>,
+}
+
 /// A session restored from disk.
 #[derive(Debug, Clone)]
 pub struct LoadedSession {
@@ -304,6 +322,18 @@ pub struct LoadedSession {
     /// [`RolloutItem::Cleared`]).
     pub total_input: u64,
     pub total_output: u64,
+    /// The prompt-cache subset of [`Self::last_usage`]'s input, as the
+    /// backend reported it; `None` when the last turn carried no cache
+    /// accounting (or none of the recorded turns did).
+    pub last_cached: Option<u64>,
+    /// Cumulative cached input across the session's recorded turns. The
+    /// per-turn records predate cache accounting on many providers, so this
+    /// lags [`Self::total_input`] legitimately.
+    pub total_cached: u64,
+    /// One record per completed turn, oldest first (reset by
+    /// [`RolloutItem::Cleared`]). What `/usage`'s per-model and per-turn
+    /// breakdowns replay from.
+    pub turns: Vec<UsageTurn>,
     /// The profile last active in this session, replayed from the meta line
     /// and [`RolloutItem::ProfileSwitched`] items.
     pub profile: Option<String>,
@@ -359,7 +389,10 @@ impl RolloutWriter {
             model: model.map(str::to_string),
             profile: profile.map(str::to_string),
         };
-        let file = OpenOptions::new().create_new(true).append(true).open(&path)?;
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)?;
         let mut rollout = RolloutFile { path, file };
         rollout.append(&RolloutItem::SessionMeta(meta))?;
         Ok(rollout)
@@ -465,6 +498,9 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     let mut last_usage = None;
     let mut total_input: u64 = 0;
     let mut total_output: u64 = 0;
+    let mut last_cached = None;
+    let mut total_cached: u64 = 0;
+    let mut turns: Vec<UsageTurn> = Vec::new();
     // The effort the session last ran with. The outer `Option` tracks
     // whether any record exists at all; the inner one is the level, with
     // `None` meaning an explicit `off`.
@@ -521,12 +557,18 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 last_usage = None;
                 total_input = 0;
                 total_output = 0;
+                last_cached = None;
+                total_cached = 0;
+                turns.clear();
             }
             // The active model selection tracks the last model used; the
             // effort is replayed for the same reason — a resumed or re-entered
             // session must send the level it was left on, including an
             // explicit `off`. Neither changes the replayed conversation.
-            RolloutItem::ModelSwitched { provider, model: switched } => {
+            RolloutItem::ModelSwitched {
+                provider,
+                model: switched,
+            } => {
                 model = Some(format!("{provider}/{switched}"));
             }
             RolloutItem::ReasoningEffortSwitched { effort: level } => {
@@ -535,15 +577,28 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 // re-seeds from the model's `default_level`.
                 effort = Some(level);
             }
-            RolloutItem::TurnUsage { model: served, input, output } => {
+            RolloutItem::TurnUsage {
+                model: served,
+                input,
+                output,
+                cached,
+            } => {
                 // A fixed backend reports no model; that cannot clear the
                 // tracked selection.
                 if served.is_some() {
-                    model = served;
+                    model = served.clone();
                 }
                 last_usage = Some((input, output));
                 total_input = total_input.saturating_add(input);
                 total_output = total_output.saturating_add(output);
+                last_cached = cached;
+                total_cached = total_cached.saturating_add(cached.unwrap_or(0));
+                turns.push(UsageTurn {
+                    model: served,
+                    input,
+                    output,
+                    cached,
+                });
             }
             RolloutItem::ProfileSwitched { name } => {
                 profile = Some(name);
@@ -592,26 +647,24 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 undo.push(crate::core::conversation::UndoEntry::Edited { index, previous });
                 message.content = content;
             }
-            RolloutItem::ContextRestored => {
-                match undo.pop() {
-                    Some(crate::core::conversation::UndoEntry::Deleted { removed }) => {
-                        for (index, message) in removed {
-                            messages.insert(index, message);
-                            for record in thinking.iter_mut() {
-                                if record.before >= index {
-                                    record.before += 1;
-                                }
+            RolloutItem::ContextRestored => match undo.pop() {
+                Some(crate::core::conversation::UndoEntry::Deleted { removed }) => {
+                    for (index, message) in removed {
+                        messages.insert(index, message);
+                        for record in thinking.iter_mut() {
+                            if record.before >= index {
+                                record.before += 1;
                             }
                         }
                     }
-                    Some(crate::core::conversation::UndoEntry::Edited { index, previous }) => {
-                        if let Some(message) = messages.get_mut(index) {
-                            message.content = previous;
-                        }
-                    }
-                    None => {}
                 }
-            }
+                Some(crate::core::conversation::UndoEntry::Edited { index, previous }) => {
+                    if let Some(message) = messages.get_mut(index) {
+                        message.content = previous;
+                    }
+                }
+                None => {}
+            },
         }
     }
 
@@ -638,6 +691,9 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
         last_usage,
         total_input,
         total_output,
+        last_cached,
+        total_cached,
+        turns,
         profile,
         tools,
     })
@@ -737,7 +793,9 @@ mod tests {
     fn replay_applies_clears_and_renames_in_order() {
         let dir = tempdir("replay");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
 
         rollout
             .append(&RolloutItem::UserMessage {
@@ -771,7 +829,9 @@ mod tests {
 
         let dir = tempdir("context-edit");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
         for text in ["one", "two", "three"] {
             rollout
                 .append(&RolloutItem::UserMessage {
@@ -782,10 +842,7 @@ mod tests {
         rollout
             .append(&RolloutItem::ContextDeleted {
                 indices: vec![0, 2],
-                removed: vec![
-                    Message::user("one"),
-                    Message::user("three"),
-                ],
+                removed: vec![Message::user("one"), Message::user("three")],
             })
             .expect("append");
         rollout
@@ -839,7 +896,9 @@ mod tests {
     fn context_restored_replays_and_clear_drops_the_stack() {
         let dir = tempdir("context-undo");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -851,12 +910,17 @@ mod tests {
                 removed: vec![Message::user("hello")],
             })
             .expect("append");
-        rollout.append(&RolloutItem::ContextRestored).expect("append");
+        rollout
+            .append(&RolloutItem::ContextRestored)
+            .expect("append");
 
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].content, "hello");
-        assert!(loaded.undo.is_empty(), "the restore consumed its checkpoint");
+        assert!(
+            loaded.undo.is_empty(),
+            "the restore consumed its checkpoint"
+        );
 
         rollout.append(&RolloutItem::Cleared).expect("append");
         rollout
@@ -876,7 +940,9 @@ mod tests {
     fn corrupt_context_delete_markers_are_skipped() {
         let dir = tempdir("context-corrupt");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -907,7 +973,9 @@ mod tests {
     fn reasoning_replays_ahead_of_the_message_it_preceded() {
         let dir = tempdir("thinking");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
 
         rollout
             .append(&RolloutItem::UserMessage {
@@ -981,7 +1049,9 @@ mod tests {
     fn context_deletions_shift_thinking_with_their_message() {
         let dir = tempdir("thinking-shift");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
 
         for (text, reasoning) in [("one", "about one"), ("two", "about two")] {
             rollout
@@ -1073,7 +1143,9 @@ mod tests {
     fn load_skips_unknown_item_types() {
         let dir = tempdir("unknown");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "hello".to_string(),
@@ -1098,7 +1170,9 @@ mod tests {
     fn reasoning_effort_round_trips_and_replays_the_last_one() {
         let dir = tempdir("effort");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
         rollout
             .append(&RolloutItem::ReasoningEffortSwitched {
                 effort: Some("high".to_string()),
@@ -1190,7 +1264,9 @@ mod tests {
     fn tools_switched_round_trips_and_replays_the_last_set() {
         let dir = tempdir("tools");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
         // No switch yet: the session never customized its tools.
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.tools, None);
@@ -1227,7 +1303,13 @@ mod tests {
         let dir = tempdir("model");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
         let mut rollout = writer
-            .start_session(&new_id(), "be brief", Some("openai"), Some("gpt-4o-mini"), None)
+            .start_session(
+                &new_id(),
+                "be brief",
+                Some("openai"),
+                Some("gpt-4o-mini"),
+                None,
+            )
             .expect("start");
         // The meta line seeds the initial selection…
         let loaded = load_session(&rollout.path).expect("load");
@@ -1246,6 +1328,7 @@ mod tests {
                 model: Some("openai/gpt-4o".to_string()),
                 input: 10,
                 output: 2,
+                cached: Some(6),
             })
             .expect("append");
         rollout
@@ -1253,6 +1336,7 @@ mod tests {
                 model: None,
                 input: 10,
                 output: 2,
+                cached: None,
             })
             .expect("append");
         let loaded = load_session(&rollout.path).expect("load");
@@ -1272,7 +1356,9 @@ mod tests {
     fn turn_usage_round_trips_and_clear_resets_it() {
         let dir = tempdir("usage");
         let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
-        let mut rollout = writer.start_session(&new_id(), "be brief", None, None, None).expect("start");
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
         rollout
             .append(&RolloutItem::UserMessage {
                 message: "first".to_string(),
@@ -1283,6 +1369,7 @@ mod tests {
                 model: Some("openai/gpt-4o-mini".to_string()),
                 input: 1_000,
                 output: 200,
+                cached: Some(700),
             })
             .expect("append");
         rollout
@@ -1295,6 +1382,7 @@ mod tests {
                 model: None,
                 input: 1_300,
                 output: 300,
+                cached: None,
             })
             .expect("append");
 
@@ -1302,6 +1390,28 @@ mod tests {
         assert_eq!(loaded.last_usage, Some((1_300, 300)));
         assert_eq!(loaded.total_input, 2_300);
         assert_eq!(loaded.total_output, 500);
+        // Cache accounting rides the same records: the last turn's `None`
+        // (older providers) leaves `last_cached` unset, but the session sum
+        // keeps the first turn's report.
+        assert_eq!(loaded.last_cached, None);
+        assert_eq!(loaded.total_cached, 700);
+        assert_eq!(
+            loaded.turns,
+            vec![
+                UsageTurn {
+                    model: Some("openai/gpt-4o-mini".to_string()),
+                    input: 1_000,
+                    output: 200,
+                    cached: Some(700),
+                },
+                UsageTurn {
+                    model: None,
+                    input: 1_300,
+                    output: 300,
+                    cached: None,
+                },
+            ]
+        );
         // Usage records are metadata: the conversation still replays to two
         // messages, and the raw line carries the tagged variant name.
         assert_eq!(loaded.messages.len(), 2);
@@ -1320,7 +1430,39 @@ mod tests {
         assert_eq!(loaded.last_usage, None);
         assert_eq!(loaded.total_input, 0);
         assert_eq!(loaded.total_output, 0);
+        assert_eq!(loaded.last_cached, None);
+        assert_eq!(loaded.total_cached, 0);
+        assert!(loaded.turns.is_empty());
         assert_eq!(loaded.messages.len(), 1);
+    }
+
+    /// A rollout predating the `cached` field loads unchanged: the absent
+    /// key deserializes as `None` and the per-turn records still build.
+    #[test]
+    fn turn_usage_without_cache_field_loads() {
+        let dir = tempdir("usage-legacy");
+        let path = dir.join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"timestamp":"t","type":"session_meta","version":1,"id":"s","created_at":"t","cwd":"/tmp/demo","system_prompt":"be brief"}"#, "\n",
+                r#"{"timestamp":"t","type":"turn_usage","model":"p/m","input":100,"output":10}"#, "\n",
+            ),
+        )
+        .expect("write");
+        let loaded = load_session(&path).expect("load");
+        assert_eq!(loaded.last_usage, Some((100, 10)));
+        assert_eq!(loaded.last_cached, None);
+        assert_eq!(loaded.total_cached, 0);
+        assert_eq!(
+            loaded.turns,
+            vec![UsageTurn {
+                model: Some("p/m".to_string()),
+                input: 100,
+                output: 10,
+                cached: None,
+            }]
+        );
     }
 
     /// A crash mid-turn truncates the file between a calls message and its
@@ -1353,10 +1495,7 @@ mod tests {
         assert_eq!(loaded.messages.len(), 3);
         assert_eq!(
             loaded.messages[2],
-            Message::tool_result(
-                "call_1",
-                crate::core::conversation::INTERRUPTED_TOOL_RESULT
-            )
+            Message::tool_result("call_1", crate::core::conversation::INTERRUPTED_TOOL_RESULT)
         );
         assert_eq!(
             Conversation::validate_tool_structure(&loaded.messages),

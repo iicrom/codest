@@ -11,7 +11,6 @@
 pub use cst_plugin_api::message::Message;
 pub use cst_plugin_api::message::Role;
 
-
 /// Commands accepted by the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -113,10 +112,23 @@ pub enum EventMsg {
     /// finished streaming, sent as soon as it arrives rather than at turn
     /// end. Display-only: the front-end updates its context readout from it,
     /// while [`EventMsg::TurnUsage`] stays the single record of a completed
-    /// turn (accumulated in `/status`, persisted in the rollout).
-    ContextUsage { input: u64, output: u64 },
+    /// turn (accumulated in `/status`, persisted in the rollout). `cached`
+    /// mirrors the round's `StreamItem::Usage`: the prompt-prefix subset of
+    /// `input`, `None` when the backend reports no cache accounting.
+    ContextUsage {
+        input: u64,
+        output: u64,
+        cached: Option<u64>,
+    },
     /// Token usage for a completed turn, right before its `TurnComplete`.
-    TurnUsage { input: u64, output: u64 },
+    /// `cached` and `model` carry what the rollout's `TurnUsage` record
+    /// persists, so the front-end's per-turn attribution matches the file.
+    TurnUsage {
+        input: u64,
+        output: u64,
+        cached: Option<u64>,
+        model: Option<String>,
+    },
     /// The turn was cancelled by the user.
     TurnAborted { reason: String },
     /// The turn hit an error.
@@ -184,4 +196,3 @@ impl Event {
         }
     }
 }
-

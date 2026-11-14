@@ -64,7 +64,12 @@ impl ModelClient for EchoModelClient {
             if cancel.is_cancelled() {
                 return;
             }
-            yield Ok(StreamItem::Usage { input, output });
+            yield Ok(StreamItem::Usage {
+                input,
+                output,
+                // The echo backend models a provider with no cache reporting.
+                cached: None,
+            });
         })
     }
 }
@@ -121,7 +126,7 @@ mod tests {
         while let Some(item) = stream.next().await {
             match item.expect("test stream never fails") {
                 StreamItem::Delta(delta) => out.push_str(&delta),
-                StreamItem::Usage { input, output } => usage = Some((input, output)),
+                StreamItem::Usage { input, output, .. } => usage = Some((input, output)),
                 other => panic!("echo model streams deltas and usage, got {other:?}"),
             }
         }
