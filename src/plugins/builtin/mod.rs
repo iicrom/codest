@@ -17,7 +17,7 @@ mod tps;
 
 use crate::plugins::Plugin;
 
-pub use ask_user::ASK_USER;
+pub use ask_user::{ASK_USER, CUSTOM_ROW, NEXT_ROW};
 pub use clear::CLEAR;
 pub use help::HELP;
 pub use r#continue::CONTINUE;

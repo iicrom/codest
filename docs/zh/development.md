@@ -68,7 +68,7 @@ python3 scripts/plugin_smoke.py --skip-git-check
 
 - `POST /chat/completions` —— 收 OpenAI 形状的请求，回 SSE 流（`data:` 帧，最后是 `data: [DONE]`），末尾带一个 usage 分片。推理增量先于可见回复发出，模拟 `reasoning_content` 先到的推理型后端；
 - `GET /models` —— OpenAI 形状的模型目录，让 `fetch_models` 发现有东西可发现；
-- 关键词触发 —— `@bash`（Windows 上为 `@pwsh`，跟随宿主的 shell 工具）、`@read`、`@write`、`@edit` 映射到对应内置工具、参数取关键词之后的文本（`@bash ls -la` → `bash` 收 `{"command": "ls -la"}`）；`@write <路径> <内容>` 与 `@edit <路径> | <旧> | <新>` 遵循固定形状；`@tool` 调用 `--tool` / `--tool-arguments` 指定的那个；
+- 关键词触发 —— `@bash`（Windows 上为 `@pwsh`，跟随宿主的 shell 工具）、`@read`、`@write`、`@edit`、`@ask-user` 映射到对应内置工具、参数取关键词之后的文本（`@bash ls -la` → `bash` 收 `{"command": "ls -la"}`）；`@write <路径> <内容>`、`@edit <路径> | <旧> | <新>` 与 `@ask-user <问题> | <选项> | <选项>`（2-4 个选项，经问题对话框作答）遵循固定形状；`@tool` 调用 `--tool` / `--tool-arguments` 指定的那个；
 - 普通消息 —— 不含关键词的消息得到一条 help 回复，列出这些关键词与端点。
 
 服务在请求之间不保存状态：它靠检查收到的消息来决定怎么回答。已经带了一轮工具调用的回合会得到轮次总结回复而不是再次调用——没有这道闸，关键词会一直留在用户消息里，循环永远不会结束。正是这一条规则让冒烟测试能在无外网、无真实模型的情况下跑完整个 agent 链路：请求、工具调用、工具结果、后续回合。

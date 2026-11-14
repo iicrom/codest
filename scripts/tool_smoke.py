@@ -195,9 +195,10 @@ def run_case(binary: str, tool: str, arguments: str, needles: list[str], label: 
         tui.send("\r", 2.0)
         report = tui.full_screen()
         # The heading counts the enabled subset against everything declared,
-        # so one disabled tool shows "Tools (3/4 enabled)" — the toggle
-        # reached the worker and the report reads it back.
-        checks[f"{label}: context counts enabled"] = "Tools (3/4 enabled)" in report
+        # so one disabled tool shows "Tools (4/5 enabled)" — the toggle
+        # reached the worker and the report reads it back. (The declared set
+        # is shell + fs + ask_user_question.)
+        checks[f"{label}: context counts enabled"] = "Tools (4/5 enabled)" in report
         # A disabled tool stays listed with its state; rows are compact
         # (name → "enabled"/"disabled"), so the whole set stays on screen.
         checks[f"{label}: context shows the tool"] = f"{tool}" in report and "disabled" in report

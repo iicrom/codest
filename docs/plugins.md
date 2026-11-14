@@ -19,6 +19,7 @@ One plugin can contribute any subset of the following, all through the
 | System-prompt fragment | `system_prompt()` | Domain instructions, tool conventions |
 | Lifecycle hooks | `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` | Notices, reports, requested actions |
 | Tools | `tools()` + `run_tool()` | Model-invoked capabilities (`bash`/`pwsh`, `read`, …) |
+| Interactive questions | `set_prompt_host()` + `PromptHost::ask` | A tool puts a structured question to the user (`ask_user_question`) |
 | Protocol factories | `protocols()` | A new wire protocol for `providers.toml` instances |
 | Sign-in entries | `auth_providers()` / `auth_status()` / `begin_sign_in()` | Browser/PAT sign-in behind `/provider` |
 | Event stream | `subscriptions()` + `on_event()` | Meters, monitors, reactions to the agent's run |
@@ -48,6 +49,7 @@ binary. The host side lives in [`src/plugins/mod.rs`](../src/plugins/mod.rs).
 | `system_prompt()` | — | `Option<&'static str>` | `None` |
 | `tools()` | — | `&'static [ToolSpec]` | empty |
 | `run_tool(&ToolCall)` | the raw JSON arguments | `Result<String, PluginError>` | error |
+| `set_prompt_host(Arc<dyn PromptHost>)` | the front-end's question service | — | no-op |
 | `protocols()` | — | `&'static [&'static dyn ProtocolFactory]` | empty |
 | `auth_providers()` | — | `&'static [AuthProvider]` | empty |
 | `auth_status(&str)` | instance name | `AuthStatus` | `Unsupported` |
@@ -183,6 +185,17 @@ default — the loop ends when the model stops calling tools, the user
 interrupts, or the request fails; `max_tool_rounds` in `config.toml`
 re-enables a guard. Tool execution runs on the blocking pool, so `run_tool`
 may block; hooks cannot.
+
+A tool that needs a decision rather than data asks the *front-end*: the TUI
+installs a `PromptHost` service once at startup (`PluginHost::install_prompt_host`,
+handed to every plugin through `set_prompt_host`), and `run_tool` calls
+`PromptHost::ask(form)` — one interruption of 1-4 structured questions — and
+blocks until the user answers or declines. The built-in
+[`ask_user_question`](tools.md) is the reference consumer. The distinction
+that keeps the contract honest: a decline is a `PromptResponse` with
+`cancelled: true`, while `ask` returning `None` means this front-end could
+not ask at all (headless runs), which a tool must report as "UI not
+available", not as a decline.
 
 ## 4. Startup validation
 

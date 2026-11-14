@@ -345,15 +345,16 @@ fn decode_question(value: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(mut question) = value else {
         return value;
     };
-    if let Some(serde_json::Value::String(text)) = question.remove("options") {
-        match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(serde_json::Value::Array(options)) => {
-                question.insert("options".to_string(), serde_json::Value::Array(options));
-            }
-            _ => {
-                question.insert("options".to_string(), serde_json::Value::String(text));
-            }
-        }
+    // Only a string-encoded array is decoded; a real array is left untouched —
+    // `remove` would take it off the map, so it must go back on either way.
+    if matches!(question.get("options"), Some(serde_json::Value::String(_)))
+        && let Some(serde_json::Value::String(text)) = question.remove("options")
+    {
+        let decoded = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(options @ serde_json::Value::Array(_)) => options,
+            _ => serde_json::Value::String(text),
+        };
+        question.insert("options".to_string(), decoded);
     }
     serde_json::Value::Object(question)
 }

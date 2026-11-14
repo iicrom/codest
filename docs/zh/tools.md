@@ -52,6 +52,20 @@ Windows 上值得知道的差异：
 
 相对路径一律按工作目录解析。
 
+### `ask_user_question`
+
+| 工具 | 行为 |
+| --- | --- |
+| `ask_user_question` | 用**一次打断**向用户提出 1-4 个结构化问题——每个问题带 2-4 个作者选项（label + description，可选 markdown `preview`）、一行自动追加的 `Type something.` 自由输入行，`multiSelect` 问题还有一行 `Next` 提交行。标记为 `read_only`。 |
+
+该工具是 `PromptHost` 契约的消费方（[plugins.md](../plugins.md) 第 3 节）：
+先校验并规范化参数，再弹出问题对话框，最后把回答整合成一条
+`role: "tool"` 消息返回——`"question"="answer"` 段落、选中选项的 preview
+（如果有）、用 `Next` 跳过的问题记为 `unanswered`，并保留一个全局备注位。
+`Esc` 拒绝整张表，信封措辞为一句固定的话，模型不会误读成某个问题的回答。
+保留标签（`Other`、`Type something.`、`Next`）在校验时即被拒绝；无头前端
+得到的是 "UI not available"——明确不是拒绝。
+
 ## 会话级工具开关
 
 `/tools` 控制本会话提供哪些已声明工具：
