@@ -10,8 +10,9 @@
 use crate::core::protocol::Role;
 use crate::core::rollout::LoadedSession;
 use crate::tui::TuiMode;
-use crate::tui::chat::HistoryCell;
+use crate::tui::chat::{CardDisplay, HistoryCell};
 use crate::tui::wrap::char_width;
+use ratatui::text::Line;
 use std::time::Instant;
 
 /// A tool call that is executing right now, rendered as a live card (spinner
@@ -22,13 +23,54 @@ use std::time::Instant;
 pub struct RunningTool {
     pub name: String,
     pub arguments: String,
+    /// The arguments parsed once at the call start. The live card re-renders
+    /// every frame (spinner, elapsed readout), and re-parsing a huge `write`
+    /// payload per frame would burn the whole streaming frame budget.
+    pub parsed: Option<serde_json::Value>,
     /// When the call started, for the live elapsed readout.
     pub started_at: Instant,
+}
+
+/// What a cached cell render depends on. A settled cell is immutable — it
+/// never changes once pushed — so the only inputs that can change its lines
+/// are the viewport width and the two fold flags. codex keys its
+/// active-cell layout cache on (identity, revision, width, render mode,
+/// theme); the identity and revision halves are unnecessary here because
+/// cached cells are only replaced on a key mismatch, never merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellRenderKey {
+    width: usize,
+    display: CardDisplay,
+}
+
+/// A cached render of one history cell.
+struct RenderedCell {
+    key: CellRenderKey,
+    /// Which single fold flag this cell's lines read, and its value at
+    /// render time — `None` for cells that read neither. Each card kind
+    /// reads one flag, so a Ctrl+O toggle must not invalidate thinking
+    /// cards (their body can be thousands of lines) and a Ctrl+T toggle
+    /// must not invalidate tool cards.
+    flag: Option<bool>,
+    /// Whether the lines carry syntax tokenization. Layout is identical
+    /// either way — highlighting restyles spans without changing text — so
+    /// off-screen cells stay plain until the viewport reaches them.
+    highlighted: bool,
+    lines: Vec<Line<'static>>,
 }
 
 /// Rendered state of one recorded conversation.
 pub struct SessionView {
     pub history: Vec<HistoryCell>,
+    /// Cached renders parallel to `history`, filled lazily by
+    /// [`Self::cell_lines`]. The transcript used to re-render every cell on
+    /// every frame — for a settled transcript that is thousands of wasted
+    /// markdown, JSON and wrap rebuilds per keystroke. Settled lines are now
+    /// reused until the width or the fold flags change. The slot count is
+    /// re-synced with `history` on every access: pushed cells have no cache
+    /// yet, and a cleared or spliced history truncates stale entries, so no
+    /// explicit invalidation is required for either.
+    rendered: Vec<Option<RenderedCell>>,
     /// Assistant text currently streaming (not yet committed to history).
     pub live: Option<String>,
     /// Thinking text currently streaming for this turn. Display-only: it is
@@ -71,6 +113,96 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    /// Keep the cache slots aligned with `history`: pushes leave holes, a
+    /// clear or splice truncates whatever no longer has a cell.
+    fn sync_rendered(&mut self) {
+        self.rendered.resize_with(self.history.len(), || None);
+    }
+
+    /// The lines of cell `index` at `width` under `display`, rebuilt only
+    /// when the cached width or fold flag no longer matches. Settled cells
+    /// are immutable, so a hit is always current content.
+    ///
+    /// A miss builds without syntax highlighting: the caller only needs the
+    /// line count for the layout math (or is rendering off-screen), and a
+    /// plain build is identical in shape. Visible cells upgrade through
+    /// [`Self::cell_lines_highlighted`].
+    pub fn cell_lines(
+        &mut self,
+        index: usize,
+        width: usize,
+        display: &CardDisplay,
+    ) -> &[Line<'static>] {
+        self.cell_lines_at(index, width, display, false)
+    }
+
+    /// [`Self::cell_lines`], guaranteed to carry syntax tokenization. Only
+    /// worth calling for cells the viewport shows — tokenizing a card's
+    /// 200-line head block is the expensive part of a rebuild, which is why
+    /// off-screen cells stay plain until scrolled into view.
+    pub fn cell_lines_highlighted(
+        &mut self,
+        index: usize,
+        width: usize,
+        display: &CardDisplay,
+    ) -> &[Line<'static>] {
+        self.cell_lines_at(index, width, display, true)
+    }
+
+    fn cell_lines_at(
+        &mut self,
+        index: usize,
+        width: usize,
+        display: &CardDisplay,
+        highlight: bool,
+    ) -> &[Line<'static>] {
+        self.sync_rendered();
+        // Each card kind reads exactly one fold flag, and the text and
+        // markdown cells read neither: a Ctrl+O or Ctrl+T toggle invalidates
+        // just the cards that actually fold with it. Rebuilding everything
+        // per toggle used to stall the expansion for seconds.
+        let flag = match self.history[index] {
+            HistoryCell::Thinking { .. } => Some(display.thinking),
+            HistoryCell::ToolCall { .. } => Some(display.tool_detail),
+            _ => None,
+        };
+        let key = CellRenderKey {
+            width,
+            display: *display,
+        };
+        let needs_build = match &self.rendered[index] {
+            Some(rendered) => {
+                rendered.key.width != width
+                    || rendered.flag != flag
+                    || (highlight && !rendered.highlighted)
+            }
+            None => true,
+        };
+        if needs_build {
+            let lines = self.history[index].lines(width, display, highlight);
+            self.rendered[index] = Some(RenderedCell {
+                key,
+                flag,
+                highlighted: highlight,
+                lines,
+            });
+        }
+        self.rendered[index]
+            .as_ref()
+            .expect("render just stored or cached")
+            .lines
+            .as_slice()
+    }
+
+    /// Drop the cached render of one cell. Used by inline mode once a cell's
+    /// lines went to scrollback: they can never render again, so holding
+    /// them would only grow memory with the session.
+    pub fn drop_cell_render(&mut self, index: usize) {
+        if index < self.rendered.len() {
+            self.rendered[index] = None;
+        }
+    }
+
     /// The first session, which carries the startup banner.
     pub fn initial(model_label: &str, mode: TuiMode) -> Self {
         let mut view = Self::empty();
@@ -177,6 +309,7 @@ impl SessionView {
     fn empty() -> Self {
         Self {
             history: Vec::new(),
+            rendered: Vec::new(),
             live: None,
             live_thinking: None,
             running_tool: None,
