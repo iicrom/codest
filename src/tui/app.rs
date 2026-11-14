@@ -5066,6 +5066,91 @@ mod tests {
         println!("ctrl+t rebuild: {:?}", t.elapsed());
     }
 
+    /// Timing probe over a real rollout file, for chasing a slow Ctrl+O on
+    /// an actual session:
+    /// `CODEST_TIMING_ROLLOUT=/path/to/rollout.jsonl cargo test --release \
+    ///  --lib -- --ignored --nocapture real_session_ctrl_o`
+    #[tokio::test]
+    #[ignore = "timing probe over a real rollout, not an assertion"]
+    async fn real_session_ctrl_o_timing() {
+        let Some(path) = std::env::var_os("CODEST_TIMING_ROLLOUT") else {
+            panic!("set CODEST_TIMING_ROLLOUT to a rollout .jsonl file");
+        };
+        let loaded = crate::core::rollout::load_session(std::path::Path::new(&path))
+            .expect("load rollout");
+        let mut app = test_app();
+        *app.view_mut() = SessionView::restored(&loaded);
+        println!(
+            "cells: {} · reasoning blocks: {} · tool cells: {}",
+            app.view().history.len(),
+            app.view()
+                .history
+                .iter()
+                .filter(|cell| matches!(cell, HistoryCell::Thinking { .. }))
+                .count(),
+            app.view()
+                .history
+                .iter()
+                .filter(|cell| matches!(cell, HistoryCell::ToolCall { .. }))
+                .count(),
+        );
+
+        let _ = render_lines(&mut app, 110, 40);
+
+        // Cold per-card cost at the toggle width, before any expansion has
+        // ever run: this is exactly what the Ctrl+O frame pays per card.
+        let expanded = chat::CardDisplay {
+            thinking: false,
+            tool_detail: true,
+        };
+        let mut card_costs: Vec<(std::time::Duration, usize, String)> = Vec::new();
+        for index in 0..app.view().history.len() {
+            if !matches!(app.view().history[index], HistoryCell::ToolCall { .. }) {
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let _ = app.view_mut().cell_lines(index, 110, &expanded);
+            card_costs.push((t.elapsed(), index, String::new()));
+        }
+        card_costs.sort_by_key(|(cost, _, _)| std::cmp::Reverse(*cost));
+        let total: std::time::Duration = card_costs.iter().map(|(d, _, _)| *d).sum();
+        println!(
+            "tool cards: {} · cold rebuild total {:?}",
+            card_costs.len(),
+            total
+        );
+        for (elapsed, index, _) in card_costs.iter().take(8) {
+            if let Some(HistoryCell::ToolCall { name, arguments, .. }) =
+                app.view().history.get(*index)
+            {
+                let path = serde_json::from_str::<serde_json::Value>(arguments)
+                    .ok()
+                    .and_then(|v| v.get("path").and_then(|p| p.as_str().map(String::from)))
+                    .unwrap_or_default();
+                println!("  {:?} · {} · {}", elapsed, name, path);
+            }
+        }
+
+        app.show_tool_detail = true;
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("ctrl+o rebuild (cells warm, viewport cold): {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("expanded settled: {:?}", t.elapsed());
+
+        app.show_tool_detail = false;
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("fold-back: {:?}", t.elapsed());
+
+        app.show_tool_detail = true;
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("ctrl+o re-expand (all warm): {:?}", t.elapsed());
+    }
+
     #[tokio::test]
     async fn settled_frames_reuse_cached_cell_renders() {
         let mut app = app_with_big_read();
