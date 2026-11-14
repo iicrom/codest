@@ -1149,6 +1149,7 @@ impl App {
             Some(chat::running_tool_lines(
                 &running.name,
                 &running.arguments,
+                running.parsed.as_ref(),
                 &elapsed,
                 frame,
                 width,
@@ -3139,9 +3140,12 @@ impl App {
                 // lives in the transcript tail (spinner + elapsed) until the
                 // completion event settles it into history.
                 self.finalize_live();
+                let parsed: Option<serde_json::Value> =
+                    serde_json::from_str(arguments.trim()).ok();
                 self.view_mut().running_tool = Some(crate::tui::session::RunningTool {
                     name,
                     arguments,
+                    parsed,
                     started_at: Instant::now(),
                 });
             }
@@ -3591,6 +3595,7 @@ impl App {
                 let mut lines = chat::running_tool_lines(
                     &running.name,
                     &running.arguments,
+                    running.parsed.as_ref(),
                     &elapsed,
                     spinner,
                     width,
@@ -4972,6 +4977,54 @@ mod tests {
         app
     }
 
+    /// Manual timing probe for the Ctrl+O rebuild of a long session:
+    /// `cargo test --release -p codest --lib -- --ignored --nocapture ctrl_o`
+    #[tokio::test]
+    #[ignore = "timing probe, not an assertion"]
+    async fn ctrl_o_rebuild_timing() {
+        let mut app = test_app();
+        let result: String = (1..=2000)
+            .map(|n| format!("{n:6}\tlet field_{n} = compute({n}); // padded comment to make the line wrap at a realistic terminal width"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let markdown: String = (1..=40)
+            .map(|n| {
+                format!("## Section {n}\n\nSome prose that wraps a few times at a normal terminal width, enough to make the markdown pass work.\n\n```rust\nfn demo_{n}() {{\n    let value = compute({n});\n}}\n```\n\n")
+            })
+            .collect();
+        {
+            let view = app.view_mut();
+            for i in 0..30 {
+                view.history
+                    .push(HistoryCell::User(format!("question {i}: look into module {i} and summarize what the tests cover")));
+                view.history.push(HistoryCell::ToolCall {
+                    name: "read".to_string(),
+                    arguments: format!(r#"{{"path": "src/module_{i}.rs"}}"#),
+                    result: result.clone(),
+                    error: None,
+                    duration_ms: Some(1_000),
+                });
+                view.history.push(HistoryCell::Assistant(markdown.clone()));
+            }
+        }
+        let _ = render_lines(&mut app, 110, 40);
+        println!("cells: {}", app.view().history.len());
+
+        app.show_tool_detail = true;
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("ctrl+o rebuild: {:?}", t.elapsed());
+
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("expanded settled: {:?}", t.elapsed());
+
+        app.show_tool_detail = false;
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("fold-back rebuild: {:?}", t.elapsed());
+    }
+
     #[tokio::test]
     async fn settled_frames_reuse_cached_cell_renders() {
         let mut app = app_with_big_read();
@@ -4986,12 +5039,25 @@ mod tests {
         let _ = render_lines(&mut app, 110, 20);
         assert_eq!(chat::render_calls(), 0, "a settled frame must not rebuild cells");
 
-        // Toggling a fold flag re-renders each cell exactly once — the
-        // expanded card is bounded by the head+tail budget, not the window.
+        // Toggling a fold flag re-renders only the card cells — the text and
+        // markdown cells don't read the flags, and they are the bulk of a
+        // long session's render cost. The expanded card is bounded by the
+        // head+tail budget, not the window.
         app.show_tool_detail = true;
         chat::reset_render_calls();
         let _ = render_lines(&mut app, 110, 20);
-        assert_eq!(chat::render_calls(), cells);
+        let card_cells = app
+            .view()
+            .history
+            .iter()
+            .filter(|cell| {
+                matches!(
+                    cell,
+                    HistoryCell::ToolCall { .. } | HistoryCell::Thinking { .. }
+                )
+            })
+            .count();
+        assert_eq!(chat::render_calls(), card_cells);
 
         // A width change behaves the same way, one rebuild per cell.
         app.show_tool_detail = false;
@@ -6548,6 +6614,7 @@ mod tests {
         app.view_mut().running_tool = Some(crate::tui::session::RunningTool {
             name: "bash".to_string(),
             arguments: r#"{"command": "cargo build"}"#.to_string(),
+            parsed: serde_json::from_str(r#"{"command": "cargo build"}"#).ok(),
             started_at: Instant::now(),
         });
         app.busy = true;
@@ -6564,6 +6631,7 @@ mod tests {
         app.view_mut().running_tool = Some(crate::tui::session::RunningTool {
             name: "bash".to_string(),
             arguments: r#"{"command": "cargo build"}"#.to_string(),
+            parsed: serde_json::from_str(r#"{"command": "cargo build"}"#).ok(),
             started_at: Instant::now(),
         });
         app.busy = true;

@@ -242,9 +242,13 @@ fn tool_card_lines(
     let chip = duration_ms.map(format_duration).map(|d| format!(" · {d}"));
     let chip_width = chip.as_ref().map(|c| display_width(c)).unwrap_or(0);
     let spent = display_width(glyph) + 1 + display_width(name) + 2 + chip_width;
+    // One parse serves the header summary and the structured body both: a
+    // `write` card's arguments carry the whole file content, and parsing it
+    // twice per rebuild doubled the cost of the only frame that pays it.
+    let parsed: Option<serde_json::Value> = serde_json::from_str(arguments.trim()).ok();
     let args = {
         let budget = width.saturating_sub(spent).max(1);
-        tool_summary(arguments, budget)
+        tool_summary_parsed(parsed.as_ref(), arguments, budget)
     };
     let has_summary = !args.summary.is_empty();
     let mut header = vec![
@@ -282,7 +286,7 @@ fn tool_card_lines(
             Style::default().fg(theme::ERROR),
             &gutter,
         ));
-    } else if let Some(body) = tool_body::build(name, arguments, result, budget) {
+    } else if let Some(body) = tool_body::build_parsed(name, parsed.as_ref(), result, budget) {
         lines.extend(body_lines(&body, width, text_style, &gutter));
     } else if !result.trim().is_empty() {
         let body = if expanded {
@@ -397,6 +401,7 @@ fn with_gutter(spans: Vec<Span<'static>>, first: bool, gutter: &Gutter) -> Line<
 pub fn running_tool_lines(
     name: &str,
     arguments: &str,
+    parsed: Option<&serde_json::Value>,
     elapsed: &str,
     spinner_frame: &str,
     width: usize,
@@ -408,7 +413,7 @@ pub fn running_tool_lines(
 
     let spent = display_width(spinner_frame) + 1 + display_width(name) + 2;
     let budget = width.saturating_sub(spent).max(1);
-    let summary = tool_summary(arguments, budget).summary;
+    let summary = tool_summary_parsed(parsed, arguments, budget).summary;
 
     let mut header = vec![
         Span::styled(spinner_frame.to_string(), Style::default().fg(category)),
@@ -441,8 +446,13 @@ struct ToolArgs {
 
 /// Build the header summary. Multi-line values fold to their first row and
 /// over-long ones clip at `max` display columns; `folded` is true when
-/// either happened.
-fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
+/// either happened. `parsed` is the shared parse of `arguments` — a huge
+/// `write` payload must not be re-parsed for the summary and the body both.
+fn tool_summary_parsed(
+    parsed: Option<&serde_json::Value>,
+    arguments: &str,
+    max: usize,
+) -> ToolArgs {
     let trimmed = arguments.trim();
     if trimmed.is_empty() || trimmed == "{}" {
         return ToolArgs {
@@ -451,8 +461,7 @@ fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
             folded: false,
         };
     }
-    let parsed: Option<serde_json::Value> = serde_json::from_str(trimmed).ok();
-    let field = match &parsed {
+    let field = match parsed {
         Some(serde_json::Value::Object(map)) => {
             let key = if map.contains_key("command") {
                 "command"
@@ -482,6 +491,14 @@ fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
         full,
         folded,
     }
+}
+
+/// [`tool_summary_parsed`] over arguments that have not been parsed yet.
+/// Tests only — production callers share the card's one parse.
+#[cfg(test)]
+fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(arguments.trim()).ok();
+    tool_summary_parsed(parsed.as_ref(), arguments, max)
 }
 
 /// A card's category color: the status glyph and tool name carry what the
@@ -1456,7 +1473,14 @@ mod tests {
 
     #[test]
     fn running_tool_card_spins_with_an_elapsed_row() {
-        let lines = running_tool_lines("bash", r#"{"command": "cargo build"}"#, "12s", "⠸", 60);
+        let lines = running_tool_lines(
+            "bash",
+            r#"{"command": "cargo build"}"#,
+            Some(&serde_json::json!({"command": "cargo build"})),
+            "12s",
+            "⠸",
+            60,
+        );
         assert_eq!(
             plain(&lines),
             vec!["⠸ bash(cargo build)", " ⎿  Running… (12s)"]

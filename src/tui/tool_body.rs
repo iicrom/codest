@@ -115,6 +115,19 @@ pub enum Budget {
 /// [`chat::DIFF_BODY_MAX_LINES`](crate::tui::chat).
 pub fn build(name: &str, arguments: &str, result: &str, budget: Budget) -> Option<Body> {
     let parsed: serde_json::Value = serde_json::from_str(arguments.trim()).ok()?;
+    build_parsed(name, Some(&parsed), result, budget)
+}
+
+/// [`build`] over an arguments value the caller already parsed — the card
+/// shares one parse between its header summary and this body, so a huge
+/// `write` payload is only deserialized once per rebuild.
+pub fn build_parsed(
+    name: &str,
+    parsed: Option<&serde_json::Value>,
+    result: &str,
+    budget: Budget,
+) -> Option<Body> {
+    let parsed = parsed?;
     let lang = parsed
         .get("path")
         .and_then(serde_json::Value::as_str)
@@ -433,17 +446,19 @@ fn read_rows(result: &str, lang: Option<&str>, range: std::ops::Range<usize>) ->
     let mut notes: Vec<String> = Vec::new();
     let mut seen = 0usize;
     for line in result.lines() {
-        let row = match split_numbered(line) {
-            Some((number, text)) => Some(ReadRow::Numbered(number.to_string(), text.to_string())),
-            None if !line.trim().is_empty() => Some(ReadRow::Note(line.trim_end().to_string())),
-            // A blank row is layout, not content: it never becomes a body row.
-            None => None,
-        };
-        let Some(row) = row else { continue };
-        if seen >= range.start && seen < range.end {
-            match row {
-                ReadRow::Numbered(number, text) => numbered.push((number, text)),
-                ReadRow::Note(note) => notes.push(note),
+        // The classification allocates, so rows before the window are only
+        // counted: a tail window used to materialize every line it skipped.
+        let parsed = split_numbered(line);
+        let is_content = parsed.is_some() || !line.trim().is_empty();
+        if !is_content {
+            continue;
+        }
+        if seen >= range.start {
+            match parsed {
+                Some((number, text)) => {
+                    numbered.push((number.to_string(), text.to_string()))
+                }
+                None => notes.push(line.trim_end().to_string()),
             }
         }
         seen += 1;

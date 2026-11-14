@@ -23,6 +23,10 @@ use std::time::Instant;
 pub struct RunningTool {
     pub name: String,
     pub arguments: String,
+    /// The arguments parsed once at the call start. The live card re-renders
+    /// every frame (spinner, elapsed readout), and re-parsing a huge `write`
+    /// payload per frame would burn the whole streaming frame budget.
+    pub parsed: Option<serde_json::Value>,
     /// When the call started, for the live elapsed readout.
     pub started_at: Instant,
 }
@@ -115,11 +119,22 @@ impl SessionView {
         display: &CardDisplay,
     ) -> &[Line<'static>] {
         self.sync_rendered();
+        // Only the card cells read the fold flags, so a Ctrl+O or Ctrl+T
+        // toggle invalidates just those: the markdown and text cells are the
+        // bulk of a long session's render cost, and rebuilding them per
+        // toggle used to stall the expansion for seconds.
+        let uses_display = matches!(
+            self.history[index],
+            HistoryCell::Thinking { .. } | HistoryCell::ToolCall { .. }
+        );
         let key = CellRenderKey {
             width,
             display: *display,
         };
-        if !matches!(&self.rendered[index], Some(rendered) if rendered.key == key) {
+        let current = matches!(&self.rendered[index], Some(rendered)
+            if rendered.key.width == width
+                && (!uses_display || rendered.key.display == *display));
+        if !current {
             let lines = self.history[index].lines(width, display);
             self.rendered[index] = Some(RenderedCell { key, lines });
         }

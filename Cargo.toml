@@ -74,6 +74,14 @@ libc = "0.2"
 opt-level = 0
 debug = "line-tables-only"
 
+# Interactive TUI time lives in the dependencies — syntect highlighting,
+# markdown parsing, unicode width tables — so an unoptimized dev build made
+# every frame and every Ctrl+O expansion several times slower than release.
+# Dependencies compile once and stay cached; the crate itself stays at 0 for
+# fast iteration.
+[profile.dev.package."*"]
+opt-level = 2
+
 # No `panic = "abort"`: the plugin task runner unwinds caught panics
 # (catch_unwind in src/tui/app.rs), which abort would turn into process death.
 [profile.release]
