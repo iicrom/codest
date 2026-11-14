@@ -11,7 +11,10 @@
 //! it owns the whole keyboard until it is answered or declined. One question
 //! is in focus at a time (the tab strip), showing the authored options plus
 //! the runtime rows the contract reserves: `Type something.` on every
-//! question and `Next` on a multi-select. `Esc` declines the whole form —
+//! question and `Next` on a multi-select. Opening the custom row starts a
+//! free-text edit; ↑↓ and Tab leave the edit and walk back to the options —
+//! only `Enter` (keep) and `Esc` (abandon) answer inside it. `Esc` declines
+//! the whole form —
 //! which is a decline, not "nobody asked": the tool can tell the difference.
 
 use std::sync::mpsc;
@@ -136,8 +139,29 @@ impl PromptDialog {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         // The free-text editor owns the keyboard while it is open; `Esc`
-        // there abandons the edit, not the questionnaire.
+        // there abandons the edit, not the questionnaire. The keys a one-line
+        // editor has no use for — ↑↓ and Tab — leave the edit instead of
+        // being swallowed: that is the way back to the authored options.
         if let Some(mut editor) = self.editor.take() {
+            let step = match key.code {
+                KeyCode::Up if !ctrl && !alt => Some(-1),
+                KeyCode::Down if !ctrl && !alt => Some(1),
+                KeyCode::Tab if !ctrl && !alt => {
+                    self.switch_question(1);
+                    return false;
+                }
+                KeyCode::BackTab if !ctrl && !alt => {
+                    self.switch_question(-1);
+                    return false;
+                }
+                _ => None,
+            };
+            if let Some(step) = step {
+                // Walking off the row abandons the unsaved text, like an edit
+                // a tab switch leaves behind; the saved text stays seeded.
+                self.move_focus(step);
+                return false;
+            }
             match editor.handle_key(key) {
                 None => {
                     self.editor = Some(editor);
@@ -243,9 +267,19 @@ impl PromptDialog {
         );
         let hint_area = Rect::new(inner.x, inner.y + visible as u16, inner.width, 1);
         frame.render_widget(
-            Paragraph::new(HINT).style(Style::default().fg(theme::DIM)),
+            Paragraph::new(self.hint()).style(Style::default().fg(theme::DIM)),
             hint_area,
         );
+    }
+
+    /// The hint row for the current state: while the custom editor is open,
+    /// the keys it describes are the editor's, not the questionnaire's.
+    fn hint(&self) -> &'static str {
+        if self.editor.is_some() {
+            EDIT_HINT
+        } else {
+            HINT
+        }
     }
 
     /// The full content, wrapped to `width`, plus the content row the focus
@@ -604,6 +638,10 @@ impl PromptDialog {
 }
 
 const HINT: &str = "↑↓ move · Enter select · Space toggle (multi) · ←→ question · Esc declines all";
+/// Shown while the custom-answer editor is open: the idle keys have
+/// different meanings now, and the way back to the options has to be
+/// spelled out — the editor otherwise reads as a trap.
+const EDIT_HINT: &str = "type · Enter keep text · ↑↓ back to options · ←→ cursor · Esc abandons";
 
 #[cfg(test)]
 mod tests {
@@ -870,6 +908,78 @@ mod tests {
         // The questionnaire is still open: Esc now declines it.
         assert!(dialog.handle_key(key(KeyCode::Esc)), "dialog closes");
         assert!(reply.recv().expect("declined").cancelled);
+    }
+
+    #[test]
+    fn the_arrow_keys_walk_out_of_the_editor_to_the_options() {
+        let (mut dialog, reply) = open(single_form());
+        dialog.handle_key(key(KeyCode::Down)); // focus "deny"
+        dialog.handle_key(key(KeyCode::Down)); // focus the custom row
+        dialog.handle_key(key(KeyCode::Enter)); // open the editor
+        dialog.handle_key(key(KeyCode::Char('x')));
+        // ↑ leaves the edit and lands back on the authored options instead
+        // of being swallowed by the one-line editor.
+        assert!(
+            !dialog.handle_key(key(KeyCode::Up)),
+            "the dialog stays open"
+        );
+        assert!(dialog.editor.is_none(), "the edit is closed");
+        assert!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            "focus is on `deny`, so Enter submits"
+        );
+        let response = reply.recv().expect("answered");
+        assert_eq!(
+            response.answers[0].kind,
+            PromptAnswerKind::Option,
+            "the unsaved draft is abandoned: the picked option submits"
+        );
+        assert_eq!(response.answers[0].answer.as_deref(), Some("deny"));
+    }
+
+    #[test]
+    fn down_leaves_the_editor_onto_the_next_row() {
+        let (mut dialog, reply) = open(mixed_form());
+        dialog.handle_key(key(KeyCode::Enter)); // pick "chrono", next question
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Down)); // the multi-select custom row
+        dialog.handle_key(key(KeyCode::Enter)); // open the editor
+        dialog.handle_key(key(KeyCode::Char('x')));
+        dialog.handle_key(key(KeyCode::Down)); // out of the edit, onto `Next`
+        assert!(dialog.editor.is_none(), "the edit is closed");
+        // The commit row is focused: Enter skips the blank question.
+        assert!(dialog.handle_key(key(KeyCode::Enter)), "dialog closes");
+        let response = reply.recv().expect("answered");
+        assert_eq!(
+            response.answers.len(),
+            1,
+            "the skipped multi-select is absent"
+        );
+    }
+
+    #[test]
+    fn tab_switches_questions_out_of_the_editor() {
+        let (mut dialog, _reply) = open(mixed_form());
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Down)); // the custom row
+        dialog.handle_key(key(KeyCode::Enter)); // open the editor
+        dialog.handle_key(key(KeyCode::Tab));
+        assert!(dialog.editor.is_none(), "the edit is closed");
+        assert_eq!(dialog.active, 1, "Tab moved to the next question");
+        dialog.handle_key(key(KeyCode::BackTab));
+        assert_eq!(dialog.active, 0, "BackTab moved back");
+    }
+
+    #[test]
+    fn the_hint_row_follows_the_editor() {
+        let (mut dialog, _reply) = open(single_form());
+        assert_eq!(dialog.hint(), HINT, "the idle keys are described");
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Enter)); // open the editor
+        assert_eq!(dialog.hint(), EDIT_HINT, "the edit keys are described");
+        dialog.handle_key(key(KeyCode::Up)); // leave the edit
+        assert_eq!(dialog.hint(), HINT, "the idle keys are back");
     }
 
     #[test]
