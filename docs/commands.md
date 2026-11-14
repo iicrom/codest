@@ -18,7 +18,7 @@ Slash commands are the local control surface of the TUI: they are parsed and exe
 | `/rename <name>` | — | Rename the current session (default name: its first user message). |
 | `/sessions` | `/resume` | Open the session list; switch back and continue one. |
 | `/continue` | — | Continue the current session without appending a new message — the recovery entry point after a crash or interrupt. |
-| `/model` | — | Open the model menu to switch provider/model (`r` re-discovers models). |
+| `/model` | — | Open the model menu to switch provider/model (`r` re-discovers models). `Tab`/`Shift+Tab` cycle the highlighted model's reasoning effort (applied with the switch); `Ctrl+S` saves the highlighted model and effort as the startup default. |
 | `/provider` | — | Open the provider wizard: add an OpenAI-compatible endpoint, sign in to a plugin provider, or list configured providers. |
 | `/profile [name]` | — | Show the available profiles, or switch to one (tools and prompt additions apply at startup only). |
 | `/effort [level]` | — | Show or set the reasoning effort (`minimal`/`low`/`medium`/`high` by default, `off` unsets); sent as `reasoning_effort`. |
@@ -103,7 +103,7 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 | --- | --- |
 | `Enter` | Send; queue the message while generating; run the selected command when the candidate popup is open. |
 | `Alt+Enter` | Deliver now: send when idle, steer into the running turn's next step boundary while generating. |
-| `Tab` | Complete the selected command. |
+| `Tab` | Complete the selected command; in the `/model` menu, cycle the highlighted model's effort (`Shift+Tab` back). |
 | `Ctrl+J` / `Shift+Enter` / `Ctrl+Enter` | Insert a newline. |
 | `↑` / `↓` | Select candidates; move the cursor in multi-line input; browse input history when single-line. |
 | `Ctrl+P` / `Ctrl+N` | Browse input history. |
@@ -114,10 +114,11 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 | Mouse wheel (fullscreen) | Scroll the transcript (3 lines per notch; `Alt`+wheel = 15). |
 | `PageUp` / `PageDown` | Scroll the transcript (fullscreen); handed to the terminal in inline mode. |
 | `Ctrl+End` | Jump to the newest line and resume following (fullscreen); `End` alone in inline mode. |
-| `Esc` | Close the candidate popup; interrupt the turn while generating. |
+| `Esc` | Close the candidate popup; interrupt the turn while generating — twice, when the interrupt confirm is on (`double_press_interrupt`). |
 | `Ctrl+T` | Expand/collapse thinking cards. |
 | `Ctrl+O` | Expand/collapse tool output (folded preview shows the first 3 lines). |
-| `Ctrl+C` | Interrupt while generating; clear input; double-press on empty input to quit. |
+| `Ctrl+S` | In the `/model` menu, save the highlighted model and effort as the startup default. |
+| `Ctrl+C` | Interrupt while generating (twice with the interrupt confirm on); clear input; double-press on empty input to quit. |
 | `Ctrl+D` | Quit on empty input. |
 
 ### Notes
@@ -125,7 +126,8 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 - **Fullscreen vs inline.** `PageUp`/`PageDown` belong to the app only in `fullscreen`, where it owns the alternate screen. In `inline` the terminal owns the scrollback, so those keys are passed through to it. `Ctrl+End` follows the same rule: it jumps the fullscreen viewport back to the newest line and re-arms follow mode, and in `inline` it stays a plain end-of-input cursor move.
 - **`Ctrl+T` is `/thinking`.** Both toggle whether thinking cards are expanded when settled; the card itself is always recorded.
 - **`Ctrl+O` folds tool output.** The card body shows the first 3 lines plus `… +N lines (ctrl+o to expand)`; `Ctrl+O` applies to all tool cards in the transcript.
-- **`Ctrl+C` has three states.** While generating it interrupts the turn (queued messages keep their place and run next); with text in the composer it clears the input; on empty input it must be pressed twice in quick succession to quit.
+- **`Ctrl+C` has three states.** While generating it interrupts the turn (queued messages keep their place and run next) — with the interrupt confirm on (`/settings` → *Confirm interrupt*, `double_press_interrupt` in `config.toml`, on by default) the first press only shows a hint and a second press inside two seconds interrupts, for Esc alike; with text in the composer it clears the input; on empty input it must be pressed twice in quick succession to quit.
+- **The `/model` menu carries an effort strip.** Under the model rows it shows the highlighted model's levels plus `off`, bracketing what Enter would set: the drafted level, the active effort for the current model, or the model's own default. `Tab`/`Shift+Tab` cycle the draft and `Enter` applies model and effort together (nothing is sent while browsing); `Ctrl+S` writes the shown combination to `config.toml` as `default` and `default_effort`, which fresh sessions start from (a profile's `effort` still wins over it).
 - **`Ctrl+D`** quits only on empty input — with text present it does nothing.
 
 ## Related

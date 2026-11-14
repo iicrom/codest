@@ -865,8 +865,9 @@ mod tests {
     #[test]
     fn the_shipped_host_toggles_write_their_dotted_keys() {
         let mut view = real_host_view("host-toggles", "");
-        // Rows: plugin segments, context readout, cache hit rate.
-        assert_eq!(REAL_HOST_FIELDS.len(), 3);
+        // Rows: plugin segments, context readout, cache hit rate, interrupt
+        // confirm.
+        assert_eq!(REAL_HOST_FIELDS.len(), 4);
         view.handle_key(key(KeyCode::Down));
         view.handle_key(key(KeyCode::Down));
         assert_eq!(

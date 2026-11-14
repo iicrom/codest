@@ -40,11 +40,23 @@ pub use cst_plugin_api::config::{
 };
 
 /// `config.toml` — global settings.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
     /// Initial model selection, `"provider/model"`.
     pub default: Option<String>,
+    /// Initial reasoning effort for fresh sessions, as `/effort <level>` would
+    /// set it (`off` included). A profile's `effort` wins over it, and a
+    /// restored session restores its own recorded choice; absent, or only
+    /// after both, the model's `default_level` seeds the effort. Set by
+    /// Ctrl+S in the `/model` picker.
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    /// Whether Esc and Ctrl+C must be pressed twice to interrupt a running
+    /// turn; the first press only shows a footer hint. Toggleable in
+    /// `/settings`.
+    #[serde(default = "default_double_press_interrupt")]
+    pub double_press_interrupt: bool,
     /// Optional cap on model → tool → model rounds per user turn. Absent
     /// leaves the turn loop unbounded, like codex; a value re-enables the
     /// runaway guard (the turn then ends with a `tool round limit reached`
@@ -63,6 +75,25 @@ pub struct GlobalConfig {
     /// anywhere else in these files: silent no-ops hide mistakes.
     #[serde(default)]
     pub plugins: BTreeMap<String, cst_plugin_api::config::PluginSettings>,
+}
+
+/// The guard is on until the user turns it off in `/settings`; `Default` and
+/// the missing-key serde default must agree, so both come from here.
+fn default_double_press_interrupt() -> bool {
+    true
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            default_effort: None,
+            double_press_interrupt: default_double_press_interrupt(),
+            max_tool_rounds: None,
+            status_bar: StatusBarConfig::default(),
+            plugins: BTreeMap::new(),
+        }
+    }
 }
 
 /// The footer's `[status_bar]` table. Absent fields and an absent table both
@@ -409,15 +440,31 @@ listen = "127.0.0.1:8737"
     }
 
     #[test]
+    fn parses_the_default_effort_and_interrupt_keys() {
+        let global = write_temp(
+            "global-keys.toml",
+            "default_effort = \"high\"\ndouble_press_interrupt = false\n",
+        );
+        let parsed = load_global(&global).unwrap();
+        assert_eq!(parsed.default_effort.as_deref(), Some("high"));
+        assert!(!parsed.double_press_interrupt);
+
+        // Absent keys — and a missing file — keep the built-in defaults: no
+        // effort preset, and the interrupt confirm starts on.
+        let empty = write_temp("global-empty.toml", "");
+        let parsed = load_global(&empty).unwrap();
+        assert_eq!(parsed.default_effort, None);
+        assert!(parsed.double_press_interrupt);
+    }
+
+    #[test]
     fn parses_global_and_provider_files() {
         let global = write_temp("global.toml", "default = \"glm/glm-5.3\"\n");
         assert_eq!(
             load_global(&global).unwrap(),
             GlobalConfig {
                 default: Some("glm/glm-5.3".to_string()),
-                max_tool_rounds: None,
-                status_bar: StatusBarConfig::default(),
-                plugins: BTreeMap::new(),
+                ..GlobalConfig::default()
             }
         );
 
