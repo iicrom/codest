@@ -22,7 +22,7 @@ CST_TUI_MODE=inline codest
 
 ### 滚动
 
-`fullscreen` 下 transcript 位于应用自管的滚动视口：滚轮每格 3 行，`Alt`+滚轮 15 行，`PgUp`/`PgDn` 每次 5 行。应用重绘视口，所以 transcript 可以长于屏幕、上下都能浏览。
+`fullscreen` 下 transcript 位于应用自管的滚动视口：滚轮每格 3 行，`Alt`+滚轮 15 行，`PgUp`/`PgDn` 每次 5 行。应用重绘视口，所以 transcript 可以长于屏幕、上下都能浏览。向上滚动会脱离尾部跟随，`Ctrl+End` 跳回最新一行并重新跟随。
 
 `inline` 下应用不做任何滚动：`PgUp`/`PgDn` 直接交给终端，由终端滚动自己的 scrollback。回合进行中，inline 面板在底部最多保留四行仍在流式生长的尾部，高度固定——因此逐行增长的块不会把自己已经画好的开头滚进 scrollback、事后又重复输出一次。块定型后，这些行才真正晋升进 scrollback。
 

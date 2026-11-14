@@ -22,7 +22,7 @@ CST_TUI_MODE=inline codest
 
 ### Scrolling
 
-In `fullscreen` the transcript lives in an application-scrolled viewport: the mouse wheel moves 3 lines per notch, `Alt`+wheel moves 15, and `PgUp`/`PgDn` move 5 lines per press. Because the app repaints the viewport, the transcript can be longer than the screen and still be browsed in both directions.
+In `fullscreen` the transcript lives in an application-scrolled viewport: the mouse wheel moves 3 lines per notch, `Alt`+wheel moves 15, and `PgUp`/`PgDn` move 5 lines per press. Because the app repaints the viewport, the transcript can be longer than the screen and still be browsed in both directions. Scrolling up detaches the viewport from the tail; `Ctrl+End` jumps back to the newest line and re-attaches it.
 
 In `inline` the app never scrolls anything: `PgUp`/`PgDn` are handed straight to the terminal, which scrolls its own scrollback. While a turn runs, the inline pane keeps at most four rows of the still-streaming tail pinned to the bottom — a fixed height, so a block growing row by row cannot scroll its own already-drawn head into the scrollback and later duplicate it. Once the block settles, its lines are promoted into the scrollback for real.
 

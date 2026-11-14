@@ -215,7 +215,7 @@ impl SessionView {
         )));
         let hint = match mode {
             TuiMode::Fullscreen => {
-                "Enter send · type / for commands · Ctrl+J newline · wheel/PgUp/PgDn scroll · Ctrl+C twice to quit"
+                "Enter send · type / for commands · Ctrl+J newline · Ctrl+End latest · wheel/PgUp/PgDn scroll · Ctrl+C twice to quit"
             }
             TuiMode::Inline => {
                 "Enter send · type / for commands · Ctrl+J newline · PgUp/PgDn terminal scrollback · Ctrl+C twice to quit"

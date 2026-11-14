@@ -117,7 +117,8 @@ const ALT_WHEEL_LINES: usize = 15;
 /// whole items from the tail — a hint clipped to `Ctrl+J newlin` reads as
 /// damage, a shorter list of complete hints reads as intent. `Ctrl+T` and
 /// `Ctrl+O` are not listed: the cards themselves name their expand key.
-const IDLE_HINTS_FULLSCREEN: &str = "Enter send · / commands · Ctrl+J newline · wheel scroll";
+const IDLE_HINTS_FULLSCREEN: &str =
+    "Enter send · / commands · Ctrl+J newline · Ctrl+End latest · wheel scroll";
 /// Inline mode owns no viewport, so it lists the terminal's paging instead of
 /// the app's jump-to-newest.
 const IDLE_HINTS_INLINE: &str = "Enter send · / commands · Ctrl+J newline · PgUp/PgDn scrollback";
@@ -1611,9 +1612,17 @@ impl App {
             KeyCode::Up => self.on_up(),
             KeyCode::Down => self.on_down(),
             KeyCode::Home => self.composer.home(),
+            // Jump back to the newest line and re-arm follow mode, so the
+            // transcript sticks to the bottom again: after browsing up
+            // through a long session, wheel notches are a poor way home.
+            // Inline mode has no viewport to jump — the terminal owns the
+            // transcript above the pane — so the key stays a cursor move.
+            KeyCode::End if ctrl && self.mode == TuiMode::Fullscreen => self.scroll_to_bottom(),
             KeyCode::End => self.composer.end(),
             KeyCode::Esc => self.on_escape(),
-            // Inline mode leaves paging to the terminal's native scrollback.
+            // Inline mode leaves paging to the terminal's native scrollback,
+            // and has no viewport to jump: the newest line is already at the
+            // bottom, because the terminal owns the transcript above it.
             KeyCode::PageUp if self.mode == TuiMode::Fullscreen => self.scroll_up(5),
             KeyCode::PageDown if self.mode == TuiMode::Fullscreen => self.scroll_down(5),
             _ => {}
@@ -3452,6 +3461,15 @@ impl App {
             let draft = std::mem::take(&mut self.draft);
             self.composer.set_text(draft);
         }
+    }
+
+    /// Jump the viewport to the newest line and resume following, the same
+    /// state a fresh turn enters (and the one wheel-scrolling to the bottom
+    /// leaves behind).
+    fn scroll_to_bottom(&mut self) {
+        let view = self.view_mut();
+        view.follow = true;
+        view.scroll = view.max_scroll;
     }
 
     fn scroll_up(&mut self, amount: usize) {
@@ -6560,6 +6578,59 @@ mod tests {
         assert_eq!(app.view().history.len(), before);
     }
 
+    /// Ctrl+End is the way home: it re-arms follow so the transcript sticks to
+    /// the newest line again, and the viewport actually shows the tail.
+    #[tokio::test]
+    async fn ctrl_end_jumps_to_the_newest_line_and_resumes_following() {
+        let mut app = test_app();
+        for n in 0..40 {
+            app.view_mut()
+                .history
+                .push(HistoryCell::Notice(format!("line {n}")));
+        }
+        let lines = render_lines(&mut app, 60, 12);
+        assert!(
+            lines.iter().any(|line| line.contains("line 39")),
+            "{lines:?}"
+        );
+
+        // Browsing up leaves follow mode behind…
+        for _ in 0..20 {
+            app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        }
+        assert!(!app.view().follow);
+        let lines = render_lines(&mut app, 60, 12);
+        assert!(
+            !lines.iter().any(|line| line.contains("line 39")),
+            "{lines:?}"
+        );
+
+        // …and Ctrl+End is the way back, follow mode included.
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert!(app.view().follow);
+        assert_eq!(app.view().scroll, app.view().max_scroll);
+        let lines = render_lines(&mut app, 60, 12);
+        assert!(
+            lines.iter().any(|line| line.contains("line 39")),
+            "{lines:?}"
+        );
+    }
+
+    /// In inline mode the terminal owns the transcript, so Ctrl+End keeps its
+    /// old meaning: move the composer cursor to the end of the input.
+    #[tokio::test]
+    async fn ctrl_end_in_inline_mode_still_ends_the_composer() {
+        let mut app = test_app();
+        app.mode = TuiMode::Inline;
+        app.composer.set_text("hello".to_string());
+        app.composer.home();
+        assert_eq!(app.composer.text(), "hello");
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert_eq!(app.composer.cursor(), app.composer.len());
+        assert!(app.view().follow, "the inline pane has no scroll to move");
+    }
+
     /// The footer's hints degrade by whole items: a narrow terminal keeps a
     /// shorter list of complete hints instead of a half-word.
     #[test]
@@ -6613,9 +6684,9 @@ mod tests {
                 );
             }
         }
-        // A wide terminal keeps the whole list.
+        // A wide terminal keeps the whole list, Ctrl+End included.
         let footer = render_lines(&mut app, 140, 20).pop().expect("footer");
-        assert!(footer.contains(IDLE_HINTS_FULLSCREEN), "{footer}");
+        assert!(footer.contains("Ctrl+End latest"), "{footer}");
     }
 
     #[tokio::test]
