@@ -52,6 +52,22 @@ Windows differences worth knowing:
 
 All paths resolve against the working directory when relative.
 
+### `ask_user_question`
+
+| Tool | Behavior |
+| --- | --- |
+| `ask_user_question` | Puts 1-4 structured questions to the user in **one interruption** — each with 2-4 authored options (label + description, optional markdown `preview`), an auto-appended `Type something.` free-text row, and a `Next` commit row on `multiSelect` questions. Marked `read_only`. |
+
+The tool is the consumer of the `PromptHost` contract (§3 in
+[plugins.md](plugins.md)): it validates and normalizes the arguments, shows
+the question dialog, and returns the answers as one `role: "tool"` message —
+`"question"="answer"` segments, the chosen option's preview when it carried
+one, `unanswered` for questions skipped with `Next`, and a global note slot.
+`Esc` declines the whole form, which the envelope words as one canonical
+sentence so the model cannot mistake it for an answer. Reserved labels
+(`Other`, `Type something.`, `Next`) are rejected at validation, and a
+headless front-end gets "UI not available" — explicitly not a decline.
+
 ## Session tool toggles
 
 `/tools` controls which declared tools this session offers:

@@ -581,6 +581,16 @@ struct App {
     provider_wizard: Option<crate::tui::provider_wizard::Wizard>,
     /// Open `/settings` screen (`Some` while it owns the input).
     settings_view: Option<crate::tui::settings_view::SettingsView>,
+    /// Open question dialog (`Some` while a tool waits on the user): the
+    /// `ask_user_question` plugin's form, drawn as a modal popup that owns
+    /// the whole keyboard.
+    prompt_dialog: Option<crate::tui::prompt_dialog::PromptDialog>,
+    /// The question dialog's inbox: `TuiPromptHost` forwards forms here from
+    /// the blocking tool thread, and the event loop opens a dialog per
+    /// request.
+    prompt_requests:
+        tokio::sync::mpsc::UnboundedReceiver<crate::tui::prompt_dialog::PromptRequest>,
+    prompt_requests_closed: bool,
     /// The file `/settings` edits. Normally `~/.codest/config.toml`; a field
     /// so a test can point the screen at a temporary document.
     settings_path: PathBuf,
@@ -776,6 +786,17 @@ impl App {
         let inline_height = inline_pane_height(inline_rows, 1, 0, 0);
         let inline_top = inline_rows.saturating_sub(inline_height);
 
+        // The front-end's question service, installed once before any turn
+        // can run a tool that asks: `ask_user_question` parks its blocking
+        // thread on the host, and the event loop below opens a dialog per
+        // request. A headless front-end never builds an `App`, so there the
+        // tool keeps its "UI not available" guidance path.
+        let (prompt_tx, prompt_requests) =
+            tokio::sync::mpsc::unbounded_channel::<crate::tui::prompt_dialog::PromptRequest>();
+        plugins.install_prompt_host(std::sync::Arc::new(
+            crate::tui::prompt_dialog::TuiPromptHost::new(prompt_tx),
+        ));
+
         let route = Selection::parse(&model_label).ok();
         // Mirrors the worker's seeding: a recorded or configured effort wins
         // outright — including an explicit `off` — and only an unset one is
@@ -813,6 +834,9 @@ impl App {
             context_view: None,
             provider_wizard: None,
             settings_view: None,
+            prompt_dialog: None,
+            prompt_requests,
+            prompt_requests_closed: false,
             settings_path: crate::core::config::config_path(),
             provider_tx,
             provider_tasks,
@@ -972,6 +996,22 @@ impl App {
                     }
                     self.needs_redraw = true;
                 }
+                maybe_request = self.prompt_requests.recv(), if !self.prompt_requests_closed => {
+                    // A tool asked the user a question. The worker runs its
+                    // tool calls strictly one at a time, so at most one
+                    // dialog can be pending; if one ever arrives while a
+                    // dialog is up, the newcomer replaces it and the parked
+                    // old tool reads "UI not available" from its dropped
+                    // reply channel.
+                    match maybe_request {
+                        Some(request) => {
+                            self.prompt_dialog =
+                                Some(crate::tui::prompt_dialog::PromptDialog::new(request));
+                        }
+                        None => self.prompt_requests_closed = true,
+                    }
+                    self.needs_redraw = true;
+                }
                 _ = tokio::time::sleep_until(next_frame.into()), if self.needs_redraw => {}
                 _ = ticker.tick() => self.on_tick(),
             }
@@ -1011,6 +1051,49 @@ impl App {
         };
         let size = tui.size()?;
 
+        // The question dialog replaces the pane while a tool waits on the
+        // user, grown to the dialog's preferred height so the options fit.
+        // The regular pane's bookkeeping (`inline_top`/`inline_height`) is
+        // kept up to date here, so closing the dialog is just the regular
+        // path seeing a pane that shrank back: it clears what the dialog
+        // left behind and flushes the transcript lines that queued up.
+        if let Some(dialog) = &self.prompt_dialog {
+            let rows = size.height;
+            let pane_rows = dialog
+                .preferred_height(size.width)
+                .min(rows.saturating_sub(1))
+                .max(3);
+            let rect = inline_rect(size.width, rows, pane_rows);
+
+            let resized = rows != self.inline_rows || size.width != self.inline_columns;
+            let changed = resized || pane_rows != self.inline_height;
+            let old_top = self.inline_top;
+            // Growing the pane consumes transcript rows: push them to
+            // scrollback first, like the regular path does, so nothing the
+            // dialog covers is lost when it closes.
+            if pane_rows > self.inline_height && !resized {
+                scroll_screen_up(rows, (pane_rows - self.inline_height) as usize)?;
+            }
+            if changed {
+                let mut stdout = std::io::stdout();
+                execute!(
+                    stdout,
+                    MoveTo(0, old_top.min(rect.y)),
+                    Clear(ClearType::FromCursorDown)
+                )?;
+            }
+            self.inline_top = rect.y;
+            self.inline_height = pane_rows;
+            self.inline_rows = rows;
+            self.inline_columns = size.width;
+
+            if changed {
+                tui.resize(rect)?;
+                tui.current_buffer_mut().reset();
+            }
+            tui.draw(|frame| dialog.render(frame, frame.area()))?;
+            return Ok(());
+        }
         // The `/context` viewer takes the whole pane while open; closing it
         // restores the normal pane, scrollback untouched.
         if self.context_view.is_some() {
@@ -1229,6 +1312,10 @@ impl App {
             // screens are modal, so with one open the paste is dropped rather
             // than typed into the composer the user cannot see.
             Event::Paste(text) => {
+                if let Some(dialog) = self.prompt_dialog.as_mut() {
+                    dialog.paste(&text);
+                    return;
+                }
                 if let Some(view) = self.settings_view.as_mut() {
                     view.paste(&text);
                     return;
@@ -1252,6 +1339,11 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.mode != TuiMode::Fullscreen {
+            return;
+        }
+        // The question dialog fills the focus and windows itself; the wheel
+        // would only scroll the transcript hidden underneath it.
+        if self.prompt_dialog.is_some() {
             return;
         }
         // Which way the wheel turned, in lines. A full-frame screen scrolls
@@ -1290,6 +1382,16 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // A pending question is an active tool call, so the dialog owns the
+        // whole keyboard until it is answered or declined — stricter than
+        // the screens below, which cannot even be opened while it is up.
+        if let Some(dialog) = self.prompt_dialog.as_mut() {
+            if dialog.handle_key(key) {
+                self.prompt_dialog = None;
+            }
+            return;
+        }
 
         // The `/context` viewer owns the whole keyboard while it is open —
         // fully modal, like the provider wizard but stricter: nothing leaks
@@ -3169,11 +3271,17 @@ impl App {
                 });
             }
             EventMsg::TurnAborted { .. } => {
+                // The turn dies while a tool may be parked on the dialog:
+                // drop it, so the blocked `ask` reads "UI not available"
+                // and the ignored tool call unwinds.
+                self.prompt_dialog = None;
                 self.settle_running_tool("interrupted");
                 self.finalize_live();
                 self.view_mut().history.push(HistoryCell::Interrupted);
             }
             EventMsg::Error { message } => {
+                // The same unwind for a turn that dies on an error.
+                self.prompt_dialog = None;
                 // A rejected context op reports inside the viewer, where the
                 // action that failed is still on screen.
                 if let Some(view) = self.context_view.as_mut() {
@@ -3372,47 +3480,52 @@ impl App {
             let mut view = self.context_view.take().expect("checked above");
             view.render(frame, area);
             self.context_view = Some(view);
-            return;
-        }
         // The `/settings` screen does too, and it mutates its own scroll, so
         // it is taken out and put back.
-        if self.settings_view.is_some() {
+        } else if self.settings_view.is_some() {
             let mut view = self.settings_view.take().expect("checked above");
             view.render(frame, area);
             self.settings_view = Some(view);
-            return;
+        } else {
+            let width = area.width as usize;
+
+            let composer_width = width.saturating_sub(2).max(1);
+            let composer_rows = self.composer.visual_rows(composer_width);
+            let desired_rows = composer_rows.len().clamp(1, MAX_COMPOSER_ROWS);
+            let max_composer_height = area.height.saturating_sub(2).max(1);
+            let composer_height = (desired_rows as u16 + 1).min(max_composer_height);
+            let visible_composer_rows = composer_height.saturating_sub(1) as usize;
+
+            let menu_height = (self.menu_row_count() as u16)
+                .min(area.height.saturating_sub(composer_height + 2));
+
+            let chunks = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(menu_height),
+                Constraint::Length(composer_height),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+            let menu = self.menu_lines(menu_height as usize);
+            self.render_chat(frame, chunks[0], width);
+            self.render_menu(frame, chunks[1], &menu);
+            self.render_composer(
+                frame,
+                chunks[2],
+                composer_width,
+                visible_composer_rows,
+                &composer_rows,
+            );
+            self.render_footer(frame, chunks[3]);
         }
-        let width = area.width as usize;
 
-        let composer_width = width.saturating_sub(2).max(1);
-        let composer_rows = self.composer.visual_rows(composer_width);
-        let desired_rows = composer_rows.len().clamp(1, MAX_COMPOSER_ROWS);
-        let max_composer_height = area.height.saturating_sub(2).max(1);
-        let composer_height = (desired_rows as u16 + 1).min(max_composer_height);
-        let visible_composer_rows = composer_height.saturating_sub(1) as usize;
-
-        let menu_height =
-            (self.menu_row_count() as u16).min(area.height.saturating_sub(composer_height + 2));
-
-        let chunks = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(menu_height),
-            Constraint::Length(composer_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-        let menu = self.menu_lines(menu_height as usize);
-        self.render_chat(frame, chunks[0], width);
-        self.render_menu(frame, chunks[1], &menu);
-        self.render_composer(
-            frame,
-            chunks[2],
-            composer_width,
-            visible_composer_rows,
-            &composer_rows,
-        );
-        self.render_footer(frame, chunks[3]);
+        // The question dialog sits on top of whatever is under it — chat,
+        // or one of the screens above: a pending question is an active tool
+        // call and outranks every screen.
+        if let Some(dialog) = self.prompt_dialog.as_ref() {
+            dialog.render(frame, area);
+        }
     }
 
     fn render_inline_pane(

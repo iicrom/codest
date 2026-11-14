@@ -18,11 +18,13 @@ response into a `tool_calls` delta (fragmented arguments, the shape providers
 stream) instead of text. `@bash` (`@pwsh` on Windows — the built-in shell tool
 is the host's own), `@read`, `@write` and `@edit` call that built-in tool with
 the text after the keyword (`@bash ls -la` → `bash` with
-`{"command": "ls -la"}`); `@tool` calls whatever `--tool` / `--tool-arguments`
-configured, which by default is the unregistered `ping` — no tool by that name
-is in the binary, so its result is the `error: unknown tool …` text. codest
-executes the call and feeds the result back as a `role: "tool"` message; the
-following response summarizes the round.
+`{"command": "ls -la"}`); `@ask-user` calls the built-in `ask_user_question`
+plugin with one structured question (`@ask-user Which color? | red | blue`),
+which the front-end shows as a modal dialog; `@tool` calls whatever `--tool` /
+`--tool-arguments` configured, which by default is the unregistered `ping` —
+no tool by that name is in the binary, so its result is the
+`error: unknown tool …` text. codest executes the call and feeds the result
+back as a `role: "tool"` message; the following response summarizes the round.
 
 Every message without a keyword gets the help reply, which lists these
 keywords — so the server documents itself on the first turn.
@@ -192,6 +194,31 @@ def edit_arguments(rest: str) -> dict[str, Any] | None:
     }
 
 
+def ask_user_arguments(rest: str) -> dict[str, Any] | None:
+    """`@ask-user <question> | <label> | <label> [| <label> | <label>]`; `None`
+    when the tail is not one 2-4 option question.
+
+    The tool the call names is `ask_user_question`: the arguments are the
+    schema's shape (one question, single-select, empty per-option
+    descriptions), and the tab header is the question truncated to its
+    16-character cap. An unparsable tail returns `None`, which falls back to
+    the help reply like `@write` / `@edit`.
+    """
+    parts = [part.strip() for part in rest.split("|")]
+    if len(parts) < 3 or len(parts) > 5 or not all(parts):
+        return None
+    question, labels = parts[0], parts[1:]
+    return {
+        "questions": [
+            {
+                "question": question,
+                "header": question[:16],
+                "options": [{"label": label, "description": ""} for label in labels],
+            }
+        ]
+    }
+
+
 @dataclass(frozen=True)
 class Trigger:
     """One keyword that turns the next response into a `tool_calls` round.
@@ -242,6 +269,15 @@ TRIGGERS: tuple[Trigger, ...] = (
         tool="edit",
         summary="replace exact text, e.g. `@edit notes.txt | hello | goodbye`",
         build=edit_arguments,
+    ),
+    Trigger(
+        keyword="@ask-user",
+        tool="ask_user_question",
+        summary=(
+            "put one structured question to the user, e.g. "
+            "`@ask-user Which color? | red | blue` (2-4 options)"
+        ),
+        build=ask_user_arguments,
     ),
 )
 

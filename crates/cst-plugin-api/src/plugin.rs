@@ -76,6 +76,16 @@ pub trait Plugin: Sync {
         ))
     }
 
+    /// Hand this plugin the front-end's prompt service, once at startup.
+    ///
+    /// A plugin cannot draw, so a tool that needs a decision from the human
+    /// asks the front-end through [`crate::prompt::PromptHost`] and blocks
+    /// until the answer arrives. The host installs the service before any tool
+    /// can run; a plugin that never asks keeps the default no-op and behaves
+    /// exactly as before. All shipped plugins share one service, so the value
+    /// is cheap to clone and store behind the plugin's own `Mutex`.
+    fn set_prompt_host(&self, _host: Arc<dyn crate::prompt::PromptHost>) {}
+
     /// Protocol kinds contributed to the provider registry. A custom
     /// provider = a `ProtocolFactory` here (the wire protocol, compile-time)
     /// plus instances in `providers.toml` (the endpoints, runtime config).

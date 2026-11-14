@@ -18,6 +18,7 @@ core、不碰终端：`/help`、`/clear`、`/quit`、`/status`、`/continue` 以
 | 系统提示词片段 | `system_prompt()` | 领域指令、工具使用约定 |
 | 生命周期钩子 | `on_startup` / `on_user_message` / `on_turn_complete` / `on_conversation_cleared` | 通知、报告、请求宿主动作 |
 | 工具 | `tools()` + `run_tool()` | 模型可调用的能力（`bash`/`pwsh`、`read`…） |
+| 交互式提问 | `set_prompt_host()` + `PromptHost::ask` | 工具把结构化问题抛给用户（`ask_user_question`） |
 | 协议工厂 | `protocols()` | 给 `providers.toml` 实例接新线协议 |
 | 登录入口 | `auth_providers()` / `auth_status()` / `begin_sign_in()` | `/provider` 后面的浏览器/PAT 登录 |
 | 事件流 | `subscriptions()` + `on_event()` | 计量器、监控端、对 agent 运行的响应 |
@@ -46,6 +47,7 @@ trait 及其交换的数据都在契约 crate
 | `system_prompt()` | — | `Option<&'static str>` | `None` |
 | `tools()` | — | `&'static [ToolSpec]` | 空 |
 | `run_tool(&ToolCall)` | 原始 JSON 参数 | `Result<String, PluginError>` | 报错 |
+| `set_prompt_host(Arc<dyn PromptHost>)` | 前端的问题服务 | — | 无操作 |
 | `protocols()` | — | `&'static [&'static dyn ProtocolFactory]` | 空 |
 | `auth_providers()` | — | `&'static [AuthProvider]` | 空 |
 | `auth_status(&str)` | 实例名 | `AuthStatus` | `Unsupported` |
@@ -165,6 +167,15 @@ profile。
 模型不再调工具、用户中断或请求失败时结束；`config.toml` 的
 `max_tool_rounds` 可恢复兜底。工具执行跑在阻塞线程池上，所以 `run_tool`
 可以阻塞；钩子不行。
+
+需要的是用户的决策而不是数据时，工具去问*前端*：TUI 在启动时装一次
+`PromptHost` 服务（`PluginHost::install_prompt_host`，经 `set_prompt_host`
+分发给每个插件），`run_tool` 调用 `PromptHost::ask(form)`——一次打断最多带
+1-4 个结构化问题——并阻塞到用户作答或拒绝。内置的
+[`ask_user_question`](tools.md) 是参考实现。让契约保持诚实的一条区分：拒绝
+是 `cancelled: true` 的 `PromptResponse`，而 `ask` 返回 `None` 表示这个前端
+根本没能提问（无头运行），工具必须把它报告为 "UI not available"，而不是
+解读成拒绝。
 
 ## 4. 装配期校验
 
