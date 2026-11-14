@@ -135,7 +135,7 @@ pub fn build_parsed(
     match name {
         "write" => {
             let content = parsed.get("content").and_then(serde_json::Value::as_str)?;
-            Some(diff(&[], content, lang.as_deref(), caption(result), budget))
+            Some(diff("", content, lang.as_deref(), caption(result), budget))
         }
         "edit" => {
             let old = parsed
@@ -145,7 +145,7 @@ pub fn build_parsed(
                 .get("new_string")
                 .and_then(serde_json::Value::as_str)?;
             Some(diff(
-                &lines_of(old),
+                old,
                 new,
                 lang.as_deref(),
                 caption(result),
@@ -195,12 +195,16 @@ fn looks_like_path(word: &str) -> bool {
 /// stat row. `write` passes no removed lines — it does not know the old
 /// content, and inventing one would be a lie about what changed.
 ///
+/// `removed` is the raw old text: its lines are materialized lazily (counted
+/// first, only the shown prefix built), so a giant replacement never
+/// allocates every line it hides.
+///
 /// The stat row is `(+N -M)`, followed by the tool's own one-line verdict when
 /// `caption` supplies one (`created`, `overwrote`, the replacement count): the
 /// result string still carries facts a diff cannot, so the card keeps them
 /// instead of discarding the whole line.
 fn diff(
-    removed: &[String],
+    removed: &str,
     added: &str,
     lang: Option<&str>,
     caption: Option<String>,
@@ -208,11 +212,12 @@ fn diff(
 ) -> Body {
     // The stat states the WHOLE change, so it counts every line even when the
     // rows below it are capped.
+    let removed_total = count_lines(removed);
     let added_total = count_lines(added);
     match budget {
         Budget::Head(max) => {
-            let mut rows = Vec::with_capacity(max.min(removed.len() + added_total + 1));
-            let mut hidden = removed.len() + added_total;
+            let mut rows = Vec::with_capacity(max.min(removed_total + added_total + 1));
+            let mut hidden = removed_total + added_total;
             if max == 0 {
                 return Body {
                     rows,
@@ -220,17 +225,17 @@ fn diff(
                     hidden,
                 };
             }
-            let stat = stat_span(added_total, removed.len(), caption);
+            let stat = stat_span(added_total, removed_total, caption);
             rows.push(Row {
                 tone: Tone::Plain,
                 lead: MARK.to_string(),
                 spans: vec![stat],
             });
             let mut left = max - 1;
-            let removed_rows = removed.len().min(left);
+            let removed_rows = removed_total.min(left);
             hidden -= removed_rows;
             left -= removed_rows;
-            push_side(&mut rows, &removed[..removed_rows], Tone::Del, '-', lang);
+            push_side(&mut rows, &lines_head(removed, removed_rows), Tone::Del, '-', lang);
 
             let kept = lines_head(added, left);
             hidden -= kept.len();
@@ -248,15 +253,15 @@ fn diff(
             // `(-N)` total stays complete, and the head rows read as the
             // start of the delete.
             let head_budget = head.saturating_sub(1).max(1);
-            let removed_rows = removed.len().min(head_budget);
+            let removed_rows = removed_total.min(head_budget);
             let mut rows = Vec::with_capacity(head + tail + 2);
-            let stat = stat_span(added_total, removed.len(), caption);
+            let stat = stat_span(added_total, removed_total, caption);
             rows.push(Row {
                 tone: Tone::Plain,
                 lead: MARK.to_string(),
                 spans: vec![stat],
             });
-            push_side(&mut rows, &removed[..removed_rows], Tone::Del, '-', lang);
+            push_side(&mut rows, &lines_head(removed, removed_rows), Tone::Del, '-', lang);
 
             let added_head = head_budget - removed_rows;
             let kept_head = lines_head(added, added_head);
@@ -533,20 +538,8 @@ fn split_numbered(line: &str) -> Option<(&str, &str)> {
     Some((number, text))
 }
 
-/// A text blob's lines: the trailing newline is a terminator, not an extra
-/// blank line, while interior blanks survive. CRLF line ends are folded so the
-/// rows do not carry a stray carriage return into the terminal.
-fn lines_of(text: &str) -> Vec<String> {
-    let text = text.strip_suffix('\n').unwrap_or(text);
-    if text.is_empty() {
-        return Vec::new();
-    }
-    text.split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
-        .collect()
-}
-
-/// How many lines [`lines_of`] would return, without building them.
+/// How many lines a text blob would split into: the trailing newline is a
+/// terminator, not an extra blank line.
 fn count_lines(text: &str) -> usize {
     let text = text.strip_suffix('\n').unwrap_or(text);
     if text.is_empty() {

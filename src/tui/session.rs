@@ -46,6 +46,12 @@ struct CellRenderKey {
 /// A cached render of one history cell.
 struct RenderedCell {
     key: CellRenderKey,
+    /// Which single fold flag this cell's lines read, and its value at
+    /// render time — `None` for cells that read neither. Each card kind
+    /// reads one flag, so a Ctrl+O toggle must not invalidate thinking
+    /// cards (their body can be thousands of lines) and a Ctrl+T toggle
+    /// must not invalidate tool cards.
+    flag: Option<bool>,
     lines: Vec<Line<'static>>,
 }
 
@@ -119,24 +125,24 @@ impl SessionView {
         display: &CardDisplay,
     ) -> &[Line<'static>] {
         self.sync_rendered();
-        // Only the card cells read the fold flags, so a Ctrl+O or Ctrl+T
-        // toggle invalidates just those: the markdown and text cells are the
-        // bulk of a long session's render cost, and rebuilding them per
-        // toggle used to stall the expansion for seconds.
-        let uses_display = matches!(
-            self.history[index],
-            HistoryCell::Thinking { .. } | HistoryCell::ToolCall { .. }
-        );
+        // Each card kind reads exactly one fold flag, and the text and
+        // markdown cells read neither: a Ctrl+O or Ctrl+T toggle invalidates
+        // just the cards that actually fold with it. Rebuilding everything
+        // per toggle used to stall the expansion for seconds.
+        let flag = match self.history[index] {
+            HistoryCell::Thinking { .. } => Some(display.thinking),
+            HistoryCell::ToolCall { .. } => Some(display.tool_detail),
+            _ => None,
+        };
         let key = CellRenderKey {
             width,
             display: *display,
         };
         let current = matches!(&self.rendered[index], Some(rendered)
-            if rendered.key.width == width
-                && (!uses_display || rendered.key.display == *display));
+            if rendered.key.width == width && rendered.flag == flag);
         if !current {
             let lines = self.history[index].lines(width, display);
-            self.rendered[index] = Some(RenderedCell { key, lines });
+            self.rendered[index] = Some(RenderedCell { key, flag, lines });
         }
         self.rendered[index]
             .as_ref()

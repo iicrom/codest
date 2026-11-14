@@ -4992,18 +4992,53 @@ mod tests {
                 format!("## Section {n}\n\nSome prose that wraps a few times at a normal terminal width, enough to make the markdown pass work.\n\n```rust\nfn demo_{n}() {{\n    let value = compute({n});\n}}\n```\n\n")
             })
             .collect();
+        let thinking: String = (1..=80)
+            .map(|n| format!("Step {n}: consider the approach for this subtask, weigh the trade-offs, and check the edge cases before committing to it. "))
+            .collect();
+        let write_content: String = (1..=20000)
+            .map(|n| format!("line {n} of a generated fixture that the model once wrote in one call\n"))
+            .collect();
+        let bash_output: String = (1..=2000)
+            .map(|n| format!("row {n}: some process output line that a build or a grep once printed\n"))
+            .collect();
         {
             let view = app.view_mut();
             for i in 0..30 {
                 view.history
                     .push(HistoryCell::User(format!("question {i}: look into module {i} and summarize what the tests cover")));
-                view.history.push(HistoryCell::ToolCall {
-                    name: "read".to_string(),
-                    arguments: format!(r#"{{"path": "src/module_{i}.rs"}}"#),
-                    result: result.clone(),
-                    error: None,
-                    duration_ms: Some(1_000),
+                view.history.push(HistoryCell::Thinking {
+                    text: thinking.clone(),
+                    duration_ms: Some(4_200),
                 });
+                match i % 3 {
+                    0 => view.history.push(HistoryCell::ToolCall {
+                        name: "read".to_string(),
+                        arguments: format!(r#"{{"path": "src/module_{i}.rs"}}"#),
+                        result: result.clone(),
+                        error: None,
+                        duration_ms: Some(1_000),
+                    }),
+                    // A generated fixture the model wrote in one call: the
+                    // arguments alone carry 20k lines.
+                    1 => view.history.push(HistoryCell::ToolCall {
+                        name: "write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": format!("tests/fixture_{i}.txt"),
+                            "content": write_content,
+                        })
+                        .to_string(),
+                        result: format!("created tests/fixture_{i}.txt (900000 bytes)"),
+                        error: None,
+                        duration_ms: Some(1_000),
+                    }),
+                    _ => view.history.push(HistoryCell::ToolCall {
+                        name: "bash".to_string(),
+                        arguments: r#"{"command": "make test"}"#.to_string(),
+                        result: bash_output.clone(),
+                        error: None,
+                        duration_ms: Some(1_000),
+                    }),
+                }
                 view.history.push(HistoryCell::Assistant(markdown.clone()));
             }
         }
@@ -5023,6 +5058,12 @@ mod tests {
         let t = std::time::Instant::now();
         let _ = render_lines(&mut app, 110, 40);
         println!("fold-back rebuild: {:?}", t.elapsed());
+
+        // Ctrl+T with thinking expanded: the other fold toggle.
+        app.show_thinking = true;
+        let t = std::time::Instant::now();
+        let _ = render_lines(&mut app, 110, 40);
+        println!("ctrl+t rebuild: {:?}", t.elapsed());
     }
 
     #[tokio::test]
