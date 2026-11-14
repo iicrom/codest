@@ -115,10 +115,35 @@ pub enum HistoryCell {
     Report(ReportBlock),
 }
 
+thread_local! {
+    /// How many times [`HistoryCell::lines`] has run since the last reset.
+    /// The per-cell render cache makes a settled frame cost zero rebuilds;
+    /// the render tests assert on this so a cache regression — a new key
+    /// input, a new call path — fails loudly instead of silently re-rendering
+    /// the whole transcript every frame. Always-on, like cordis's
+    /// `render-stats` counters: one integer increment per render.
+    static RENDER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Total [`HistoryCell::lines`] invocations since process start (test
+/// observability).
+pub fn render_calls() -> usize {
+    RENDER_CALLS.get()
+}
+
+/// Zero the render counter (test observability).
+pub fn reset_render_calls() {
+    RENDER_CALLS.set(0);
+}
+
 impl HistoryCell {
     /// Render this cell into owned lines for a transcript of `width` columns.
-    /// `display` carries the per-frame fold flags for the card cells.
-    pub fn lines(&self, width: usize, display: &CardDisplay) -> Vec<Line<'static>> {
+    /// `display` carries the per-frame fold flags for the card cells, and
+    /// `highlight` gates syntax tokenization — off-screen cells build without
+    /// it (identical layout, plain spans) and are re-rendered highlighted
+    /// once the viewport reaches them.
+    pub fn lines(&self, width: usize, display: &CardDisplay, highlight: bool) -> Vec<Line<'static>> {
+        RENDER_CALLS.with(|count| count.set(count.get() + 1));
         match self {
             HistoryCell::User(text) => {
                 prefixed("› ", theme::USER, true, text, Style::default(), width)
@@ -163,6 +188,7 @@ impl HistoryCell {
                 *duration_ms,
                 display.tool_detail,
                 width,
+                highlight,
             ),
             HistoryCell::Report(block) => report_lines(block, width),
         }
@@ -180,6 +206,7 @@ impl HistoryCell {
 /// Any other tool shows the head of its output text, capped at
 /// [`TOOL_BODY_MAX_LINES`]. Either way a folded card ends in a dim
 /// `… +N lines` hint, and a failure rides in the body in the error color.
+#[allow(clippy::too_many_arguments)]
 fn tool_card_lines(
     name: &str,
     arguments: &str,
@@ -188,6 +215,7 @@ fn tool_card_lines(
     duration_ms: Option<u64>,
     expanded: bool,
     width: usize,
+    highlight: bool,
 ) -> Vec<Line<'static>> {
     let width = width.max(4);
     let category = tool_category_color(name);
@@ -201,11 +229,17 @@ fn tool_card_lines(
     let text_style = Style::default().fg(theme::DIM);
     let glyph = if error.is_some() { "✗" } else { "●" };
     // A structured body gets a deeper budget: a diff row says far more per line
-    // than a row of command output, so cordis caps diff cards at eight.
+    // than a row of command output, so cordis caps diff cards at eight. An
+    // expanded card trades the unbounded budget for head+tail rows around an
+    // omitted marker — unfolding every card must not materialize a whole
+    // 2,000-line `read` window per rebuild.
     let budget = if expanded {
-        usize::MAX
+        tool_body::Budget::HeadTail {
+            head: tool_body::EXPANDED_HEAD_ROWS,
+            tail: tool_body::EXPANDED_TAIL_ROWS,
+        }
     } else {
-        DIFF_BODY_MAX_LINES
+        tool_body::Budget::Head(DIFF_BODY_MAX_LINES)
     };
 
     // The duration chip rides at the end of the header; the argument summary
@@ -214,9 +248,13 @@ fn tool_card_lines(
     let chip = duration_ms.map(format_duration).map(|d| format!(" · {d}"));
     let chip_width = chip.as_ref().map(|c| display_width(c)).unwrap_or(0);
     let spent = display_width(glyph) + 1 + display_width(name) + 2 + chip_width;
+    // One parse serves the header summary and the structured body both: a
+    // `write` card's arguments carry the whole file content, and parsing it
+    // twice per rebuild doubled the cost of the only frame that pays it.
+    let parsed: Option<serde_json::Value> = serde_json::from_str(arguments.trim()).ok();
     let args = {
         let budget = width.saturating_sub(spent).max(1);
-        tool_summary(arguments, budget)
+        tool_summary_parsed(parsed.as_ref(), arguments, budget)
     };
     let has_summary = !args.summary.is_empty();
     let mut header = vec![
@@ -234,9 +272,17 @@ fn tool_card_lines(
     let mut lines = vec![Line::from(header)];
 
     // An expanded card keeps the full arguments above the output when the
-    // header had to fold them (a multi-line bash command, typically).
+    // header had to fold them (a multi-line bash command, typically), under
+    // the same head+tail budget as the body.
     if expanded && args.folded && has_summary {
-        lines.extend(gutter_lines(&args.full, width, text_style, &gutter));
+        lines.extend(head_tail_gutter_lines(
+            &args.full,
+            width,
+            tool_body::EXPANDED_HEAD_ROWS,
+            tool_body::EXPANDED_TAIL_ROWS,
+            text_style,
+            &gutter,
+        ));
     }
 
     if let Some(message) = error {
@@ -246,23 +292,28 @@ fn tool_card_lines(
             Style::default().fg(theme::ERROR),
             &gutter,
         ));
-    } else if let Some(body) = tool_body::build(name, arguments, result, budget) {
+    } else if let Some(body) =
+        tool_body::build_parsed(name, parsed.as_ref(), result, budget, highlight)
+    {
         lines.extend(body_lines(&body, width, text_style, &gutter));
     } else if !result.trim().is_empty() {
-        let (mut body, hidden) = capped_gutter_lines(
-            result,
-            width,
-            if expanded {
-                usize::MAX
-            } else {
-                TOOL_BODY_MAX_LINES
-            },
-            text_style,
-            &gutter,
-        );
-        if let Some(hint) = fold_hint(hidden, text_style) {
-            body.push(hint);
-        }
+        let body = if expanded {
+            head_tail_gutter_lines(
+                result,
+                width,
+                tool_body::EXPANDED_HEAD_ROWS,
+                tool_body::EXPANDED_TAIL_ROWS,
+                text_style,
+                &gutter,
+            )
+        } else {
+            let (mut body, hidden) =
+                capped_gutter_lines(result, width, TOOL_BODY_MAX_LINES, text_style, &gutter);
+            if let Some(hint) = fold_hint(hidden, text_style) {
+                body.push(hint);
+            }
+            body
+        };
         lines.extend(body);
     } else {
         lines.push(Line::from(vec![
@@ -358,6 +409,7 @@ fn with_gutter(spans: Vec<Span<'static>>, first: bool, gutter: &Gutter) -> Line<
 pub fn running_tool_lines(
     name: &str,
     arguments: &str,
+    parsed: Option<&serde_json::Value>,
     elapsed: &str,
     spinner_frame: &str,
     width: usize,
@@ -369,7 +421,7 @@ pub fn running_tool_lines(
 
     let spent = display_width(spinner_frame) + 1 + display_width(name) + 2;
     let budget = width.saturating_sub(spent).max(1);
-    let summary = tool_summary(arguments, budget).summary;
+    let summary = tool_summary_parsed(parsed, arguments, budget).summary;
 
     let mut header = vec![
         Span::styled(spinner_frame.to_string(), Style::default().fg(category)),
@@ -402,8 +454,13 @@ struct ToolArgs {
 
 /// Build the header summary. Multi-line values fold to their first row and
 /// over-long ones clip at `max` display columns; `folded` is true when
-/// either happened.
-fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
+/// either happened. `parsed` is the shared parse of `arguments` — a huge
+/// `write` payload must not be re-parsed for the summary and the body both.
+fn tool_summary_parsed(
+    parsed: Option<&serde_json::Value>,
+    arguments: &str,
+    max: usize,
+) -> ToolArgs {
     let trimmed = arguments.trim();
     if trimmed.is_empty() || trimmed == "{}" {
         return ToolArgs {
@@ -412,8 +469,7 @@ fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
             folded: false,
         };
     }
-    let parsed: Option<serde_json::Value> = serde_json::from_str(trimmed).ok();
-    let field = match &parsed {
+    let field = match parsed {
         Some(serde_json::Value::Object(map)) => {
             let key = if map.contains_key("command") {
                 "command"
@@ -443,6 +499,14 @@ fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
         full,
         folded,
     }
+}
+
+/// [`tool_summary_parsed`] over arguments that have not been parsed yet.
+/// Tests only — production callers share the card's one parse.
+#[cfg(test)]
+fn tool_summary(arguments: &str, max: usize) -> ToolArgs {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(arguments.trim()).ok();
+    tool_summary_parsed(parsed.as_ref(), arguments, max)
 }
 
 /// A card's category color: the status glyph and tool name carry what the
@@ -503,11 +567,25 @@ impl Gutter {
 
 /// Wrap `text` under `gutter`, styling the body with `style`.
 fn gutter_lines(text: &str, width: usize, style: Style, gutter: &Gutter) -> Vec<Line<'static>> {
+    gutter_lines_from(normalize(text).split('\n'), width, style, gutter, true)
+}
+
+/// [`gutter_lines`] over an explicit logical-line iterator. `first_spine`
+/// decides whether the very first row may carry the card's opening bracket —
+/// `false` for a tail fragment, which hangs under the bracket the head
+/// already drew.
+fn gutter_lines_from<'a>(
+    logical: impl Iterator<Item = &'a str>,
+    width: usize,
+    style: Style,
+    gutter: &Gutter,
+    first_spine: bool,
+) -> Vec<Line<'static>> {
     let available = width.saturating_sub(display_width(gutter.first)).max(1);
     let mut lines = Vec::new();
-    for (logical_index, logical) in normalize(text).split('\n').enumerate() {
+    for (logical_index, logical) in logical.enumerate() {
         for (row_index, row) in wrap_str(logical, available).into_iter().enumerate() {
-            let spine = if logical_index == 0 && row_index == 0 {
+            let spine = if first_spine && logical_index == 0 && row_index == 0 {
                 gutter.first
             } else {
                 gutter.rest
@@ -529,6 +607,10 @@ fn gutter_lines(text: &str, width: usize, style: Style, gutter: &Gutter) -> Vec<
 
 /// [`gutter_lines`] limited to `max` logical lines (trailing blanks are not
 /// counted); returns the lines and how many logical lines were hidden.
+///
+/// The count runs first, without materializing anything: a folded card of a
+/// huge result used to allocate every logical line just to know how many of
+/// them it had hidden.
 fn capped_gutter_lines(
     text: &str,
     width: usize,
@@ -536,18 +618,76 @@ fn capped_gutter_lines(
     style: Style,
     gutter: &Gutter,
 ) -> (Vec<Line<'static>>, usize) {
-    let mut logical: Vec<String> = normalize(text).split('\n').map(str::to_owned).collect();
-    while logical.last().is_some_and(|line| line.trim().is_empty()) {
-        logical.pop();
+    let normalized = normalize(text);
+    let total = count_kept_lines(&normalized);
+    if max >= total {
+        return (
+            gutter_lines_from(normalized.split('\n').take(total), width, style, gutter, true),
+            0,
+        );
     }
-    if max >= logical.len() {
-        return (gutter_lines(&logical.join("\n"), width, style, gutter), 0);
-    }
-    let hidden = logical.len() - max;
     (
-        gutter_lines(&logical[..max].join("\n"), width, style, gutter),
-        hidden,
+        gutter_lines_from(
+            normalized.split('\n').take(max),
+            width,
+            style,
+            gutter,
+            true,
+        ),
+        total - max,
     )
+}
+
+/// [`gutter_lines`] under a head+tail budget: the first `head` and last
+/// `tail` logical lines (trailing blanks don't count) around a dim
+/// `… +N lines omitted` marker. The marker is part of the lines, so nothing
+/// is left to hint about once they are shown.
+fn head_tail_gutter_lines(
+    text: &str,
+    width: usize,
+    head: usize,
+    tail: usize,
+    style: Style,
+    gutter: &Gutter,
+) -> Vec<Line<'static>> {
+    let normalized = normalize(text);
+    let total = count_kept_lines(&normalized);
+    if total <= head + tail {
+        return gutter_lines_from(normalized.split('\n').take(total), width, style, gutter, true);
+    }
+    let hidden = total - head - tail;
+    let mut lines = gutter_lines_from(normalized.split('\n').take(head), width, style, gutter, true);
+    lines.push(Line::from(vec![
+        Span::styled(gutter.rest.to_string(), gutter.style),
+        Span::styled(
+            format!(" … +{hidden} lines omitted"),
+            Style::default().fg(theme::DIM),
+        ),
+    ]));
+    lines.extend(gutter_lines_from(
+        normalized.split('\n').skip(total - tail).take(tail),
+        width,
+        style,
+        gutter,
+        false,
+    ));
+    lines
+}
+
+/// How many logical lines [`gutter_lines`] would wrap for `normalized`,
+/// trailing blank lines excluded — one scan, no per-line allocation.
+fn count_kept_lines(normalized: &str) -> usize {
+    let mut total = 0usize;
+    let mut trailing_blanks = 0usize;
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            trailing_blanks += 1;
+        } else {
+            trailing_blanks = 0;
+        }
+        total += 1;
+    }
+    total - trailing_blanks
 }
 
 /// Render a plugin report the way reference TUIs style their loaded-context
@@ -908,7 +1048,7 @@ mod tests {
 
     #[test]
     fn user_cell_has_prompt_and_indent() {
-        let lines = HistoryCell::User("hello world".to_string()).lines(10, &expanded_all());
+        let lines = HistoryCell::User("hello world".to_string()).lines(10, &expanded_all(), true);
         assert_eq!(plain(&lines), vec!["› hello", "  world"]);
     }
 
@@ -946,7 +1086,7 @@ mod tests {
 
     #[test]
     fn notice_is_dim_and_indented() {
-        let lines = HistoryCell::Notice("note".to_string()).lines(20, &expanded_all());
+        let lines = HistoryCell::Notice("note".to_string()).lines(20, &expanded_all(), true);
         assert_eq!(plain(&lines), vec!["  note"]);
     }
 
@@ -957,13 +1097,13 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(20, &expanded_all())),
+            plain(&cell.lines(20, &expanded_all(), true)),
             vec!["⚓ thinking", "  │ reasoning hard"]
         );
 
         // The rail is the thinking card's own color, so the body reads as part
         // of the card; the text itself stays dim italic.
-        let rendered = cell.lines(20, &expanded_all());
+        let rendered = cell.lines(20, &expanded_all(), true);
         assert_eq!(rendered[0].spans[0].style.fg, Some(theme::THINKING));
         assert_eq!(
             rendered[1].spans[0].style.fg,
@@ -992,7 +1132,7 @@ mod tests {
         // Folded: the header naming the expand key, then the newest reasoning
         // row as a preview, so a folded card still says what it was about.
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec![
                 "⚓ thinking · 4.2s (ctrl+t to expand)",
                 "  │ reasoning hard"
@@ -1000,7 +1140,7 @@ mod tests {
         );
 
         // Even folded the header is the thinking color, not the notice gray.
-        let rendered = cell.lines(60, &folded_all());
+        let rendered = cell.lines(60, &folded_all(), true);
         assert_eq!(rendered[0].spans[2].style.fg, Some(theme::THINKING));
         assert_eq!(
             rendered[0].spans[4].style.fg,
@@ -1026,7 +1166,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec!["⚓ thinking (ctrl+t to expand)", "  │ second thought"]
         );
 
@@ -1036,7 +1176,7 @@ mod tests {
             text: "aaaa bbbb cccc dddd eeee".to_string(),
             duration_ms: None,
         };
-        let rendered = plain(&cell.lines(20, &folded_all()));
+        let rendered = plain(&cell.lines(20, &folded_all(), true));
         assert_eq!(rendered[0], "⚓ thinking (ctrl+t to expand)");
         assert_eq!(rendered[1], "  │ …cccc dddd eeee");
         assert!(display_width(&rendered[1]) <= 20, "{rendered:?}");
@@ -1048,7 +1188,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec!["⚓ thinking (ctrl+t to expand)"]
         );
     }
@@ -1086,7 +1226,7 @@ mod tests {
         };
         // Folded: header, the three-line head preview, then the hint.
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec![
                 "● bash(ls -la) · 4.2s",
                 " ⎿  a",
@@ -1097,7 +1237,7 @@ mod tests {
         );
         // Expanded: the whole output, no hint.
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● bash(ls -la) · 4.2s",
                 " ⎿  a",
@@ -1122,7 +1262,7 @@ mod tests {
         // column — the result string ("created … (14 bytes)") is gone, since
         // the body itself is the more useful statement.
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● write(src/a.py) · 120ms",
                 " ⎿    (+3 -0) created",
@@ -1142,7 +1282,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let rendered = cell.lines(60, &expanded_all());
+        let rendered = cell.lines(60, &expanded_all(), true);
         assert_eq!(
             plain(&rendered),
             vec![
@@ -1176,14 +1316,14 @@ mod tests {
         };
         // Folded: the stat row plus eight content rows, then the hint. Rows are
         // laid out first and folded second, so the hint is never content.
-        let folded = plain(&cell.lines(80, &folded_all()));
+        let folded = plain(&cell.lines(80, &folded_all(), true));
         assert_eq!(folded.len(), 1 + DIFF_BODY_MAX_LINES + 1);
         assert_eq!(folded[1], " ⎿    (+12 -0) created");
         assert_eq!(folded[8], "    + line 7");
         assert_eq!(folded[9], " … +5 lines (ctrl+o to expand)");
 
         // Expanded: every row, no hint.
-        let expanded = plain(&cell.lines(80, &expanded_all()));
+        let expanded = plain(&cell.lines(80, &expanded_all(), true));
         assert_eq!(expanded.len(), 1 + 13);
         assert_eq!(expanded.last().unwrap(), "    + line 12");
     }
@@ -1200,7 +1340,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● read(a.rs)",
                 " ⎿  1 fn main() {",
@@ -1222,7 +1362,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let rendered = plain(&cell.lines(20, &expanded_all()));
+        let rendered = plain(&cell.lines(20, &expanded_all(), true));
         // The code row wraps at the column budget and keeps every character,
         // including the space it broke at.
         let joined: String = rendered[2..]
@@ -1248,11 +1388,11 @@ mod tests {
         // The failure rides in the card body, outside any cap, in the error
         // style; no preview follows a failed call.
         assert_eq!(
-            plain(&cell.lines(40, &expanded_all())),
+            plain(&cell.lines(40, &expanded_all(), true)),
             vec![r#"✗ echo({ "x": 1 })"#, " ⎿  unknown tool"]
         );
         assert_eq!(
-            cell.lines(40, &expanded_all())[1].spans[1].style.fg,
+            cell.lines(40, &expanded_all(), true)[1].spans[1].style.fg,
             Some(theme::ERROR)
         );
 
@@ -1264,7 +1404,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(40, &expanded_all())),
+            plain(&cell.lines(40, &expanded_all(), true)),
             vec!["● ping", " ⎿  pong"]
         );
     }
@@ -1279,13 +1419,13 @@ mod tests {
             duration_ms: Some(120),
         };
         // The header carries the command's first row only.
-        let folded = cell.lines(60, &folded_all());
+        let folded = cell.lines(60, &folded_all(), true);
         assert_eq!(plain(&folded)[0], "● bash(echo one) · 120ms");
         assert_eq!(folded.len(), 3, "header + two output rows, no args block");
 
         // Expanded, the full command rides above the output under the spine.
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● bash(echo one) · 120ms",
                 " ⎿  echo one",
@@ -1305,7 +1445,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let lines = cell.lines(40, &expanded_all());
+        let lines = cell.lines(40, &expanded_all(), true);
         let glyph = &lines[0].spans[0];
         assert_eq!(glyph.content.as_ref(), "●");
         assert_eq!(glyph.style.fg, Some(theme::TOOL_MUTATE));
@@ -1318,7 +1458,7 @@ mod tests {
             error: Some("boom".to_string()),
             duration_ms: None,
         };
-        let lines = cell.lines(40, &expanded_all());
+        let lines = cell.lines(40, &expanded_all(), true);
         assert_eq!(lines[0].spans[0].content.as_ref(), "✗");
         assert_eq!(lines[0].spans[0].style.fg, Some(theme::ERROR));
     }
@@ -1332,7 +1472,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let lines = cell.lines(40, &expanded_all());
+        let lines = cell.lines(40, &expanded_all(), true);
         // The `⎿` spine takes the read category color, the body stays dim.
         assert_eq!(lines[1].spans[0].content.as_ref(), BRACKET_FIRST);
         assert_eq!(lines[1].spans[0].style.fg, Some(theme::TOOL_READ));
@@ -1341,7 +1481,14 @@ mod tests {
 
     #[test]
     fn running_tool_card_spins_with_an_elapsed_row() {
-        let lines = running_tool_lines("bash", r#"{"command": "cargo build"}"#, "12s", "⠸", 60);
+        let lines = running_tool_lines(
+            "bash",
+            r#"{"command": "cargo build"}"#,
+            Some(&serde_json::json!({"command": "cargo build"})),
+            "12s",
+            "⠸",
+            60,
+        );
         assert_eq!(
             plain(&lines),
             vec!["⠸ bash(cargo build)", " ⎿  Running… (12s)"]
@@ -1398,7 +1545,7 @@ mod tests {
                 ],
             }],
         });
-        let rendered = cell.lines(60, &expanded_all());
+        let rendered = cell.lines(60, &expanded_all(), true);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| {
@@ -1447,7 +1594,7 @@ mod tests {
                 )],
             }],
         });
-        let rendered = cell.lines(40, &expanded_all());
+        let rendered = cell.lines(40, &expanded_all(), true);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| {

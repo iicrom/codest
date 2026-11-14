@@ -32,7 +32,14 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 cst-plugin-api = { path = "crates/cst-plugin-api", version = "0.1.0" }
 futures-util = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false }
-ratatui = "0.30"
+# Only the crossterm backend is used (plus TestBackend in tests), so the
+# default set is dropped: `all-widgets` (calendar → `time` crate) and the
+# unused backend crates stay out of the build.
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+] }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "stream",
@@ -40,12 +47,16 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Syntax highlighting for fenced code: `regex-fancy` is the pure-Rust engine,
-# so no oniguruma C toolchain is needed. `two-face` carries bat's syntax dump,
-# which covers languages syntect's own set lacks (TypeScript, TOML, Dockerfile).
+# Syntax highlighting for fenced code. `regex-onig` (oniguruma) is 10-50x
+# faster than the pure-Rust `regex-fancy` engine on the complex grammars —
+# TypeScript and Markdown tokenize at ~1 MB/s on fancy, which stalled Ctrl+O
+# on sessions with big read/write cards; it does need a C toolchain at build
+# time (vendored by onig-sys, fine with MSVC). `two-face` carries bat's
+# syntax dump, which covers languages syntect's own set lacks (TypeScript,
+# TOML, Dockerfile).
 syntect = { version = "5", default-features = false, features = [
     "parsing",
-    "regex-fancy",
+    "regex-onig",
     "dump-load",
 ] }
 thiserror = "2"
@@ -53,7 +64,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 tokio-util = "0.7"
 toml = "0.9"
 two-face = { version = "0.5", default-features = false, features = [
-    "syntect-fancy",
+    "syntect-onig",
 ] }
 unicode-width = "0.2"
 # Session ids. v7 is time-ordered, so rollout file names sort by creation.
@@ -66,3 +77,19 @@ libc = "0.2"
 [profile.dev]
 opt-level = 0
 debug = "line-tables-only"
+
+# Interactive TUI time lives in the dependencies — syntect highlighting,
+# markdown parsing, unicode width tables — so an unoptimized dev build made
+# every frame and every Ctrl+O expansion several times slower than release.
+# Dependencies compile once and stay cached; the crate itself stays at 0 for
+# fast iteration.
+[profile.dev.package."*"]
+opt-level = 2
+
+# No `panic = "abort"`: the plugin task runner unwinds caught panics
+# (catch_unwind in src/tui/app.rs), which abort would turn into process death.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
