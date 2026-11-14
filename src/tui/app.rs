@@ -6888,9 +6888,9 @@ mod tests {
                 .any(|line| line.contains("● bash(cargo build) · 4.2s")),
             "{lines:?}"
         );
-        assert!(lines.iter().any(|line| line.contains("⎿  a")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("┌  a")), "{lines:?}");
         assert!(
-            !lines.iter().any(|line| line.trim_end() == "    e"),
+            !lines.iter().any(|line| line.trim_end() == " └  e"),
             "{lines:?}"
         );
         assert!(
@@ -6904,7 +6904,7 @@ mod tests {
         app.show_tool_detail = true;
         let lines = render_lines(&mut app, 80, 20);
         assert!(
-            lines.iter().any(|line| line.trim_end() == "    e"),
+            lines.iter().any(|line| line.trim_end() == " └  e"),
             "{lines:?}"
         );
         assert!(

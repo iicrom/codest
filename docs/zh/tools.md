@@ -91,14 +91,14 @@ Windows 上值得知道的差异：
 
 ```text
 ● bash(cargo build) · 4.2s   # Windows 宿主上是 `pwsh(...)`
- ⎿  Compiling codest v0.1.0
-    Finished `dev` profile [unoptimized + debuginfo] target(s)
-    [exit code: 0]
- … +12 lines (ctrl+o to expand)
+ ┌  Compiling codest v0.1.0
+ │  Finished `dev` profile [unoptimized + debuginfo] target(s)
+ │  [exit code: 0]
+ └  … +12 lines (ctrl+o to expand)
 ```
 
 - 标题是 `● <工具>(<第一个参数>) · <耗时>`，工具名使用其分类颜色。恢复的卡片没有耗时块——rollout 记录消息，不记录计时。
-- `⎿` 正文挂在悬挂轨道上，显示结果的前 **3 行**。
+- 正文显示结果的前 **3 行**，外面套一个用同一套制表符画的框：`┌` 起头，中间每一行（含折叠提示）挂在 `│` 上，`└` 收尾。三者等宽，因此正文列始终对齐，再长的正文也连成一块，而不是散落在一个孤立折角下面的自由文本。
 - 其余折叠为 `… +N lines (ctrl+o to expand)`；`Ctrl+O` 展开或折叠全部工具输出（见 [commands.md](commands.md)）。折叠与展开是逐帧的视图决定，单元格本身保持无状态。
 - 调用执行期间，transcript 尾部有一张带 spinner 标题与耗时行的实时卡片；工具顺序执行，因此同一时刻最多一张。
 
@@ -108,22 +108,22 @@ Windows 上值得知道的差异：
 
 ```text
 ● edit(src/tui/chat.rs) · 1.2s
- ⎿    (+2 -1) replaced 1 occurrence
-    - fn body(…) { dim }
-    + fn body(…) { highlighted }
-    +     …
+ ┌    (+2 -1) replaced 1 occurrence
+ │  - fn body(…) { dim }
+ │  + fn body(…) { highlighted }
+ └  +     …
 
 ● read(src/tui/theme.rs) · 6ms
- ⎿  24 pub const TOOL_EXEC: Color = Color::Cyan;
-    25 /// Read-only file tools (`read`).
-       [2 lines total, showing 24-25]
+ ┌  24 pub const TOOL_EXEC: Color = Color::Cyan;
+ │  25 /// Read-only file tools (`read`).
+ └    [2 lines total, showing 24-25]
 ```
 
 - **`write` 与 `edit`** 渲染 diff 节选：`-` 行是这次替换掉的文本，`+` 行是写入的文本，上方是一条暗色的 `(+N -M)` 统计行，同时保留工具的一句话结论（`created`、`overwrote`、`replaced 2 occurrences`），去掉标题里已经显示的路径。`write` 没有 `-` 侧——它不知道旧内容，编造一侧只会歪曲这次改动。
 - **`read`** 把带编号的窗口渲染到右对齐的暗色行号列下，`[N lines total, showing …]` 说明行缩进到代码列下方。
 - 两者都按文件扩展名 **语法高亮**，`-`/`+` 色调落在标记和语法调色板未着色的部分上：新增行一眼就是绿色，而关键字与字符串仍保留自己的颜色。
 - 结构化正文折叠到 **8 行**（diff 一行的信息量远高于一行命令输出，后者仍保持 3 行预算），`Ctrl+O` 与其他输出一样展开。行数在构建正文时就已计数并截断，因此一次巨大的 `write` 不会生成卡片根本显示不了的行。
-- 正文是代码，因此按列宽硬折行而不是在空格处重排：折出的行能原样拼回它来自的那一行。代码在 [`src/tui/tool_body.rs`](../../src/tui/tool_body.rs)，`chat.rs` 负责卡片脊线与折叠提示。
+- 正文是代码，因此按列宽硬折行而不是在空格处重排：折出的行能原样拼回它来自的那一行。代码在 [`src/tui/tool_body.rs`](../../src/tui/tool_body.rs)，`chat.rs` 负责卡片外框与折叠提示。
 
 ## 离线验证整条链路
 

@@ -8,24 +8,28 @@
 //! Thinking and tool calls render as foldable cards, styled the way
 //! cordis-harness-tui styles its transcript so they cannot be mistaken for
 //! ordinary output. Each card is a header in its own color plus a body that
-//! hangs from a spine:
+//! hangs from a spine — a rail for thinking, a boxed frame for a tool call:
 //!
 //! ```text
 //! ⚓ thinking · 4.2s (ctrl+t to expand)
 //!   │ …the newest reasoning row…
 //!
 //! ● bash(cargo build) · 4.2s
-//!  ⎿  Compiling codest
-//!     … +3 lines (ctrl+o to expand)
+//!  ┌  Compiling codest
+//!  │  Finished dev profile
+//!  └  … +3 lines (ctrl+o to expand)
 //! ```
 //!
 //! The tool header is `● name(args) · duration` with the name in the tool's
-//! category color and the `⎿` spine tinted to match; the thinking header is
-//! `⚓ thinking · duration` in the thinking color over a `│` rail. Folded, a
-//! tool card is that one header line plus a dim hint naming its expand key
-//! (`ctrl+o`), and a thinking card keeps the header plus one row of context —
-//! its newest reasoning row, clipped from the start so the tokens that arrived
-//! last stay readable. The two fold independently (`ctrl+t` for thinking).
+//! category color and the body frame tinted to match; the thinking header is
+//! `⚓ thinking · duration` in the thinking color over a `│` rail. A tool body
+//! is a box drawn in one box-drawing set — `┌`, `│`, `└` — so its corners and
+//! its rail line up on one column and a card of any depth reads as one block
+//! (a thinking card has no corners: the reasoning runs on for as long as it
+//! runs). Folded, a tool card is that one header line plus a dim hint naming
+//! its expand key (`ctrl+o`), and a thinking card keeps the header plus one row
+//! of context — its newest reasoning row, clipped from the start so the tokens
+//! that arrived last stay readable. The two fold independently (`ctrl+t`).
 //! Which cards show their body is decided per frame by [`CardDisplay`],
 //! resolved from the global toggles — cells themselves stay stateless.
 //!
@@ -63,10 +67,26 @@ const TOOL_BODY_MAX_LINES: usize = 3;
 /// cards at eight. `write` and `edit` render through this.
 const DIFF_BODY_MAX_LINES: usize = 8;
 
-/// Body spine of a tool card: the `⎿` bracket on the first row, blank indent
-/// under it afterwards (both four columns wide, so rows align).
-const BRACKET_FIRST: &str = " ⎿  ";
-const BRACKET_REST: &str = "    ";
+/// Frame of a tool card's body: the corners and rail of one box-drawing set,
+/// four columns wide on every row so the body text never shifts between them.
+///
+/// ```text
+/// ● bash(cargo build) · 4.2s
+///  ┌  Compiling codest
+///  │  Finished dev profile
+///  └  … +3 lines (ctrl+o to expand)
+/// ```
+///
+/// The opening corner is `┌`, not the `⎿` elbow earlier versions opened with:
+/// `⎿` *is* a bottom corner (`DENTISTRY SYMBOL LIGHT VERTICAL AND BOTTOM
+/// RIGHT`), so a body that started with one and then hung off a blank indent
+/// put the elbow on the wrong end of the rail, in a different character set
+/// from the rail itself. `┌` … `│` … `└` are one set, all three the same
+/// display width, so the corners and the rail line up to the cell — and the
+/// closing corner tells a reader where the body stops without counting rows.
+const BRACKET_FIRST: &str = " ┌  ";
+const BRACKET_REST: &str = " │  ";
+const BRACKET_LAST: &str = " └  ";
 /// Body spine of a thinking card: a continuous vertical rail on every row,
 /// so an expanded block reads as one hanging unit.
 const RAIL: &str = "  │ ";
@@ -197,8 +217,8 @@ impl HistoryCell {
 
 /// Render one executed tool call as a card: the status glyph, the bold
 /// category-colored tool name with its argument summary in parentheses, and
-/// the duration chip on the header row; the output then hangs under a `⎿`
-/// spine tinted like the header.
+/// the duration chip on the header row; the output then hangs in a box tinted
+/// like the header, closed with `┌` / `│` / `└`.
 ///
 /// The body is one of three things. A file tool (`write`, `edit`, `read`)
 /// renders a structured body — a highlighted `-`/`+` diff excerpt, or the
@@ -269,13 +289,16 @@ fn tool_card_lines(
         // The chip carries its own ` · ` separator.
         header.push(Span::styled(chip, text_style));
     }
-    let mut lines = vec![Line::from(header)];
+    // The body is assembled whole and framed last, so a card built from
+    // several fragments (folded arguments, then output) still gets one box
+    // around all of it rather than one per fragment.
+    let mut body: Vec<Line<'static>> = Vec::new();
 
     // An expanded card keeps the full arguments above the output when the
     // header had to fold them (a multi-line bash command, typically), under
     // the same head+tail budget as the body.
     if expanded && args.folded && has_summary {
-        lines.extend(head_tail_gutter_lines(
+        body.extend(head_tail_gutter_lines(
             &args.full,
             width,
             tool_body::EXPANDED_HEAD_ROWS,
@@ -286,55 +309,62 @@ fn tool_card_lines(
     }
 
     if let Some(message) = error {
-        lines.extend(gutter_lines(
+        body.extend(gutter_lines(
             message,
             width,
             Style::default().fg(theme::ERROR),
             &gutter,
         ));
-    } else if let Some(body) =
+    } else if let Some(structured) =
         tool_body::build_parsed(name, parsed.as_ref(), result, budget, highlight)
     {
-        lines.extend(body_lines(&body, width, text_style, &gutter));
+        body.extend(body_lines(&structured, width, text_style, &gutter));
     } else if !result.trim().is_empty() {
-        let body = if expanded {
-            head_tail_gutter_lines(
+        if expanded {
+            body.extend(head_tail_gutter_lines(
                 result,
                 width,
                 tool_body::EXPANDED_HEAD_ROWS,
                 tool_body::EXPANDED_TAIL_ROWS,
                 text_style,
                 &gutter,
-            )
+            ));
         } else {
-            let (mut body, hidden) =
+            let (mut preview, hidden) =
                 capped_gutter_lines(result, width, TOOL_BODY_MAX_LINES, text_style, &gutter);
-            if let Some(hint) = fold_hint(hidden, text_style) {
-                body.push(hint);
+            if let Some(hint) = fold_hint(hidden, text_style, &gutter) {
+                preview.push(hint);
             }
-            body
-        };
-        lines.extend(body);
+            body.extend(preview);
+        }
     } else {
-        lines.push(Line::from(vec![
-            Span::styled(gutter.first.to_string(), gutter.style),
-            Span::styled("(no output)".to_string(), text_style),
-        ]));
+        body.push(on_rail(
+            vec![Span::styled("(no output)".to_string(), text_style)],
+            &gutter,
+        ));
     }
+
+    frame(&gutter, &mut body);
+    let mut lines = vec![Line::from(header)];
+    lines.extend(body);
     lines
 }
 
 /// Fold hint under a capped body: how many logical lines the card hid, and the
-/// key that restores them.
-fn fold_hint(hidden: usize, style: Style) -> Option<Line<'static>> {
+/// key that restores them. A body row like any other, so it hangs on the
+/// card's rail — and, ending a folded card, it is the row [`frame`] closes.
+fn fold_hint(hidden: usize, style: Style, gutter: &Gutter) -> Option<Line<'static>> {
     if hidden == 0 {
         return None;
     }
     let noun = if hidden == 1 { "line" } else { "lines" };
-    Some(Line::from(Span::styled(
-        format!(" … +{hidden} {noun} (ctrl+o to expand)"),
-        style,
-    )))
+    Some(on_rail(
+        vec![Span::styled(
+            format!("… +{hidden} {noun} (ctrl+o to expand)"),
+            style,
+        )],
+        gutter,
+    ))
 }
 
 /// Lay a structured [`tool_body::Body`] out under the card gutter. The body was
@@ -377,29 +407,48 @@ fn body_lines(
                 spans.push(Span::raw(" ".repeat(lead_width)));
             }
             spans.extend(content);
-            out.push(with_gutter(spans, out.is_empty(), gutter));
+            out.push(on_rail(spans, gutter));
         }
     }
-    if let Some(hint) = fold_hint(body.hidden, text_style) {
+    if let Some(hint) = fold_hint(body.hidden, text_style, gutter) {
         out.push(hint);
-    }
-    if out.is_empty() {
-        out.push(Line::from(Span::styled(
-            gutter.first.to_string(),
-            gutter.style,
-        )));
     }
     out
 }
 
-/// Prefix `spans` with the card's spine — the `⎿` bracket on the very first
-/// row, blank indent under it afterwards.
-fn with_gutter(spans: Vec<Span<'static>>, first: bool, gutter: &Gutter) -> Line<'static> {
-    let spine = if first { gutter.first } else { gutter.rest };
+/// Prefix `spans` with the gutter's rail — the chrome every body row carries
+/// before the body is framed.
+fn on_rail(spans: Vec<Span<'static>>, gutter: &Gutter) -> Line<'static> {
     let mut line = Vec::with_capacity(spans.len() + 1);
-    line.push(Span::styled(spine.to_string(), gutter.style));
+    line.push(Span::styled(gutter.rest.to_string(), gutter.style));
     line.extend(spans);
     Line::from(line)
+}
+
+/// Frame a card body: the first row takes the opening corner, the last row the
+/// closing one, and everything between stays on the rail.
+///
+/// The frame is applied once, to the whole body, because a card can be built
+/// from several fragments (folded arguments, then output) and each fragment
+/// would otherwise draw its own box. A one-row body takes the closing corner by
+/// itself — ` └  pong` — the way a single-child tree draws it: there is no rail
+/// to run down, so an opening corner would dangle over nothing.
+fn frame(gutter: &Gutter, lines: &mut [Line<'static>]) {
+    let Some(last) = lines.len().checked_sub(1) else {
+        return;
+    };
+    for (index, line) in lines.iter_mut().enumerate() {
+        let spine = if index == last {
+            gutter.last
+        } else if index == 0 {
+            gutter.first
+        } else {
+            continue;
+        };
+        if let Some(span) = line.spans.first_mut() {
+            span.content = spine.to_string().into();
+        }
+    }
 }
 
 /// The live stand-in shown while a tool executes: the braille spinner in the
@@ -432,8 +481,9 @@ pub fn running_tool_lines(
         header.push(Span::styled(format!("({summary})"), text_style));
     }
     let mut lines = vec![Line::from(header)];
+    // One row is the whole body for now: it opens and closes at once.
     lines.push(Line::from(vec![
-        Span::styled(BRACKET_FIRST.to_string(), Style::default().fg(category)),
+        Span::styled(BRACKET_LAST.to_string(), Style::default().fg(category)),
         Span::styled(format!("Running… ({elapsed})"), text_style),
     ]));
     lines
@@ -535,72 +585,61 @@ pub fn format_duration(ms: u64) -> String {
     }
 }
 
-/// A card's body spine: the chrome prefixing its first row, the indent that
-/// keeps every later row aligned, and the style the spine carries — tinted
-/// like the card's header, so a card body reads as part of the card rather
-/// than as loose transcript text.
+/// A card's body spine: the chrome opening its first row, the rail that keeps
+/// every row under it aligned, the corner closing its last row, and the style
+/// the spine carries — tinted like the card's header, so a card body reads as
+/// part of the card rather than as loose transcript text. All three are the
+/// same display width, so the body text sits in one column from top to bottom.
 struct Gutter {
     first: &'static str,
     rest: &'static str,
+    last: &'static str,
     style: Style,
 }
 
 impl Gutter {
-    /// The tool card's ` ⎿  ` bracket, in the tool's category color.
+    /// The tool card's ` ┌  ` / ` │  ` / ` └  ` frame, in the tool's category
+    /// color.
     fn bracket(color: Color) -> Self {
         Self {
             first: BRACKET_FIRST,
             rest: BRACKET_REST,
+            last: BRACKET_LAST,
             style: Style::default().fg(color),
         }
     }
 
-    /// The thinking card's `  │ ` rail, in the thinking color.
+    /// The thinking card's `  │ ` rail, in the thinking color. A rail has no
+    /// corners: the card runs on for as long as the reasoning does.
     fn rail() -> Self {
         Self {
             first: RAIL,
             rest: RAIL,
+            last: RAIL,
             style: Style::default().fg(theme::THINKING),
         }
     }
 }
 
-/// Wrap `text` under `gutter`, styling the body with `style`.
+/// Wrap `text` onto the card's rail, styling the body with `style`.
 fn gutter_lines(text: &str, width: usize, style: Style, gutter: &Gutter) -> Vec<Line<'static>> {
-    gutter_lines_from(normalize(text).split('\n'), width, style, gutter, true)
+    gutter_lines_from(normalize(text).split('\n'), width, style, gutter)
 }
 
-/// [`gutter_lines`] over an explicit logical-line iterator. `first_spine`
-/// decides whether the very first row may carry the card's opening bracket —
-/// `false` for a tail fragment, which hangs under the bracket the head
-/// already drew.
+/// [`gutter_lines`] over an explicit logical-line iterator. Rows come back on
+/// the rail; corners are the caller's business (see [`frame`]).
 fn gutter_lines_from<'a>(
     logical: impl Iterator<Item = &'a str>,
     width: usize,
     style: Style,
     gutter: &Gutter,
-    first_spine: bool,
 ) -> Vec<Line<'static>> {
-    let available = width.saturating_sub(display_width(gutter.first)).max(1);
+    let available = width.saturating_sub(display_width(gutter.rest)).max(1);
     let mut lines = Vec::new();
-    for (logical_index, logical) in logical.enumerate() {
-        for (row_index, row) in wrap_str(logical, available).into_iter().enumerate() {
-            let spine = if first_spine && logical_index == 0 && row_index == 0 {
-                gutter.first
-            } else {
-                gutter.rest
-            };
-            lines.push(Line::from(vec![
-                Span::styled(spine.to_string(), gutter.style),
-                Span::styled(row, style),
-            ]));
+    for logical in logical {
+        for row in wrap_str(logical, available) {
+            lines.push(on_rail(vec![Span::styled(row, style)], gutter));
         }
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            gutter.first.to_string(),
-            gutter.style,
-        )));
     }
     lines
 }
@@ -620,22 +659,12 @@ fn capped_gutter_lines(
 ) -> (Vec<Line<'static>>, usize) {
     let normalized = normalize(text);
     let total = count_kept_lines(&normalized);
-    if max >= total {
-        return (
-            gutter_lines_from(normalized.split('\n').take(total), width, style, gutter, true),
-            0,
-        );
-    }
-    (
-        gutter_lines_from(
-            normalized.split('\n').take(max),
-            width,
-            style,
-            gutter,
-            true,
-        ),
-        total - max,
-    )
+    let rows = if max >= total {
+        gutter_lines_from(normalized.split('\n').take(total), width, style, gutter)
+    } else {
+        gutter_lines_from(normalized.split('\n').take(max), width, style, gutter)
+    };
+    (rows, total.saturating_sub(max))
 }
 
 /// [`gutter_lines`] under a head+tail budget: the first `head` and last
@@ -653,23 +682,22 @@ fn head_tail_gutter_lines(
     let normalized = normalize(text);
     let total = count_kept_lines(&normalized);
     if total <= head + tail {
-        return gutter_lines_from(normalized.split('\n').take(total), width, style, gutter, true);
+        return gutter_lines_from(normalized.split('\n').take(total), width, style, gutter);
     }
     let hidden = total - head - tail;
-    let mut lines = gutter_lines_from(normalized.split('\n').take(head), width, style, gutter, true);
-    lines.push(Line::from(vec![
-        Span::styled(gutter.rest.to_string(), gutter.style),
-        Span::styled(
-            format!(" … +{hidden} lines omitted"),
+    let mut lines = gutter_lines_from(normalized.split('\n').take(head), width, style, gutter);
+    lines.push(on_rail(
+        vec![Span::styled(
+            format!("… +{hidden} lines omitted"),
             Style::default().fg(theme::DIM),
-        ),
-    ]));
+        )],
+        gutter,
+    ));
     lines.extend(gutter_lines_from(
         normalized.split('\n').skip(total - tail).take(tail),
         width,
         style,
         gutter,
-        false,
     ));
     lines
 }
@@ -1215,6 +1243,40 @@ mod tests {
         }
     }
 
+    /// The frame is one box-drawing set on one column: every body row starts
+    /// with the same four display columns, whatever spine it carries, so the
+    /// body text never steps in or out. Checked across a wrapping width too —
+    /// a wrapped row must not shift the column either.
+    #[test]
+    fn tool_card_frame_keeps_one_text_column() {
+        let cell = HistoryCell::ToolCall {
+            name: "bash".to_string(),
+            arguments: r#"{"command": "cargo build"}"#.to_string(),
+            result: "Compiling codest v0.1.0\nFinished dev profile\nwarning: unused\nnote: more"
+                .to_string(),
+            error: None,
+            duration_ms: None,
+        };
+        for width in [18usize, 40, 72] {
+            let lines = plain(&cell.lines(width, &folded_all(), false));
+            assert!(lines[1].starts_with(BRACKET_FIRST), "{lines:?}");
+            assert!(lines.last().unwrap().starts_with(BRACKET_LAST), "{lines:?}");
+            // Interior rows carry the rail, in the same four columns.
+            for row in &lines[2..lines.len() - 1] {
+                assert!(row.starts_with(BRACKET_REST), "{lines:?}");
+            }
+            // …so the body text starts at one column top to bottom.
+            let body_starts: Vec<usize> = lines[1..]
+                .iter()
+                .map(|row| display_width(&row[..display_width(BRACKET_FIRST)]))
+                .collect();
+            assert!(
+                body_starts.iter().all(|start| *start == body_starts[0]),
+                "{lines:?}"
+            );
+        }
+    }
+
     #[test]
     fn tool_card_previews_its_output_and_folds_the_rest() {
         let cell = HistoryCell::ToolCall {
@@ -1224,27 +1286,28 @@ mod tests {
             error: None,
             duration_ms: Some(4_200),
         };
-        // Folded: header, the three-line head preview, then the hint.
+        // Folded: header, the three-line head preview, then the hint — every
+        // body row hangs on the rail the header's elbow opened.
         assert_eq!(
             plain(&cell.lines(60, &folded_all(), true)),
             vec![
                 "● bash(ls -la) · 4.2s",
-                " ⎿  a",
-                "    b",
-                "    c",
-                " … +2 lines (ctrl+o to expand)",
+                " ┌  a",
+                " │  b",
+                " │  c",
+                " └  … +2 lines (ctrl+o to expand)",
             ]
         );
-        // Expanded: the whole output, no hint.
+        // Expanded: the whole output between the corners, no hint.
         assert_eq!(
             plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● bash(ls -la) · 4.2s",
-                " ⎿  a",
-                "    b",
-                "    c",
-                "    d",
-                "    e",
+                " ┌  a",
+                " │  b",
+                " │  c",
+                " │  d",
+                " └  e",
             ]
         );
     }
@@ -1265,10 +1328,10 @@ mod tests {
             plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● write(src/a.py) · 120ms",
-                " ⎿    (+3 -0) created",
-                "    + one",
-                "    + two",
-                "    + three",
+                " ┌    (+3 -0) created",
+                " │  + one",
+                " │  + two",
+                " └  + three",
             ]
         );
     }
@@ -1287,9 +1350,9 @@ mod tests {
             plain(&rendered),
             vec![
                 "● edit(a.rs)",
-                " ⎿    (+1 -1) replaced 1 occurrence",
-                "    - old",
-                "    + new",
+                " ┌    (+1 -1) replaced 1 occurrence",
+                " │  - old",
+                " └  + new",
             ]
         );
         // Removed rows are red, added rows green, both on the marker column.
@@ -1318,14 +1381,14 @@ mod tests {
         // laid out first and folded second, so the hint is never content.
         let folded = plain(&cell.lines(80, &folded_all(), true));
         assert_eq!(folded.len(), 1 + DIFF_BODY_MAX_LINES + 1);
-        assert_eq!(folded[1], " ⎿    (+12 -0) created");
-        assert_eq!(folded[8], "    + line 7");
-        assert_eq!(folded[9], " … +5 lines (ctrl+o to expand)");
+        assert_eq!(folded[1], " ┌    (+12 -0) created");
+        assert_eq!(folded[8], " │  + line 7");
+        assert_eq!(folded[9], " └  … +5 lines (ctrl+o to expand)");
 
         // Expanded: every row, no hint.
         let expanded = plain(&cell.lines(80, &expanded_all(), true));
         assert_eq!(expanded.len(), 1 + 13);
-        assert_eq!(expanded.last().unwrap(), "    + line 12");
+        assert_eq!(expanded.last().unwrap(), " └  + line 12");
     }
 
     #[test]
@@ -1343,12 +1406,12 @@ mod tests {
             plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● read(a.rs)",
-                " ⎿  1 fn main() {",
-                "    2     body();",
-                "    3 }",
+                " ┌  1 fn main() {",
+                " │  2     body();",
+                " │  3 }",
                 // The caption starts where the code column does, so it reads as
                 // a note about the body rather than as line 4 of the file.
-                "      [3 lines total, showing 1-3]",
+                " └    [3 lines total, showing 1-3]",
             ]
         );
     }
@@ -1389,7 +1452,7 @@ mod tests {
         // style; no preview follows a failed call.
         assert_eq!(
             plain(&cell.lines(40, &expanded_all(), true)),
-            vec![r#"✗ echo({ "x": 1 })"#, " ⎿  unknown tool"]
+            vec![r#"✗ echo({ "x": 1 })"#, " └  unknown tool"]
         );
         assert_eq!(
             cell.lines(40, &expanded_all(), true)[1].spans[1].style.fg,
@@ -1405,7 +1468,7 @@ mod tests {
         };
         assert_eq!(
             plain(&cell.lines(40, &expanded_all(), true)),
-            vec!["● ping", " ⎿  pong"]
+            vec!["● ping", " └  pong"]
         );
     }
 
@@ -1426,12 +1489,14 @@ mod tests {
         // Expanded, the full command rides above the output under the spine.
         assert_eq!(
             plain(&cell.lines(60, &expanded_all(), true)),
+            // One box around both fragments: the folded arguments and the
+            // output they produced are one body, not two cards stacked.
             vec![
                 "● bash(echo one) · 120ms",
-                " ⎿  echo one",
-                "    echo two",
-                " ⎿  one",
-                "    two",
+                " ┌  echo one",
+                " │  echo two",
+                " │  one",
+                " └  two",
             ]
         );
     }
@@ -1473,8 +1538,9 @@ mod tests {
             duration_ms: None,
         };
         let lines = cell.lines(40, &expanded_all(), true);
-        // The `⎿` spine takes the read category color, the body stays dim.
-        assert_eq!(lines[1].spans[0].content.as_ref(), BRACKET_FIRST);
+        // A one-row body is both corners at once; the corner takes the read
+        // category color and the body text stays dim.
+        assert_eq!(lines[1].spans[0].content.as_ref(), BRACKET_LAST);
         assert_eq!(lines[1].spans[0].style.fg, Some(theme::TOOL_READ));
         assert_eq!(lines[1].spans[1].style.fg, Some(theme::DIM));
     }
@@ -1491,7 +1557,7 @@ mod tests {
         );
         assert_eq!(
             plain(&lines),
-            vec!["⠸ bash(cargo build)", " ⎿  Running… (12s)"]
+            vec!["⠸ bash(cargo build)", " └  Running… (12s)"]
         );
     }
 

@@ -101,19 +101,20 @@ Every tool call renders as its own card:
 
 ```text
 ● bash(cargo build) · 4.2s   # `pwsh(...)` on a Windows host
- ⎿  Compiling codest
-    … +3 lines (ctrl+o to expand)
+ ┌  Compiling codest
+ │  Finished `dev` profile
+ └  … +3 lines (ctrl+o to expand)
 ```
 
-The header is `● name(args) · duration`, with the name in the tool's category color and the `⎿` spine tinted to match. The body previews the first 3 lines; `Ctrl+O` expands and collapses the full output. While the call is still running, a braille spinner occupies the status-glyph slot and an elapsed-time row hangs under the spine. Failures swap `●` for `✗` and render the message in the error color in place of output. When the argument summary had to fold (a multi-line command, typically), expanding restores the full arguments above the output.
+The header is `● name(args) · duration`, with the name in the tool's category color and the body frame tinted to match. The body is a box in one box-drawing set — `┌` opens it, `│` carries its rows, `└` closes it — so its corners and its rail line up on one column and a body of any depth hangs together. The body previews the first 3 lines; `Ctrl+O` expands and collapses the full output. While the call is still running, a braille spinner occupies the status-glyph slot and its single elapsed row is the closed box under the header. Failures swap `●` for `✗` and render the message in the error color in place of output. When the argument summary had to fold (a multi-line command, typically), expanding restores the full arguments above the output.
 
 The file tools render a **structured body** instead of their result text, because they know more than it does — a `write`/`edit` card shows a highlighted `-`/`+` excerpt over a `(+N -M)` stat row, and a `read` card shows its numbered window under a dim number column:
 
 ```text
 ● edit(src/tui/chat.rs) · 1.2s
- ⎿    (+2 -1) replaced 1 occurrence
-    - fn body(…) { dim }
-    + fn body(…) { highlighted }
+ ┌    (+2 -1) replaced 1 occurrence
+ │  - fn body(…) { dim }
+ └  + fn body(…) { highlighted }
 ```
 
 Those bodies fold at 8 rows rather than 3, are highlighted by the file's extension, and wrap at the column budget like code. [tools.md](tools.md#file-tool-bodies) has the details.
