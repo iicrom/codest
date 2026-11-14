@@ -77,6 +77,14 @@ pub enum PluginEventKind<'a> {
     TurnAborted { reason: &'a str },
     /// The turn (or an op) hit an error.
     Error { message: &'a str },
+    /// A steered message joined the running turn at a step boundary:
+    /// appended to the conversation, riding in this turn's next model
+    /// request.
+    SteerClaimed { text: &'a str },
+    /// Steered messages that never reached a step boundary — the turn
+    /// completed or was aborted first — handed back for the front-end to
+    /// requeue as regular turns.
+    SteerUnclaimed { texts: &'a [String] },
     /// The turn is over.
     TurnComplete,
     /// The conversation history was dropped (system prompt retained).
@@ -114,7 +122,9 @@ impl PluginEventKind<'_> {
         match self {
             Self::MessageDelta { .. } => EventSubscription::DELTAS,
             Self::RoundUsage { .. } | Self::TurnUsage { .. } => EventSubscription::USAGE,
-            Self::ToolCallStarted { .. } | Self::ToolCallFinished { .. } => EventSubscription::TOOLS,
+            Self::ToolCallStarted { .. } | Self::ToolCallFinished { .. } => {
+                EventSubscription::TOOLS
+            }
             Self::ConversationSnapshot { .. } => EventSubscription::SNAPSHOT,
             Self::SessionStarted { .. }
             | Self::SessionSwitched { .. }
@@ -127,6 +137,8 @@ impl PluginEventKind<'_> {
             | Self::AgentMessage { .. }
             | Self::TurnAborted { .. }
             | Self::Error { .. }
+            | Self::SteerClaimed { .. }
+            | Self::SteerUnclaimed { .. }
             | Self::TurnComplete
             | Self::ConversationCleared
             | Self::Shutdown => EventSubscription::LIFECYCLE,
@@ -198,7 +210,10 @@ mod tests {
         use std::time::Instant;
         let at = Instant::now();
         let text = String::from("hi");
-        let delta = PluginEventKind::MessageDelta { kind: DeltaKind::Text, text: &text };
+        let delta = PluginEventKind::MessageDelta {
+            kind: DeltaKind::Text,
+            text: &text,
+        };
         assert_eq!(delta.subscription(), EventSubscription::DELTAS);
 
         let empty: [Message; 0] = [];

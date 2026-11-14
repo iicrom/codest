@@ -112,6 +112,9 @@ const MAX_COMPOSER_ROWS: usize = 8;
 /// lines that produced.
 const MAX_LIVE_TAIL_ROWS: usize = 4;
 const MAX_COMMAND_MENU_ROWS: usize = 6;
+/// Rows the pending preview shows before folding the rest into a summary
+/// line — a long queue must not crowd out the composer above which it sits.
+const MAX_PENDING_ROWS: usize = 2;
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
 /// The idle footer's key hints, most useful first. A narrow terminal drops
@@ -593,6 +596,10 @@ struct App {
     /// `ask_user_question` plugin's form, drawn as a modal popup that owns
     /// the whole keyboard.
     prompt_dialog: Option<crate::tui::prompt_dialog::PromptDialog>,
+    /// Open floating report window (`/status`, `/usage`): a bordered pane
+    /// over the transcript, modal while open, and gone without a trace when
+    /// dismissed — output streaming underneath keeps repainting.
+    report_popup: Option<crate::tui::report_popup::ReportPopup>,
     /// The question dialog's inbox: `TuiPromptHost` forwards forms here from
     /// the blocking tool thread, and the event loop opens a dialog per
     /// request.
@@ -656,6 +663,12 @@ struct App {
     /// True after Esc dismissed the menu for the current input.
     command_menu_dismissed: bool,
     busy: bool,
+    /// Messages accepted while a turn runs, pending delivery: queued ones
+    /// start after the running turn, steered ones join it at the next step
+    /// boundary. Each becomes a transcript cell only when the core reports
+    /// it delivered (`TurnStarted` / `SteerClaimed`), so the record never
+    /// shows it above the answer still streaming.
+    pending: Vec<PendingInput>,
     tick: usize,
     /// Set by every event that may change what the screen shows. The event
     /// loop draws once per [`MIN_FRAME_INTERVAL`] while it stands, so bursts
@@ -695,6 +708,23 @@ struct App {
 struct ModelMenu {
     items: Vec<ModelMenuItem>,
     selected: usize,
+}
+
+/// Where a mid-turn message is headed: a queued turn runs after the current
+/// one finishes; a steered message joins the running turn at its next step
+/// boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPlacement {
+    Queue,
+    Steer,
+}
+
+/// A message accepted while a turn runs, shown as a pending row above the
+/// composer until the core reports it delivered — only then does it become
+/// a transcript cell.
+struct PendingInput {
+    text: String,
+    placement: PendingPlacement,
 }
 
 struct ModelMenuItem {
@@ -840,6 +870,7 @@ impl App {
             provider_wizard: None,
             settings_view: None,
             prompt_dialog: None,
+            report_popup: None,
             prompt_requests,
             prompt_requests_closed: false,
             settings_path: crate::core::config::config_path(),
@@ -863,6 +894,7 @@ impl App {
             command_selection: 0,
             command_menu_dismissed: false,
             busy: false,
+            pending: Vec::new(),
             tick: 0,
             needs_redraw: true,
             last_draw: Instant::now()
@@ -1095,6 +1127,47 @@ impl App {
                 tui.current_buffer_mut().reset();
             }
             tui.draw(|frame| dialog.render(frame, frame.area()))?;
+            return Ok(());
+        }
+        // The report popup replaces the pane while open — the same trade as
+        // the question dialog: streaming output keeps flushing to scrollback
+        // behind it, and closing restores the regular pane, scrollback
+        // untouched.
+        if let Some(popup) = &self.report_popup {
+            let rows = size.height;
+            let pane_rows = popup
+                .preferred_height(size.width, rows.saturating_sub(1))
+                .min(rows.saturating_sub(1))
+                .max(3);
+            let rect = inline_rect(size.width, rows, pane_rows);
+
+            let resized = rows != self.inline_rows || size.width != self.inline_columns;
+            let changed = resized || pane_rows != self.inline_height;
+            let old_top = self.inline_top;
+            // Growing the pane consumes transcript rows: push them to
+            // scrollback first, like the regular path does, so nothing the
+            // popup covers is lost when it closes.
+            if pane_rows > self.inline_height && !resized {
+                scroll_screen_up(rows, (pane_rows - self.inline_height) as usize)?;
+            }
+            if changed {
+                let mut stdout = std::io::stdout();
+                execute!(
+                    stdout,
+                    MoveTo(0, old_top.min(rect.y)),
+                    Clear(ClearType::FromCursorDown)
+                )?;
+            }
+            self.inline_top = rect.y;
+            self.inline_height = pane_rows;
+            self.inline_rows = rows;
+            self.inline_columns = size.width;
+
+            if changed {
+                tui.resize(rect)?;
+                tui.current_buffer_mut().reset();
+            }
+            tui.draw(|frame| popup.render(frame, frame.area()))?;
             return Ok(());
         }
         // The `/context` viewer takes the whole pane while open; closing it
@@ -1395,6 +1468,26 @@ impl App {
             return;
         }
 
+        // The report popup is modal like the screens: scroll keys move it,
+        // Esc / Enter / `q` dismiss it, and everything else is swallowed so
+        // typing cannot leak into the composer behind it.
+        if let Some(popup) = self.report_popup.as_mut() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.report_popup = None;
+                }
+                KeyCode::Up => popup.scroll_up(1),
+                KeyCode::Down => popup.scroll_down(1),
+                KeyCode::PageUp => popup.scroll_up(10),
+                KeyCode::PageDown => popup.scroll_down(10),
+                KeyCode::Home => popup.scroll_home(),
+                KeyCode::End => popup.scroll_end(),
+                _ => {}
+            }
+            self.needs_redraw = true;
+            return;
+        }
+
         // The `/context` viewer owns the whole keyboard while it is open —
         // fully modal, like the provider wizard but stricter: nothing leaks
         // to the composer or the menus underneath.
@@ -1594,7 +1687,14 @@ impl App {
             KeyCode::Char('p') if ctrl => self.history_prev(),
             KeyCode::Char('n') if ctrl => self.history_next(),
             KeyCode::Char(c) if !ctrl && !alt => self.composer.insert_char(c),
-            KeyCode::Enter if ctrl || alt || shift => self.composer.insert_char('\n'),
+            KeyCode::Enter if ctrl || shift => self.composer.insert_char('\n'),
+            // Alt+Enter delivers now: submit when idle, steer into the
+            // running turn's next step boundary when busy. Shift+Enter and
+            // Ctrl+Enter keep their newline meaning.
+            KeyCode::Enter if alt => {
+                self.complete_command_selection();
+                self.submit_composer(true);
+            }
             KeyCode::Enter => self.on_enter(),
             KeyCode::Tab => {
                 self.complete_command_selection();
@@ -1710,8 +1810,9 @@ impl App {
     }
 
     fn command_matches(&self) -> Vec<CommandCandidate> {
-        if self.busy
-            || self.command_menu_dismissed
+        // The menu works mid-turn too: a command typed while streaming runs
+        // as itself instead of queueing.
+        if self.command_menu_dismissed
             || self.session_menu.is_some()
             || self.model_menu.is_some()
             || self.effort_menu.is_some()
@@ -1760,9 +1861,14 @@ impl App {
     }
 
     fn try_submit(&mut self) {
-        if self.busy {
-            return;
-        }
+        self.submit_composer(false);
+    }
+
+    /// Accept the composer: a command runs as itself in any state (idle,
+    /// mid-turn — except the commands that would strand a streaming turn's
+    /// output), and a message submits when idle, queues behind the running
+    /// turn by default, and joins it at the next step boundary on Alt+Enter.
+    fn submit_composer(&mut self, steer: bool) {
         let text = self.composer.text();
         if text.trim().is_empty() {
             return;
@@ -1771,7 +1877,7 @@ impl App {
         match self.plugins.parse(&text) {
             CommandInput::Command(invocation) => {
                 // Commands are local — none of them need a model — so they
-                // keep working on an empty route.
+                // keep working on an empty route, and mid-turn too.
                 self.clear_for_submit(&text);
                 self.run_command(invocation);
                 return;
@@ -1790,22 +1896,113 @@ impl App {
         // complete endpoint, or actionable guidance. The composer is
         // deliberately untouched in every guidance branch so the message
         // survives until the setup is fixed.
-        if self.route.is_none() {
-            let guidance = if self.pool.registry().instances().is_empty() {
-                crate::core::providers::NO_MODEL_GUIDANCE.to_string()
-            } else {
-                crate::core::providers::NO_MODEL_SELECTED.to_string()
-            };
+        if let Some(guidance) = self.route_blocker() {
             self.view_mut().history.push(HistoryCell::Error(guidance));
-            return;
-        }
-        if let Some(prompt) = self.route_guidance() {
-            self.view_mut().history.push(HistoryCell::Error(prompt));
             return;
         }
 
         self.clear_for_submit(&text);
-        self.submit_user_turn(text);
+        match (steer, self.busy) {
+            (true, true) => self.steer_text(text),
+            // Steer with no turn running is just a submit.
+            (true, false) | (false, false) => self.submit_user_turn(text),
+            (false, true) => self.queue_text(text),
+        }
+    }
+
+    /// Why a message cannot be served by the active route right now: nothing
+    /// selected at all, or a half-specified endpoint (a lone `--base-url` or
+    /// `--api-key`).
+    fn route_blocker(&self) -> Option<String> {
+        if self.route.is_none() {
+            return Some(if self.pool.registry().instances().is_empty() {
+                crate::core::providers::NO_MODEL_GUIDANCE.to_string()
+            } else {
+                crate::core::providers::NO_MODEL_SELECTED.to_string()
+            });
+        }
+        self.route_guidance()
+    }
+
+    /// Queue the message for after the running turn (Enter while busy). The
+    /// core's op channel is FIFO, so the turn starts the moment the current
+    /// one finishes; the transcript cell lands when `TurnStarted` confirms
+    /// delivery, not before.
+    fn queue_text(&mut self, text: String) {
+        self.pending.push(PendingInput {
+            text: text.clone(),
+            placement: PendingPlacement::Queue,
+        });
+        let output = self.plugins.user_message(&text, self.plugin_info());
+        self.apply_output(output);
+        self.session.submit_user_turn(text);
+    }
+
+    /// Steer the message into the running turn (Alt+Enter while busy): it
+    /// joins the conversation at the next step boundary, without waiting for
+    /// the turn to end. When the channel refuses — the turn ended between
+    /// the busy check and now — fall back to queueing.
+    fn steer_text(&mut self, text: String) {
+        if !self.session.steer(text.clone()) {
+            self.queue_text(text);
+            return;
+        }
+        let output = self.plugins.user_message(&text, self.plugin_info());
+        self.apply_output(output);
+        self.pending.push(PendingInput {
+            text,
+            placement: PendingPlacement::Steer,
+        });
+    }
+
+    /// Deliver the oldest queued message: its turn is starting (or was
+    /// rejected before it could), so it becomes a transcript cell. The core
+    /// event carries no text — FIFO order pairs one `TurnStarted` with one
+    /// queued entry — so the entry's own text is used.
+    fn deliver_queued(&mut self) {
+        let index = self
+            .pending
+            .iter()
+            .position(|entry| entry.placement == PendingPlacement::Queue);
+        if let Some(index) = index {
+            let text = self.pending.remove(index).text;
+            self.view_mut().history.push(HistoryCell::User(text));
+        }
+    }
+
+    /// Retire the oldest steered entry: the core claimed it at a boundary.
+    /// The claim event carries the authoritative text for the cell.
+    fn retire_steer(&mut self) {
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|entry| entry.placement == PendingPlacement::Steer)
+        {
+            self.pending.remove(index);
+        }
+    }
+
+    /// Requeue a steered message the turn never claimed: the pending entry
+    /// flips to queued — moved to the back, matching its place at the end of
+    /// the core's submission queue — and a regular turn is submitted so the
+    /// input still gets answered.
+    fn requeue_steer(&mut self, text: String) {
+        let index = self
+            .pending
+            .iter()
+            .position(|entry| entry.placement == PendingPlacement::Steer && entry.text == text);
+        match index {
+            Some(index) => {
+                let mut entry = self.pending.remove(index);
+                entry.placement = PendingPlacement::Queue;
+                self.pending.push(entry);
+            }
+            None => self.pending.push(PendingInput {
+                text: text.clone(),
+                placement: PendingPlacement::Queue,
+            }),
+        }
+        self.session.submit_user_turn(text);
     }
 
     /// Why the active route cannot serve a message right now, if it can't:
@@ -1832,6 +2029,15 @@ impl App {
     /// behavior and never reach the plugin host; their specs live in the
     /// shared command table so parsing, the command menu, and `/help` agree.
     fn run_command(&mut self, invocation: Invocation) {
+        // A streaming turn (or one already queued behind it) owns the active
+        // view: archiving it or switching away mid-flight would strand its
+        // output in the wrong place. Everything else is safe mid-turn.
+        if (self.busy || !self.pending.is_empty())
+            && matches!(invocation.spec.name, "new" | "sessions")
+        {
+            self.flash("busy — press Esc to interrupt first");
+            return;
+        }
         match invocation.spec.name {
             "new" => return self.start_new_session(),
             "rename" => return self.rename_session(&invocation.args),
@@ -1869,14 +2075,13 @@ impl App {
             // `/settings` opens the settings screen; an optional argument
             // names the section to focus (host or plugin id).
             "settings" => return self.open_settings(&invocation.args),
-            // `/usage` prints the consumption report inline, like the
-            // plugin-authored reports do.
+            // `/usage` opens the floating report window: the readout stays
+            // on screen while a turn streams underneath, and closing it
+            // leaves no transcript residue.
             "usage" => {
-                let report = self.build_usage_report();
-                // A report is read from its top, like every plugin report.
-                let view = self.view_mut();
-                view.history.push(HistoryCell::Report(report));
-                view.park_on_last_report = true;
+                self.report_popup = Some(crate::tui::report_popup::ReportPopup::new(
+                    self.build_usage_report(),
+                ));
                 return;
             }
             _ => {}
@@ -2048,9 +2253,16 @@ impl App {
         self.model_label = selection.to_string();
         self.route = Some(item.selection.clone());
         self.refresh_request_facts();
+        // The switch lands between turns in the core; while one streams (or
+        // one is queued) the notice says so, matching the running turn
+        // keeping its own model.
+        let notice = if self.busy || !self.pending.is_empty() {
+            format!("switched to {selection} · applies from the next turn")
+        } else {
+            format!("switched to {selection}")
+        };
         let view = self.view_mut();
-        view.history
-            .push(HistoryCell::Notice(format!("switched to {selection}")));
+        view.history.push(HistoryCell::Notice(notice));
         self.session.switch_model(selection);
     }
 
@@ -3091,7 +3303,19 @@ impl App {
                     self.view_mut().history.push(HistoryCell::Report(block));
                     self.view_mut().park_on_last_report = true;
                 }
+                PluginEffect::PresentReport(block) => {
+                    // `/status` and friends: open the floating window
+                    // instead of appending to the transcript. It survives
+                    // streaming output and leaves nothing behind.
+                    self.report_popup = Some(crate::tui::report_popup::ReportPopup::new(block));
+                }
                 PluginEffect::ClearConversation => {
+                    // Same guard as `/clear`'s kin (`/new`, `/sessions`): a
+                    // streaming turn's output would land in a wiped view.
+                    if self.busy || !self.pending.is_empty() {
+                        self.flash("busy — press Esc to interrupt first");
+                        continue;
+                    }
                     self.clear_transcript();
                     self.session.clear_conversation();
                 }
@@ -3231,6 +3455,11 @@ impl App {
         self.apply_output(output);
         match event.msg {
             EventMsg::TurnStarted => {
+                // A queued message's turn is starting: the pending entry
+                // becomes the transcript cell now, so it lands below the
+                // answer that just finished instead of above the one still
+                // streaming. FIFO pairs one `TurnStarted` with one entry.
+                self.deliver_queued();
                 self.busy = true;
                 if self.view().live.is_none() {
                     self.view_mut().live = Some(String::new());
@@ -3369,6 +3598,13 @@ impl App {
                     view.set_error(message);
                     return;
                 }
+                // A queued turn rejected before it ever started (no usable
+                // route in the core) never sees `TurnStarted`: its pending
+                // entry retires here, so the message shows next to its
+                // rejection.
+                if !self.busy {
+                    self.deliver_queued();
+                }
                 self.settle_running_tool("interrupted");
                 self.finalize_live();
                 self.view_mut().history.push(HistoryCell::Error(message));
@@ -3380,6 +3616,24 @@ impl App {
                 self.busy = false;
                 self.last_ctrl_c = None;
                 self.apply_output(output);
+            }
+            EventMsg::SteerClaimed { text } => {
+                // The running turn absorbed a steered message at a step
+                // boundary: retire the pending row and give the message its
+                // transcript cell, below the round that just committed and
+                // above the round about to stream.
+                self.retire_steer();
+                self.view_mut().history.push(HistoryCell::User(text));
+            }
+            EventMsg::SteerUnclaimed { texts } => {
+                // The turn ended before a boundary — completed or aborted —
+                // so the model never saw the steered input. Each entry
+                // flips to queued and a regular turn is submitted right
+                // away: the core runs it after whatever is already waiting,
+                // so the input still gets answered.
+                for text in texts {
+                    self.requeue_steer(text);
+                }
             }
             EventMsg::ConversationCleared => {
                 // The TUI already reset its transcript synchronously when
@@ -3610,6 +3864,14 @@ impl App {
             self.render_footer(frame, chunks[3]);
         }
 
+        // The report popup floats over everything below it and is drawn
+        // last, so a streaming repaint underneath cannot disturb it. The
+        // question dialog still outranks it: a pending question is an active
+        // tool call.
+        if let Some(popup) = self.report_popup.as_ref() {
+            popup.render(frame, area);
+        }
+
         // The question dialog sits on top of whatever is under it — chat,
         // or one of the screens above: a pending question is an active tool
         // call and outranks every screen.
@@ -3659,7 +3921,8 @@ impl App {
 
     /// Rows the menu above the composer needs: a picker (`/sessions`,
     /// `/model`, `/effort`) when it is open, otherwise the slash-command
-    /// candidates. Empty when neither is visible.
+    /// candidates, otherwise the pending mid-turn submissions. Empty when
+    /// none of the three is visible.
     fn menu_row_count(&self) -> usize {
         if let Some(wizard) = self.provider_wizard.as_ref() {
             // Pickers show their rows; a text step shows the prompt; a running
@@ -3674,9 +3937,58 @@ impl App {
             menu.items.len().min(MAX_COMMAND_MENU_ROWS)
         } else if self.session_menu.is_some() {
             self.views.len().min(MAX_COMMAND_MENU_ROWS)
+        } else if self.command_matches().is_empty() {
+            self.pending_row_count()
         } else {
             self.command_matches().len().min(MAX_COMMAND_MENU_ROWS)
         }
+    }
+
+    /// Rows the pending-preview needs: one per queued/steered message, up to
+    /// [`MAX_PENDING_ROWS`], plus one fold line when there are more.
+    fn pending_row_count(&self) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        let shown = self.pending.len().min(MAX_PENDING_ROWS);
+        shown + usize::from(self.pending.len() > shown)
+    }
+
+    /// The pending preview: messages accepted mid-turn that the core has not
+    /// reported delivered yet. Each row names its destination and the
+    /// message's first line, so the user can see what will go out and when.
+    fn pending_lines(&self) -> Vec<Line<'static>> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let shown = self.pending.len().min(MAX_PENDING_ROWS);
+        let mut lines: Vec<Line<'static>> = self
+            .pending
+            .iter()
+            .take(shown)
+            .map(|entry| {
+                let (marker, destination) = match entry.placement {
+                    PendingPlacement::Queue => ("⏳", "queued · after this turn"),
+                    PendingPlacement::Steer => ("⚡", "steer · next boundary"),
+                };
+                let text = crate::tui::session::truncated(
+                    entry.text.lines().next().unwrap_or_default(),
+                    48,
+                );
+                Line::from(Span::styled(
+                    format!("{marker} {destination} ↳ {text}"),
+                    Style::default().fg(theme::SUBTLE),
+                ))
+            })
+            .collect();
+        if self.pending.len() > shown {
+            let rest = self.pending.len() - shown;
+            lines.push(Line::from(Span::styled(
+                format!("  … and {rest} more pending"),
+                Style::default().fg(theme::DIM),
+            )));
+        }
+        lines
     }
 
     /// The menu lines, windowed around the selection so it stays visible
@@ -3721,7 +4033,7 @@ impl App {
 
         let matches = self.command_matches();
         if matches.is_empty() {
-            return Vec::new();
+            return self.pending_lines();
         }
         let selected = self.command_selection.min(matches.len() - 1);
         let window = command_menu_window(matches.len(), selected, height);
@@ -4006,7 +4318,7 @@ impl App {
                 } else if self.show_ctrl_c_hint() {
                     "Ctrl+C again to quit"
                 } else if self.busy {
-                    "streaming…"
+                    "Enter queue · Alt+Enter steer · Esc interrupt"
                 } else if self.mode == TuiMode::Fullscreen {
                     IDLE_HINTS_FULLSCREEN
                 } else {
@@ -6013,6 +6325,151 @@ mod tests {
         assert_eq!(app.view().history.len(), before);
     }
 
+    /// Enter while a turn streams queues the message: nothing lands in the
+    /// transcript until `TurnStarted` reports the queued turn running.
+    #[tokio::test]
+    async fn enter_while_busy_queues_and_delivers_on_turn_started() {
+        let mut app = test_app();
+        app.busy = true;
+        app.view_mut().live = Some("streaming answer".to_string());
+        app.composer.set_text("second".to_string());
+
+        app.try_submit();
+
+        // The composer clears and the running turn's live text survives,
+        // but the transcript gains no cell yet — only the pending row.
+        assert!(app.composer.is_empty());
+        assert!(app.busy);
+        assert_eq!(
+            app.view().live.as_deref(),
+            Some("streaming answer"),
+            "queueing must not touch the streaming turn's live text"
+        );
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].placement, PendingPlacement::Queue);
+        assert!(
+            !app.view()
+                .history
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::User(text) if text == "second"))
+        );
+
+        app.handle_agent_event(crate::core::Event::new("sub-2", EventMsg::TurnStarted));
+
+        // Delivery: the pending row retires and the cell lands.
+        assert!(app.pending.is_empty());
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::User(text)) if text == "second"
+        ));
+    }
+
+    /// Alt+Enter while a turn streams steers: the pending row retires when
+    /// the core claims the message at a step boundary.
+    #[tokio::test]
+    async fn alt_enter_while_busy_steers_and_claims_at_the_boundary() {
+        let mut app = test_app();
+        app.busy = true;
+        app.composer.set_text("pivot now".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+
+        assert!(app.composer.is_empty());
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].placement, PendingPlacement::Steer);
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::SteerClaimed {
+                text: "pivot now".to_string(),
+            },
+        ));
+
+        assert!(app.pending.is_empty());
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::User(text)) if text == "pivot now"
+        ));
+    }
+
+    /// A steer the turn never claimed (interrupted, or no boundary reached)
+    /// flips to queued and a regular turn is submitted for it — the worker
+    /// answers it after the current one settles. Driven end-to-end over the
+    /// real worker: the test fabricates `busy` without a turn, so the steer
+    /// lands on an idle worker and comes straight back as `SteerUnclaimed`.
+    #[tokio::test]
+    async fn steer_unclaimed_requeues_and_resubmits() {
+        let mut app = test_app();
+        app.busy = true;
+        app.composer.set_text("pivot now".to_string());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(app.pending[0].placement, PendingPlacement::Steer);
+
+        // The worker's own hand-back arrives; the app requeues and
+        // resubmits, and the worker answers — its `TurnStarted` pops the
+        // pending row into a transcript cell.
+        loop {
+            let event = app.session.next_event().await.expect("worker event");
+            let done = matches!(event.msg, EventMsg::TurnStarted);
+            app.handle_agent_event(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(app.pending.len(), 0);
+        assert!(app.busy);
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::User(text)) if text == "pivot now"
+        ));
+    }
+
+    /// A command typed mid-turn runs as itself; the ones that would strand a
+    /// streaming turn's output are refused with a flash instead.
+    #[tokio::test]
+    async fn mid_turn_commands_run_but_new_and_clear_are_refused() {
+        let mut app = test_app();
+        app.busy = true;
+
+        app.composer.set_text("/status".to_string());
+        app.try_submit();
+        assert!(app.report_popup.is_some(), "/status opens mid-turn");
+        assert!(app.pending.is_empty(), "commands never queue");
+        assert!(app.composer.is_empty());
+
+        app.composer.set_text("/new".to_string());
+        app.try_submit();
+        assert_eq!(app.views.len(), 1, "/new is refused mid-turn");
+        assert!(app.status.is_some(), "the refusal flashes");
+
+        app.busy = false;
+        app.composer.set_text("/new".to_string());
+        app.try_submit();
+        assert_eq!(app.views.len(), 2, "idle /new still works");
+    }
+
+    /// The report popup is modal: scroll keys move it, Esc dismisses it, and
+    /// other keys leak nowhere.
+    #[tokio::test]
+    async fn report_popup_scrolls_and_closes() {
+        let mut app = test_app();
+        app.composer.set_text("/usage".to_string());
+        app.try_submit();
+        assert!(app.report_popup.is_some());
+
+        // Typing leaks nothing into the composer behind the popup.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.composer.is_empty());
+        assert!(app.report_popup.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        // (scroll clamps at render; the state just tracks the requests)
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.report_popup.is_none());
+    }
+
     #[tokio::test]
     async fn clear_resets_the_transcript_immediately() {
         let mut app = test_app();
@@ -6073,16 +6530,22 @@ mod tests {
         app.try_submit();
 
         assert!(!app.busy);
-        match app.view().history.last() {
-            Some(HistoryCell::Notice(text)) => {
-                assert!(text.contains("backend: test/one"), "{text}");
-                assert!(
-                    text.contains("plugins: help, clear, quit, status"),
-                    "{text}"
-                );
-            }
-            other => panic!("expected a status notice, got {other:?}"),
-        }
+        let popup = app.report_popup.as_ref().expect("status opens the popup");
+        let block = popup.block();
+        let entry = |label: &str| {
+            block.groups[0]
+                .entries
+                .iter()
+                .find(|entry| entry.label == label)
+                .unwrap_or_else(|| panic!("missing {label} entry"))
+                .text
+                .clone()
+        };
+        assert_eq!(entry("backend"), "test/one");
+        assert_eq!(
+            entry("plugins"),
+            "help, clear, quit, status, continue, tps, ask_user_question, bash, fs"
+        );
     }
 
     #[tokio::test]
@@ -6133,10 +6596,20 @@ mod tests {
             Some(HistoryCell::Error(text)) if text.contains("arguments")
         ));
 
+        // The picker opens mid-turn too; the switch lands between turns and
+        // the notice says so.
         app.busy = true;
         app.composer.set_text("/model".to_string());
         app.try_submit();
-        assert!(app.model_menu.is_none(), "no picker while streaming");
+        assert!(app.model_menu.is_some(), "the picker opens while streaming");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.model_menu.is_none());
+        assert!(matches!(
+            app.view().history.last(),
+            Some(HistoryCell::Notice(text))
+                if text == "switched to test/two · applies from the next turn"
+        ));
     }
 
     #[tokio::test]
@@ -6337,7 +6810,7 @@ mod tests {
         assert!(app.view().turns.is_empty());
     }
 
-    /// `/usage` prints the consumption report as an inline report cell.
+    /// `/usage` opens the floating report window with the consumption report.
     #[tokio::test]
     async fn usage_command_prints_the_consumption_report() {
         let mut app = test_app();
@@ -6356,24 +6829,21 @@ mod tests {
             args: String::new(),
         });
 
-        match app.view().history.last() {
-            Some(HistoryCell::Report(block)) => {
-                assert_eq!(block.title, "usage");
-                let context = &block.groups[0];
-                assert!(
-                    context.entries[0]
-                        .text
-                        .contains("1.2k tok · window unknown · cache 70%"),
-                    "{context:?}"
-                );
-                // The turn record feeds the Turns group, newest last.
-                let turns = block.groups.iter().find(|g| g.heading == "Turns").unwrap();
-                assert_eq!(turns.entries.len(), 1);
-                assert_eq!(turns.entries[0].label, "test/one");
-                assert!(turns.entries[0].text.contains("cached 700"), "{turns:?}");
-            }
-            other => panic!("expected a report cell, got {other:?}"),
-        }
+        let popup = app.report_popup.as_ref().expect("usage opens the popup");
+        let block = popup.block();
+        assert_eq!(block.title, "usage");
+        let context = &block.groups[0];
+        assert!(
+            context.entries[0]
+                .text
+                .contains("1.2k tok · window unknown · cache 70%"),
+            "{context:?}"
+        );
+        // The turn record feeds the Turns group, newest last.
+        let turns = block.groups.iter().find(|g| g.heading == "Turns").unwrap();
+        assert_eq!(turns.entries.len(), 1);
+        assert_eq!(turns.entries[0].label, "test/one");
+        assert!(turns.entries[0].text.contains("cached 700"), "{turns:?}");
     }
 
     #[tokio::test]
@@ -6604,13 +7074,18 @@ mod tests {
 
         app.composer.set_text("/status".to_string());
         app.try_submit();
-        assert!(
-            matches!(app.view().history.last(), Some(HistoryCell::Notice(text))
-                if text.contains("context: 13.0k/200.0k (6%)")
-                    && text.contains("tokens: session in 12.3k / out 660")),
-            "{:?}",
-            app.view().history.last()
-        );
+        let popup = app.report_popup.as_ref().expect("status opens the popup");
+        let entry = |label: &str| {
+            popup.block().groups[0]
+                .entries
+                .iter()
+                .find(|entry| entry.label == label)
+                .unwrap_or_else(|| panic!("missing {label} entry"))
+                .text
+                .clone()
+        };
+        assert_eq!(entry("context"), "13.0k/200.0k (6%)");
+        assert_eq!(entry("tokens"), "session in 12.3k / out 660");
     }
 
     #[tokio::test]
@@ -7455,10 +7930,13 @@ mod tests {
         // …including `/status`, which reports the empty backend label…
         app.composer.set_text("/status".to_string());
         app.try_submit();
-        assert!(matches!(
-            app.view().history.last(),
-            Some(HistoryCell::Notice(text)) if text.contains("backend: no model"),
-        ));
+        let popup = app.report_popup.as_ref().expect("status opens the popup");
+        assert!(
+            popup.block().groups[0]
+                .entries
+                .iter()
+                .any(|entry| entry.label == "backend" && entry.text == "no model")
+        );
 
         // …and `/model`, whose empty menu carries the same guidance.
         app.composer.set_text("/model".to_string());
@@ -7566,7 +8044,10 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.busy = true;
-        assert!(app.command_matches().is_empty(), "no menu while streaming");
+        assert!(
+            !app.command_matches().is_empty(),
+            "the command menu works while streaming: a command runs as itself mid-turn"
+        );
     }
 
     #[tokio::test]

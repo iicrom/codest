@@ -721,7 +721,11 @@ fn count_kept_lines(normalized: &str) -> usize {
 /// Render a plugin report the way reference TUIs style their loaded-context
 /// panels: the bold accent title, then each group's bold subtle heading over
 /// dim entries whose labels are picked out in the accent color.
-fn report_lines(block: &ReportBlock, width: usize) -> Vec<Line<'static>> {
+/// The report block as wrapped, styled lines — shared by the transcript
+/// card and the `/status` / `/usage` floating window. The first row is the
+/// `▪ title` marker; the floating window renders the title in its border
+/// and skips it.
+pub(crate) fn report_lines(block: &ReportBlock, width: usize) -> Vec<Line<'static>> {
     let mut out = vec![Line::from(Span::styled(
         format!("▪ {}", block.title),
         Style::default()

@@ -703,23 +703,20 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
                 break
             previous = growth
         turn_end = len(output)
-        # `/usage` needs an idle agent; the turn is done by now. The report
-        # is printed into a transcript that is already taller than the
-        # 24-row grid, so the visible frame shows only its tail. Assertions
-        # therefore read the *rendered transcript text* (via `screen_turn`
-        # plus the report's own stream) rather than assuming what fits.
+        # `/usage` opens the floating report window: a bordered pane over the
+        # transcript, gone without a trace on Esc. Capture the open frame,
+        # one PgDn into its scroll, and the frame after closing.
         os.write(master, b"/usage")
         pump(master, output, 0.3)
         os.write(master, b"\r")
         pump(master, output, 1.2)
-        # The report parks the viewport on its first line (the useful part),
-        # so its tail — Request, Usage — is one PgDn away. Scroll once and
-        # capture that frame too, the way a reader would.
-        before_quit = len(output)
-        for _ in range(2):
-            os.write(master, b"\x1b[6~")  # PgDn
-            pump(master, output, 0.2)
-        report_tail_end = len(output)
+        popup_open = len(output)
+        os.write(master, b"\x1b[6~")  # PgDn scrolls the popup's body
+        pump(master, output, 0.3)
+        popup_scrolled = len(output)
+        os.write(master, b"\x1b")  # Esc closes it
+        pump(master, output, 0.4)
+        popup_closed = len(output)
         for _ in range(3):
             if process.poll() is not None:
                 break
@@ -745,15 +742,12 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
     screen_turn = render(output[:turn_end].decode("utf-8", "replace"))
     raw_before_quit = output[:before_quit].decode("utf-8", "replace")
     screen = render(raw_before_quit)
-    # The report is taller than the grid and parks on its first line, so the
-    # frame right after `/usage` shows its head and the frame after PgDn its
-    # tail. Fullscreen repaints only the visible window and inline prints to
-    # the terminal's scrollback, so the assertions read the plain text of the
-    # whole capture (escape sequences and cursor moves stripped) plus the
-    # scrolled frame — the closest a pty test gets to scrolling back.
-    plain = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07", "", raw_before_quit)
-    report_tail = render(output[:report_tail_end].decode("utf-8", "replace"))
-    report_screen = raw_before_quit + "\n" + plain + "\n" + report_tail
+    # The popup renders over the transcript and leaves nothing behind: the
+    # open frame shows its border title and body, the closed frame must not.
+    popup = render(output[:popup_open].decode("utf-8", "replace"))
+    popup_pgdn = render(output[:popup_scrolled].decode("utf-8", "replace"))
+    after_close = render(output[:popup_closed].decode("utf-8", "replace"))
+    report_screen = popup + "\n" + popup_pgdn
 
     print(f"--- {mode} screen (tool cell) ---")
     print(screen_tool)
@@ -767,15 +761,14 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         "tool call rendered": TOOL_CARD_MARKER.search(screen_tool) is not None,
         "unknown tool surfaced": "unknown tool `ping`" in screen_turn,
         "round trip reply": "tool-calling round trip of the test server" in screen_turn,
-        # The `/usage` report is taller than the grid, so these read the
-        # transcript text (`report_screen`), not the visible frame: its title
-        # line plus the Context, Session and per-turn sections — the last of
-        # which now carries the cache rate the server reports.
-        "usage report title": "▪ usage" in report_screen,
-        "usage shows context": "  Context" in report_screen,
-        "usage shows the session sums": "session in " in report_screen,
-        "usage shows the measured turn": "last turn" in report_screen,
-        "usage shows the cache rate": re.search(r"cache \d+%", report_screen) is not None,
+        # The `/usage` popup floats over the transcript: its border title and
+        # body show while open, and Esc closes it without a transcript trace.
+        "usage popup opens": " usage " in popup,
+        "usage popup shows context": "  Context" in report_screen,
+        "usage popup shows the session sums": "session in " in report_screen,
+        "usage popup shows the measured turn": "last turn" in report_screen,
+        "usage popup shows the cache rate": re.search(r"cache \d+%", report_screen) is not None,
+        "usage popup closes without a trace": " usage " not in after_close,
         "clean exit": process.poll() is not None or process.returncode == 0,
     }
     checks["rollout records tool round"] = (
@@ -783,6 +776,152 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         and '"type":"tool_result"' in rollout_text
         and '"name":"ping"' in rollout_text
     )
+    for name, passed in checks.items():
+        print(f"{'PASS' if passed else 'FAIL'}  {name}")
+    return checks
+
+
+def steer_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
+    """Mid-turn input: while the first turn streams, Enter queues a message
+    (pending row above the composer, delivered when the turn ends) and
+    Alt+Enter steers one. The steering lands on a tool-less turn, so the
+    core hands it back and the TUI requeues it — the rollout must end up
+    with all three user messages in order, each answered."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+    env = dict(os.environ)
+    env["TERM"] = "xterm-256color"
+    home = tempfile.mkdtemp(prefix="codest-pty-steer-")
+    env["CODEST_HOME"] = home
+    process = subprocess.Popen(
+        [
+            binary,
+            "--tui-mode",
+            mode,
+            "--base-url",
+            base_url,
+            "--api-key",
+            "test-key",
+            "--model",
+            "test-model",
+        ],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave)
+
+    output = bytearray()
+    queued_end = 0
+    steered_end = 0
+    popup_end = 0
+    settled_end = 0
+    try:
+        if not pump(master, output, 1.5):
+            print(f"[{mode}] steer smoke exited during startup", file=sys.stderr)
+            print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
+            return {"steer startup": False}
+        # Turn 1 streams for a couple of seconds (5ms per token); queue and
+        # steer well inside that window.
+        os.write(master, b"hello")
+        pump(master, output, 0.3)
+        os.write(master, b"\r")
+        pump(master, output, 0.6)
+
+        os.write(master, b"queued one")
+        pump(master, output, 0.3)
+        os.write(master, b"\r")
+        pump(master, output, 0.4)
+        queued_end = len(output)
+
+        os.write(master, b"steered one")
+        pump(master, output, 0.3)
+        os.write(master, b"\x1b\r")  # Alt+Enter
+        pump(master, output, 0.4)
+        steered_end = len(output)
+
+        # `/usage` mid-turn opens the floating window over the stream.
+        os.write(master, b"/usage")
+        pump(master, output, 0.3)
+        os.write(master, b"\r")
+        pump(master, output, 0.6)
+        popup_end = len(output)
+        os.write(master, b"\x1b")
+        pump(master, output, 0.3)
+
+        # Settle: turn 1 finishes, the queued turn runs, the returned steer
+        # requeues and runs. Wait for the output rate to drop to spinner
+        # noise, like `tool_smoke` does.
+        previous = -1
+        for _ in range(100):
+            before = len(output)
+            if not pump(master, output, 0.4):
+                break
+            growth = len(output) - before
+            if growth <= 256 and 0 <= previous <= 256:
+                break
+            previous = growth
+        settled_end = len(output)
+
+        for _ in range(3):
+            if process.poll() is not None:
+                break
+            try:
+                os.write(master, b"\x03")
+            except OSError:
+                break
+            pump(master, output, 0.4)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+    screen_queued = render(output[:queued_end].decode("utf-8", "replace"))
+    screen_steered = render(output[:steered_end].decode("utf-8", "replace"))
+    screen_popup = render(output[:popup_end].decode("utf-8", "replace"))
+    screen_settled = render(output[:settled_end].decode("utf-8", "replace"))
+    print(f"--- {mode} screen (pending queue) ---")
+    print(screen_queued)
+    print(f"--- {mode} checks ---")
+
+    # The rollout is the authoritative record: three user messages in order,
+    # each answered by its own assistant message — queue delivered after the
+    # first turn, returned steer requeued behind it.
+    records = []
+    for path in Path(home).glob("sessions/*/rollout-*.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if '"type":"user_message"' not in line and '"type":"assistant_message"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            records.append((record.get("type"), record.get("message", "")))
+    user_texts = [text for kind, text in records if kind == "user_message"]
+    assistant_count = sum(1 for kind, _ in records if kind == "assistant_message")
+    checks = {
+        "queued pending row": "queued · after this turn" in screen_queued,
+        "steer pending row": "steer · next boundary" in screen_steered,
+        # The footer hint degrades whole items on a narrow terminal, so the
+        # queue hint is what a 100-column footer shows mid-turn.
+        "mid-turn footer hint": "Enter queue" in screen_queued,
+        "usage popup opens mid-turn": " usage " in screen_popup,
+        "queued turn delivered": any(text == "queued one" for text in user_texts),
+        "steer requeued and delivered": any(text == "steered one" for text in user_texts),
+        "order kept: hello, queued, steered": user_texts[:3] == ["hello", "queued one", "steered one"],
+        "every message answered": assistant_count >= 3,
+        "transcript settles back to ready": "│  ready" in screen_settled,
+        "clean exit": process.poll() is not None or process.returncode == 0,
+    }
     for name, passed in checks.items():
         print(f"{'PASS' if passed else 'FAIL'}  {name}")
     return checks
@@ -801,6 +940,11 @@ def main() -> int:
         "--skip-tool",
         action="store_true",
         help="skip the tool-calling round-trip scenario",
+    )
+    parser.add_argument(
+        "--skip-steer",
+        action="store_true",
+        help="skip the mid-turn queue/steer scenario",
     )
     args = parser.parse_args()
 
@@ -822,6 +966,11 @@ def main() -> int:
             if not args.skip_tool:
                 print(f"=== {mode}/tool ===")
                 checks = tool_smoke(args.binary, mode, base_url)
+                passed = passed and all(checks.values())
+                print()
+            if not args.skip_steer:
+                print(f"=== {mode}/steer ===")
+                checks = steer_smoke(args.binary, mode, base_url)
                 passed = passed and all(checks.values())
                 print()
     finally:

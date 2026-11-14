@@ -15,6 +15,7 @@ pub mod inline_edit;
 pub mod markdown;
 pub mod prompt_dialog;
 pub mod provider_wizard;
+pub mod report_popup;
 pub mod screen;
 pub mod session;
 pub mod settings_view;
