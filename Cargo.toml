@@ -32,7 +32,14 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 cst-plugin-api = { path = "crates/cst-plugin-api", version = "0.1.0" }
 futures-util = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false }
-ratatui = "0.30"
+# Only the crossterm backend is used (plus TestBackend in tests), so the
+# default set is dropped: `all-widgets` (calendar → `time` crate) and the
+# unused backend crates stay out of the build.
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+] }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "stream",
@@ -66,3 +73,11 @@ libc = "0.2"
 [profile.dev]
 opt-level = 0
 debug = "line-tables-only"
+
+# No `panic = "abort"`: the plugin task runner unwinds caught panics
+# (catch_unwind in src/tui/app.rs), which abort would turn into process death.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

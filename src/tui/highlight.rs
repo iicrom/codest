@@ -68,9 +68,11 @@ const MAX_BLOCK_BYTES: usize = 128 * 1024;
 const MAX_LINE_BYTES: usize = 8 * 1024;
 /// Bounds the cache. Streaming inserts a new variant of the live block on
 /// every delta, so the entry cap is what keeps memory flat while a message
-/// arrives; the byte cap catches a few very large blocks.
-const MAX_CACHE_ENTRIES: usize = 32;
-const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+/// arrives; the byte cap catches a few very large blocks. Sized for a long
+/// session's settled blocks: a smaller cache evicted them round-robin, and
+/// each miss is a full re-tokenize on the next rebuild.
+const MAX_CACHE_ENTRIES: usize = 128;
+const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Tokenize one fenced block of `lines`, returning one segment list per line.
 ///

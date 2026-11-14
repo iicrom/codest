@@ -115,10 +115,32 @@ pub enum HistoryCell {
     Report(ReportBlock),
 }
 
+thread_local! {
+    /// How many times [`HistoryCell::lines`] has run since the last reset.
+    /// The per-cell render cache makes a settled frame cost zero rebuilds;
+    /// the render tests assert on this so a cache regression — a new key
+    /// input, a new call path — fails loudly instead of silently re-rendering
+    /// the whole transcript every frame. Always-on, like cordis's
+    /// `render-stats` counters: one integer increment per render.
+    static RENDER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Total [`HistoryCell::lines`] invocations since process start (test
+/// observability).
+pub fn render_calls() -> usize {
+    RENDER_CALLS.get()
+}
+
+/// Zero the render counter (test observability).
+pub fn reset_render_calls() {
+    RENDER_CALLS.set(0);
+}
+
 impl HistoryCell {
     /// Render this cell into owned lines for a transcript of `width` columns.
     /// `display` carries the per-frame fold flags for the card cells.
     pub fn lines(&self, width: usize, display: &CardDisplay) -> Vec<Line<'static>> {
+        RENDER_CALLS.with(|count| count.set(count.get() + 1));
         match self {
             HistoryCell::User(text) => {
                 prefixed("› ", theme::USER, true, text, Style::default(), width)
@@ -201,11 +223,17 @@ fn tool_card_lines(
     let text_style = Style::default().fg(theme::DIM);
     let glyph = if error.is_some() { "✗" } else { "●" };
     // A structured body gets a deeper budget: a diff row says far more per line
-    // than a row of command output, so cordis caps diff cards at eight.
+    // than a row of command output, so cordis caps diff cards at eight. An
+    // expanded card trades the unbounded budget for head+tail rows around an
+    // omitted marker — unfolding every card must not materialize a whole
+    // 2,000-line `read` window per rebuild.
     let budget = if expanded {
-        usize::MAX
+        tool_body::Budget::HeadTail {
+            head: tool_body::EXPANDED_HEAD_ROWS,
+            tail: tool_body::EXPANDED_TAIL_ROWS,
+        }
     } else {
-        DIFF_BODY_MAX_LINES
+        tool_body::Budget::Head(DIFF_BODY_MAX_LINES)
     };
 
     // The duration chip rides at the end of the header; the argument summary
@@ -234,9 +262,17 @@ fn tool_card_lines(
     let mut lines = vec![Line::from(header)];
 
     // An expanded card keeps the full arguments above the output when the
-    // header had to fold them (a multi-line bash command, typically).
+    // header had to fold them (a multi-line bash command, typically), under
+    // the same head+tail budget as the body.
     if expanded && args.folded && has_summary {
-        lines.extend(gutter_lines(&args.full, width, text_style, &gutter));
+        lines.extend(head_tail_gutter_lines(
+            &args.full,
+            width,
+            tool_body::EXPANDED_HEAD_ROWS,
+            tool_body::EXPANDED_TAIL_ROWS,
+            text_style,
+            &gutter,
+        ));
     }
 
     if let Some(message) = error {
@@ -249,20 +285,23 @@ fn tool_card_lines(
     } else if let Some(body) = tool_body::build(name, arguments, result, budget) {
         lines.extend(body_lines(&body, width, text_style, &gutter));
     } else if !result.trim().is_empty() {
-        let (mut body, hidden) = capped_gutter_lines(
-            result,
-            width,
-            if expanded {
-                usize::MAX
-            } else {
-                TOOL_BODY_MAX_LINES
-            },
-            text_style,
-            &gutter,
-        );
-        if let Some(hint) = fold_hint(hidden, text_style) {
-            body.push(hint);
-        }
+        let body = if expanded {
+            head_tail_gutter_lines(
+                result,
+                width,
+                tool_body::EXPANDED_HEAD_ROWS,
+                tool_body::EXPANDED_TAIL_ROWS,
+                text_style,
+                &gutter,
+            )
+        } else {
+            let (mut body, hidden) =
+                capped_gutter_lines(result, width, TOOL_BODY_MAX_LINES, text_style, &gutter);
+            if let Some(hint) = fold_hint(hidden, text_style) {
+                body.push(hint);
+            }
+            body
+        };
         lines.extend(body);
     } else {
         lines.push(Line::from(vec![
@@ -503,11 +542,25 @@ impl Gutter {
 
 /// Wrap `text` under `gutter`, styling the body with `style`.
 fn gutter_lines(text: &str, width: usize, style: Style, gutter: &Gutter) -> Vec<Line<'static>> {
+    gutter_lines_from(normalize(text).split('\n'), width, style, gutter, true)
+}
+
+/// [`gutter_lines`] over an explicit logical-line iterator. `first_spine`
+/// decides whether the very first row may carry the card's opening bracket —
+/// `false` for a tail fragment, which hangs under the bracket the head
+/// already drew.
+fn gutter_lines_from<'a>(
+    logical: impl Iterator<Item = &'a str>,
+    width: usize,
+    style: Style,
+    gutter: &Gutter,
+    first_spine: bool,
+) -> Vec<Line<'static>> {
     let available = width.saturating_sub(display_width(gutter.first)).max(1);
     let mut lines = Vec::new();
-    for (logical_index, logical) in normalize(text).split('\n').enumerate() {
+    for (logical_index, logical) in logical.enumerate() {
         for (row_index, row) in wrap_str(logical, available).into_iter().enumerate() {
-            let spine = if logical_index == 0 && row_index == 0 {
+            let spine = if first_spine && logical_index == 0 && row_index == 0 {
                 gutter.first
             } else {
                 gutter.rest
@@ -529,6 +582,10 @@ fn gutter_lines(text: &str, width: usize, style: Style, gutter: &Gutter) -> Vec<
 
 /// [`gutter_lines`] limited to `max` logical lines (trailing blanks are not
 /// counted); returns the lines and how many logical lines were hidden.
+///
+/// The count runs first, without materializing anything: a folded card of a
+/// huge result used to allocate every logical line just to know how many of
+/// them it had hidden.
 fn capped_gutter_lines(
     text: &str,
     width: usize,
@@ -536,18 +593,76 @@ fn capped_gutter_lines(
     style: Style,
     gutter: &Gutter,
 ) -> (Vec<Line<'static>>, usize) {
-    let mut logical: Vec<String> = normalize(text).split('\n').map(str::to_owned).collect();
-    while logical.last().is_some_and(|line| line.trim().is_empty()) {
-        logical.pop();
+    let normalized = normalize(text);
+    let total = count_kept_lines(&normalized);
+    if max >= total {
+        return (
+            gutter_lines_from(normalized.split('\n').take(total), width, style, gutter, true),
+            0,
+        );
     }
-    if max >= logical.len() {
-        return (gutter_lines(&logical.join("\n"), width, style, gutter), 0);
-    }
-    let hidden = logical.len() - max;
     (
-        gutter_lines(&logical[..max].join("\n"), width, style, gutter),
-        hidden,
+        gutter_lines_from(
+            normalized.split('\n').take(max),
+            width,
+            style,
+            gutter,
+            true,
+        ),
+        total - max,
     )
+}
+
+/// [`gutter_lines`] under a head+tail budget: the first `head` and last
+/// `tail` logical lines (trailing blanks don't count) around a dim
+/// `… +N lines omitted` marker. The marker is part of the lines, so nothing
+/// is left to hint about once they are shown.
+fn head_tail_gutter_lines(
+    text: &str,
+    width: usize,
+    head: usize,
+    tail: usize,
+    style: Style,
+    gutter: &Gutter,
+) -> Vec<Line<'static>> {
+    let normalized = normalize(text);
+    let total = count_kept_lines(&normalized);
+    if total <= head + tail {
+        return gutter_lines_from(normalized.split('\n').take(total), width, style, gutter, true);
+    }
+    let hidden = total - head - tail;
+    let mut lines = gutter_lines_from(normalized.split('\n').take(head), width, style, gutter, true);
+    lines.push(Line::from(vec![
+        Span::styled(gutter.rest.to_string(), gutter.style),
+        Span::styled(
+            format!(" … +{hidden} lines omitted"),
+            Style::default().fg(theme::DIM),
+        ),
+    ]));
+    lines.extend(gutter_lines_from(
+        normalized.split('\n').skip(total - tail).take(tail),
+        width,
+        style,
+        gutter,
+        false,
+    ));
+    lines
+}
+
+/// How many logical lines [`gutter_lines`] would wrap for `normalized`,
+/// trailing blank lines excluded — one scan, no per-line allocation.
+fn count_kept_lines(normalized: &str) -> usize {
+    let mut total = 0usize;
+    let mut trailing_blanks = 0usize;
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            trailing_blanks += 1;
+        } else {
+            trailing_blanks = 0;
+        }
+        total += 1;
+    }
+    total - trailing_blanks
 }
 
 /// Render a plugin report the way reference TUIs style their loaded-context

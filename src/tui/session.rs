@@ -10,8 +10,9 @@
 use crate::core::protocol::Role;
 use crate::core::rollout::LoadedSession;
 use crate::tui::TuiMode;
-use crate::tui::chat::HistoryCell;
+use crate::tui::chat::{CardDisplay, HistoryCell};
 use crate::tui::wrap::char_width;
+use ratatui::text::Line;
 use std::time::Instant;
 
 /// A tool call that is executing right now, rendered as a live card (spinner
@@ -26,9 +27,36 @@ pub struct RunningTool {
     pub started_at: Instant,
 }
 
+/// What a cached cell render depends on. A settled cell is immutable — it
+/// never changes once pushed — so the only inputs that can change its lines
+/// are the viewport width and the two fold flags. codex keys its
+/// active-cell layout cache on (identity, revision, width, render mode,
+/// theme); the identity and revision halves are unnecessary here because
+/// cached cells are only replaced on a key mismatch, never merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellRenderKey {
+    width: usize,
+    display: CardDisplay,
+}
+
+/// A cached render of one history cell.
+struct RenderedCell {
+    key: CellRenderKey,
+    lines: Vec<Line<'static>>,
+}
+
 /// Rendered state of one recorded conversation.
 pub struct SessionView {
     pub history: Vec<HistoryCell>,
+    /// Cached renders parallel to `history`, filled lazily by
+    /// [`Self::cell_lines`]. The transcript used to re-render every cell on
+    /// every frame — for a settled transcript that is thousands of wasted
+    /// markdown, JSON and wrap rebuilds per keystroke. Settled lines are now
+    /// reused until the width or the fold flags change. The slot count is
+    /// re-synced with `history` on every access: pushed cells have no cache
+    /// yet, and a cleared or spliced history truncates stale entries, so no
+    /// explicit invalidation is required for either.
+    rendered: Vec<Option<RenderedCell>>,
     /// Assistant text currently streaming (not yet committed to history).
     pub live: Option<String>,
     /// Thinking text currently streaming for this turn. Display-only: it is
@@ -71,6 +99,46 @@ pub struct SessionView {
 }
 
 impl SessionView {
+    /// Keep the cache slots aligned with `history`: pushes leave holes, a
+    /// clear or splice truncates whatever no longer has a cell.
+    fn sync_rendered(&mut self) {
+        self.rendered.resize_with(self.history.len(), || None);
+    }
+
+    /// The lines of cell `index` at `width` under `display`, rebuilt only
+    /// when the cached width or fold flags no longer match. Settled cells
+    /// are immutable, so a hit is always current content.
+    pub fn cell_lines(
+        &mut self,
+        index: usize,
+        width: usize,
+        display: &CardDisplay,
+    ) -> &[Line<'static>] {
+        self.sync_rendered();
+        let key = CellRenderKey {
+            width,
+            display: *display,
+        };
+        if !matches!(&self.rendered[index], Some(rendered) if rendered.key == key) {
+            let lines = self.history[index].lines(width, display);
+            self.rendered[index] = Some(RenderedCell { key, lines });
+        }
+        self.rendered[index]
+            .as_ref()
+            .expect("render just stored or cached")
+            .lines
+            .as_slice()
+    }
+
+    /// Drop the cached render of one cell. Used by inline mode once a cell's
+    /// lines went to scrollback: they can never render again, so holding
+    /// them would only grow memory with the session.
+    pub fn drop_cell_render(&mut self, index: usize) {
+        if index < self.rendered.len() {
+            self.rendered[index] = None;
+        }
+    }
+
     /// The first session, which carries the startup banner.
     pub fn initial(model_label: &str, mode: TuiMode) -> Self {
         let mut view = Self::empty();
@@ -177,6 +245,7 @@ impl SessionView {
     fn empty() -> Self {
         Self {
             history: Vec::new(),
+            rendered: Vec::new(),
             live: None,
             live_thinking: None,
             running_tool: None,

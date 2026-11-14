@@ -118,6 +118,15 @@ const ALT_WHEEL_LINES: usize = 15;
 /// glance, gone before it can accumulate.
 const STATUS_TTL: Duration = Duration::from_millis(2_000);
 
+/// Frame budget: at most one screen render per interval. Everything an event
+/// burst mutates — streaming deltas, wheel notches, queued notices — lands in
+/// one frame instead of paying a full transcript rebuild per event. codex
+/// runs the same coalescing behind a 120 fps cap ([`tui/frame_rate_limiter`]);
+/// this UI's only animation is the 90 ms spinner, so 60 fps is generous.
+///
+/// [`tui/frame_rate_limiter`]: https://github.com/openai/codex
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 /// The profile side of startup: the whole `profiles.toml` table (for
 /// `/profile` listing and `Op::SwitchProfile` lookups) plus the name this
 /// run started with (`--profile`). The active profile's tool filter is
@@ -631,6 +640,13 @@ struct App {
     command_menu_dismissed: bool,
     busy: bool,
     tick: usize,
+    /// Set by every event that may change what the screen shows. The event
+    /// loop draws once per [`MIN_FRAME_INTERVAL`] while it stands, so bursts
+    /// coalesce; idle ticks leave it unset and nothing renders at all.
+    needs_redraw: bool,
+    /// When the last frame went out — the reference the frame budget is
+    /// measured against. Backdated at startup so the first frame is immediate.
+    last_draw: Instant,
     quit: bool,
     /// Plugin status segments (`plugin:key` → segment), in registration
     /// order. `[status_bar] order` decides display priority at render time.
@@ -819,6 +835,10 @@ impl App {
             command_menu_dismissed: false,
             busy: false,
             tick: 0,
+            needs_redraw: true,
+            last_draw: Instant::now()
+                .checked_sub(MIN_FRAME_INTERVAL)
+                .unwrap_or_else(Instant::now),
             quit: false,
             status_segments: Vec::new(),
             status_bar,
@@ -886,11 +906,30 @@ impl App {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
-            self.draw(terminal)?;
             if self.quit {
+                // One final frame before tearing the screen down: a plugin
+                // (or the worker) quitting right after it pushed a notice
+                // still gets the notice flushed to scrollback, like the
+                // pre-coalescing loop that drew once per iteration.
+                if self.needs_redraw {
+                    self.draw(terminal)?;
+                }
                 break;
             }
+            // Render at most once per frame budget while the dirty flag
+            // stands. A delta burst arriving faster than the budget produces
+            // one draw for the whole burst instead of one full transcript
+            // rebuild per event.
+            if self.needs_redraw && self.last_draw.elapsed() >= MIN_FRAME_INTERVAL {
+                self.draw(terminal)?;
+                self.needs_redraw = false;
+                self.last_draw = Instant::now();
+            }
 
+            // Wake at the frame boundary so a dirty flag raised inside the
+            // current budget still gets its draw; a clean (idle) frame is not
+            // woken at all and waits on real events.
+            let next_frame = self.last_draw + MIN_FRAME_INTERVAL;
             tokio::select! {
                 maybe_event = events.next() => {
                     match maybe_event {
@@ -898,18 +937,21 @@ impl App {
                         Some(Err(error)) => return Err(error.into()),
                         None => break,
                     }
+                    self.needs_redraw = true;
                 }
                 maybe_event = self.session.next_event() => {
                     match maybe_event {
                         Some(event) => self.handle_agent_event(event),
                         None => break,
                     }
+                    self.needs_redraw = true;
                 }
                 maybe_task = self.provider_tasks.recv(), if !self.provider_tasks_closed => {
                     match maybe_task {
                         Some(task) => self.handle_provider_task(task),
                         None => self.provider_tasks_closed = true,
                     }
+                    self.needs_redraw = true;
                 }
                 maybe_notice = self.notices.recv(), if !self.notices_closed => {
                     match maybe_notice {
@@ -918,6 +960,7 @@ impl App {
                         }
                         None => self.notices_closed = true,
                     }
+                    self.needs_redraw = true;
                 }
                 maybe_effect = self.plugin_effects.recv(), if !self.plugin_effects_closed => {
                     // What plugin background tasks send lands here, one
@@ -927,7 +970,9 @@ impl App {
                         Some(effect) => self.apply_effects(vec![effect]),
                         None => self.plugin_effects_closed = true,
                     }
+                    self.needs_redraw = true;
                 }
+                _ = tokio::time::sleep_until(next_frame.into()), if self.needs_redraw => {}
                 _ = ticker.tick() => self.on_tick(),
             }
         }
@@ -1147,9 +1192,15 @@ impl App {
             view.live_committed = 0;
         }
 
-        // Transcript cells that have not been written to scrollback yet.
+        // Transcript cells that have not been written to scrollback yet. Each
+        // cell flushes exactly once, so its cached render is dropped right
+        // after: scrollback can never ask for those lines again, and keeping
+        // them would make the cache grow with the session for no benefit.
         while view.printed_cells < view.history.len() {
-            pending.extend(view.history[view.printed_cells].lines(width, &display));
+            let index = view.printed_cells;
+            let lines = view.cell_lines(index, width, &display);
+            pending.extend(lines.iter().cloned());
+            view.drop_cell_render(index);
             pending.push(Line::from(""));
             view.printed_cells += 1;
         }
@@ -1464,17 +1515,22 @@ impl App {
     }
 
     fn on_tick(&mut self) {
+        // Only visible movement redraws now: the spinner while a turn runs,
+        // and an ephemeral footer message reaching its expiry. An idle
+        // session ticks without ever dirtying a frame.
         if self.busy {
             self.tick = self.tick.wrapping_add(1);
+            self.needs_redraw = true;
         }
-        // The footer message is time-boxed: the loop redraws on every tick, so
-        // dropping it here is all it takes for the hint row to come back.
+        // The footer message is time-boxed: dropping it here is all it takes
+        // for the hint row to come back on the next dirty frame.
         if self
             .status
             .as_ref()
             .is_some_and(|(_, until)| Instant::now() >= *until)
         {
             self.status = None;
+            self.needs_redraw = true;
         }
     }
 
@@ -3500,57 +3556,73 @@ impl App {
         let spinner = chat::SPINNER[self.tick % chat::SPINNER.len()];
         let view = self.view_mut();
 
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push(Line::from(""));
-
-        // Where the last report cell starts, for the park-on-report scroll
-        // below (the row count is only known here, at this width).
+        // Per-cell line counts and absolute start rows. `cell_lines` fills
+        // the per-cell render cache, so settled cells only re-render when the
+        // width or the fold flags changed; a cache hit costs one length read.
+        // The transcript used to be rebuilt wholesale on every frame — which
+        // is why long sessions slowed every keystroke down.
+        let mut starts = Vec::with_capacity(view.history.len());
+        let mut counts = Vec::with_capacity(view.history.len());
+        let mut abs = 1usize; // the leading blank line
         let mut last_report_start = None;
-        for (index, cell) in view.history.iter().enumerate() {
-            if matches!(cell, HistoryCell::Report(_)) {
-                last_report_start = Some(lines.len());
+        for index in 0..view.history.len() {
+            if matches!(view.history[index], HistoryCell::Report(_)) {
+                // Where the last report cell starts, for the park-on-report
+                // scroll below (the row count is only known here, at this
+                // width).
+                last_report_start = Some(abs);
             }
-            lines.extend(cell.lines(width, &display));
-            let has_more = index + 1 < view.history.len() || view.live.is_some();
-            if has_more {
+            starts.push(abs);
+            let count = view.cell_lines(index, width, &display).len();
+            counts.push(count);
+            abs += count;
+            if index + 1 < view.history.len() || view.live.is_some() {
+                abs += 1; // the blank separator row after the cell
+            }
+        }
+        let history_end = abs;
+
+        // The live tail is still mutating, so it renders every frame. It is
+        // one streaming message at most — bounded, unlike the history.
+        let running_part = match &view.running_tool {
+            Some(running) => {
+                let elapsed =
+                    chat::format_duration(running.started_at.elapsed().as_millis() as u64);
+                let mut lines = chat::running_tool_lines(
+                    &running.name,
+                    &running.arguments,
+                    &elapsed,
+                    spinner,
+                    width,
+                );
                 lines.push(Line::from(""));
+                Some(lines)
             }
-        }
-
-        // The tool call currently executing, between the committed history
-        // and whatever the next round streams.
-        if let Some(running) = &view.running_tool {
-            let elapsed = chat::format_duration(running.started_at.elapsed().as_millis() as u64);
-            lines.extend(chat::running_tool_lines(
-                &running.name,
-                &running.arguments,
-                &elapsed,
-                spinner,
-                width,
-            ));
-            lines.push(Line::from(""));
-        }
-
+            None => None,
+        };
         // The thinking block still streaming for this turn, above the
         // assistant text it precedes.
-        if let Some(thinking) = &view.live_thinking
-            && !thinking.is_empty()
-        {
-            lines.extend(chat::thinking_live_lines(
-                thinking,
-                width,
-                display.thinking,
-                spinner,
-            ));
-            lines.push(Line::from(""));
-        }
+        let thinking_part = match &view.live_thinking {
+            Some(thinking) if !thinking.is_empty() => {
+                let mut lines =
+                    chat::thinking_live_lines(thinking, width, display.thinking, spinner);
+                lines.push(Line::from(""));
+                Some(lines)
+            }
+            _ => None,
+        };
+        let live_part = view
+            .live
+            .as_ref()
+            .map(|live| chat::assistant_lines(live, width, busy));
 
-        if let Some(live) = &view.live {
-            lines.extend(chat::assistant_lines(live, width, busy));
-        }
+        let total = history_end
+            + running_part.as_ref().map_or(0, Vec::len)
+            + thinking_part.as_ref().map_or(0, Vec::len)
+            + live_part.as_ref().map_or(0, Vec::len);
 
         let height = area.height as usize;
-        view.max_scroll = lines.len().saturating_sub(height);
+        view.max_scroll = total.saturating_sub(height);
 
         if view.park_on_last_report {
             // A report was just appended: show its first line. Doing it here
@@ -3567,9 +3639,42 @@ impl App {
             view.scroll = view.scroll.min(view.max_scroll);
         }
 
-        let start = view.scroll.min(lines.len());
-        let end = (start + height).min(lines.len());
-        let visible = lines[start..end].to_vec();
+        // Materialize only the viewport slice: cells outside the window
+        // contribute their cached rows to the layout math but are never
+        // cloned into a frame.
+        let start = view.scroll.min(total);
+        let end = (start + height).min(total);
+        let mut visible: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(start));
+
+        if start == 0 && end > 0 {
+            visible.push(Line::from(""));
+        }
+        for index in 0..view.history.len() {
+            let cell_start = starts[index];
+            let count = counts[index];
+            if cell_start < end && start < cell_start + count {
+                let lines = view.cell_lines(index, width, &display);
+                let from = start.saturating_sub(cell_start).min(count);
+                let to = (end - cell_start).min(count);
+                visible.extend(lines[from..to].iter().cloned());
+            }
+            // The separator row sits exactly at the cell's end, whenever a
+            // cell or live text follows it.
+            let sep = index + 1 < view.history.len() || view.live.is_some();
+            if sep && start <= cell_start + count && cell_start + count < end {
+                visible.push(Line::from(""));
+            }
+        }
+        let mut part_start = history_end;
+        for part in [running_part, thinking_part, live_part].into_iter().flatten() {
+            let part_end = part_start + part.len();
+            if part_start < end && start < part_end {
+                let from = start.saturating_sub(part_start).min(part.len());
+                let to = (end - part_start).min(part.len());
+                visible.extend(part[from..to].iter().cloned());
+            }
+            part_start = part_end;
+        }
 
         frame.render_widget(Paragraph::new(Text::from(visible)), area);
     }
@@ -4843,6 +4948,110 @@ mod tests {
                 line.trim_end().to_string()
             })
             .collect()
+    }
+
+    /// A settled `read` card whose window the tool capped at 2,000 lines —
+    /// the shape that made long sessions unusable when every frame rebuilt
+    /// every cell.
+    fn app_with_big_read() -> App {
+        let mut app = test_app();
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("hello".to_string()));
+        let big: String = (1..=2000)
+            .map(|n| format!("{n:6}\tline {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.view_mut().history.push(HistoryCell::ToolCall {
+            name: "read".to_string(),
+            arguments: r#"{"path": "src/big.rs"}"#.to_string(),
+            result: big,
+            error: None,
+            duration_ms: Some(1_000),
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn settled_frames_reuse_cached_cell_renders() {
+        let mut app = app_with_big_read();
+
+        // The first render builds every cell once…
+        let _ = render_lines(&mut app, 110, 20);
+        let cells = app.view().history.len();
+        chat::reset_render_calls();
+
+        // …and a settled frame at the same width and fold flags rebuilds none
+        // of them, however much history sits above the viewport.
+        let _ = render_lines(&mut app, 110, 20);
+        assert_eq!(chat::render_calls(), 0, "a settled frame must not rebuild cells");
+
+        // Toggling a fold flag re-renders each cell exactly once — the
+        // expanded card is bounded by the head+tail budget, not the window.
+        app.show_tool_detail = true;
+        chat::reset_render_calls();
+        let _ = render_lines(&mut app, 110, 20);
+        assert_eq!(chat::render_calls(), cells);
+
+        // A width change behaves the same way, one rebuild per cell.
+        app.show_tool_detail = false;
+        chat::reset_render_calls();
+        let _ = render_lines(&mut app, 90, 20);
+        assert_eq!(chat::render_calls(), cells);
+    }
+
+    #[tokio::test]
+    async fn an_expanded_read_card_is_bounded_by_the_head_tail_budget() {
+        let mut app = app_with_big_read();
+        let display = chat::CardDisplay {
+            thinking: false,
+            tool_detail: true,
+        };
+        // The read card is the last cell (three banner notices precede it).
+        let card = app.view().history.len() - 1;
+        let lines = app.view_mut().cell_lines(card, 108, &display);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("… +1750 lines omitted"),
+            "the marker names what the budget hid: {joined}"
+        );
+        // 200 head rows + the marker + 50 tail rows, under the header.
+        assert!(lines.len() <= 260, "expanded card stays bounded: {}", lines.len());
+        assert!(
+            joined.contains("line 2000"),
+            "the tail rows are the true end of the output: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folded_read_card_keeps_its_hint_and_shows_no_marker() {
+        let mut app = app_with_big_read();
+        let display = chat::CardDisplay {
+            thinking: false,
+            tool_detail: false,
+        };
+        let card = app.view().history.len() - 1;
+        let lines = app.view_mut().cell_lines(card, 108, &display);
+        let joined = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        assert!(joined.contains("ctrl+o to expand"), "{joined}");
+        assert!(!joined.contains("lines omitted"), "{joined}");
     }
 
     #[tokio::test]
