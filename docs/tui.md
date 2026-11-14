@@ -22,7 +22,7 @@ CST_TUI_MODE=inline codest
 
 ### Scrolling
 
-In `fullscreen` the transcript lives in an application-scrolled viewport: the mouse wheel moves 3 lines per notch, `Alt`+wheel moves 15, and `PgUp`/`PgDn` move 5 lines per press. Because the app repaints the viewport, the transcript can be longer than the screen and still be browsed in both directions.
+In `fullscreen` the transcript lives in an application-scrolled viewport: the mouse wheel moves 3 lines per notch, `Alt`+wheel moves 15, and `PgUp`/`PgDn` move 5 lines per press. Because the app repaints the viewport, the transcript can be longer than the screen and still be browsed in both directions. Scrolling up detaches the viewport from the tail; `Ctrl+End` jumps back to the newest line and re-attaches it.
 
 In `inline` the app never scrolls anything: `PgUp`/`PgDn` are handed straight to the terminal, which scrolls its own scrollback. While a turn runs, the inline pane keeps at most four rows of the still-streaming tail pinned to the bottom — a fixed height, so a block growing row by row cannot scroll its own already-drawn head into the scrollback and later duplicate it. Once the block settles, its lines are promoted into the scrollback for real.
 
@@ -34,7 +34,7 @@ Both modes arrange the same four bands, top to bottom: transcript, menu band, co
 - **Menu band.** The slash-command candidate popup, or one of the pickers (`/sessions`, `/model`, `/effort`, `/tools`) while one is open. It collapses to zero rows when nothing needs it. The `/provider` wizard renders here too, as a set of option lines rather than an overlay. The full-frame screens (`/context`, `/settings`) replace the whole layout instead of occupying the band.
 - **Full-frame screens.** `/settings` and `/context` share one frame (`src/tui/screen.rs`): a header with an `n/m` counter, a scrolling list, an optional fixed panel (the `/context` inspector), a rule, a notice line, and a help bar. In both, `↑`/`↓` walk the list and wrap at the ends — `↑` on the first row lands on the last, `↓` on the last lands on the first — and the mouse wheel scrolls the list without moving the selection, so browsing never changes what a key would act on. The next keyboard step re-anchors the viewport on the selection.
 - **Composer.** A multi-line editor with a single top border and a `› ` prompt in its own two-column gutter, capped at eight visible rows; longer input scrolls inside it. Bracketed paste is enabled, so a multi-line paste lands as text instead of a burst of keystrokes.
-- **Footer.** The left side reads `codest · <provider/model> · effort <level> · <context>`, then a `│` and the state word — `ready`, or a spinner with `working · Esc interrupt` while a turn runs. The context readout is always present: `used/window (n%)` once both are known, `—/window` when only the window is, `used tok` when only usage is, and `—` when neither is known yet. It tracks each streaming round as it reports usage, so a long tool round never leaves it stale, and the completed turn settles it. The right side is the hint line for the current context; a transient message such as `thinking expanded` takes its place for a couple of seconds.
+- **Footer.** The left side reads `codest · <provider/model> · effort <level> · <context>`, then a `│` and the state word — `ready`, or a spinner with `working · Esc interrupt` while a turn runs. The context readout is always present: `used/window (n%)` once both are known, `—/window` when only the window is, `used tok` when only usage is, and `—` when neither is known yet. It tracks each streaming round as it reports usage, so a long tool round never leaves it stale, and the completed turn settles it. The right side is the hint line for the current context; a transient message such as `thinking expanded` takes its place for a couple of seconds. On a narrow terminal the hints degrade by whole items — the list is cut at an `·` boundary rather than mid-word, so `Enter send · / commands` becomes `Enter send` instead of `Enter send · / comma`.
 
 A terminal resize redraws on the next frame; in `fullscreen` everything re-wraps to the new width, while in `inline` only the rows that have not yet reached the scrollback do (see [Known limitations](development.md#known-limitations)).
 
@@ -101,19 +101,20 @@ Every tool call renders as its own card:
 
 ```text
 ● bash(cargo build) · 4.2s   # `pwsh(...)` on a Windows host
- ⎿  Compiling codest
-    … +3 lines (ctrl+o to expand)
+ ┌  Compiling codest
+ │  Finished `dev` profile
+ └  … +3 lines (ctrl+o to expand)
 ```
 
-The header is `● name(args) · duration`, with the name in the tool's category color and the `⎿` spine tinted to match. The body previews the first 3 lines; `Ctrl+O` expands and collapses the full output. While the call is still running, a braille spinner occupies the status-glyph slot and an elapsed-time row hangs under the spine. Failures swap `●` for `✗` and render the message in the error color in place of output. When the argument summary had to fold (a multi-line command, typically), expanding restores the full arguments above the output.
+The header is `● name(args) · duration`, with the name in the tool's category color and the body frame tinted to match. The body is a box in one box-drawing set — `┌` opens it, `│` carries its rows, `└` closes it — so its corners and its rail line up on one column and a body of any depth hangs together. The body previews the first 3 lines; `Ctrl+O` expands and collapses the full output. While the call is still running, a braille spinner occupies the status-glyph slot and its single elapsed row is the closed box under the header. Failures swap `●` for `✗` and render the message in the error color in place of output. When the argument summary had to fold (a multi-line command, typically), expanding restores the full arguments above the output.
 
 The file tools render a **structured body** instead of their result text, because they know more than it does — a `write`/`edit` card shows a highlighted `-`/`+` excerpt over a `(+N -M)` stat row, and a `read` card shows its numbered window under a dim number column:
 
 ```text
 ● edit(src/tui/chat.rs) · 1.2s
- ⎿    (+2 -1) replaced 1 occurrence
-    - fn body(…) { dim }
-    + fn body(…) { highlighted }
+ ┌    (+2 -1) replaced 1 occurrence
+ │  - fn body(…) { dim }
+ └  + fn body(…) { highlighted }
 ```
 
 Those bodies fold at 8 rows rather than 3, are highlighted by the file's extension, and wrap at the column budget like code. [tools.md](tools.md#file-tool-bodies) has the details.

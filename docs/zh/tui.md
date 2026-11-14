@@ -22,7 +22,7 @@ CST_TUI_MODE=inline codest
 
 ### 滚动
 
-`fullscreen` 下 transcript 位于应用自管的滚动视口：滚轮每格 3 行，`Alt`+滚轮 15 行，`PgUp`/`PgDn` 每次 5 行。应用重绘视口，所以 transcript 可以长于屏幕、上下都能浏览。
+`fullscreen` 下 transcript 位于应用自管的滚动视口：滚轮每格 3 行，`Alt`+滚轮 15 行，`PgUp`/`PgDn` 每次 5 行。应用重绘视口，所以 transcript 可以长于屏幕、上下都能浏览。向上滚动会脱离尾部跟随，`Ctrl+End` 跳回最新一行并重新跟随。
 
 `inline` 下应用不做任何滚动：`PgUp`/`PgDn` 直接交给终端，由终端滚动自己的 scrollback。回合进行中，inline 面板在底部最多保留四行仍在流式生长的尾部，高度固定——因此逐行增长的块不会把自己已经画好的开头滚进 scrollback、事后又重复输出一次。块定型后，这些行才真正晋升进 scrollback。
 
@@ -34,7 +34,7 @@ CST_TUI_MODE=inline codest
 - **菜单带。** slash 指令候选弹窗，或打开中的某个选择器（`/sessions`、`/model`、`/effort`、`/tools`）。没有内容需要它时收缩为零行。`/provider` 向导也渲染在这里，是一组选项行而不是覆盖层。整帧界面（`/context`、`/settings`）则整体替换布局，而不是占用这条带。
 - **整帧界面。** `/settings` 与 `/context` 共用同一套框架（`src/tui/screen.rs`）：带 `n/m` 计数器的头部、可滚动的列表、可选的固定面板（`/context` 的检视区）、分隔线、提示行和帮助栏。两者都是 `↑`/`↓` 在列表中移动并在两端循环——第一行按 `↑` 跳到末行，末行按 `↓` 跳回首行——滚轮只滚动列表、不移动选择，所以浏览不会改变按键作用的对象；下一次按键会把视口重新锚定到选择上。
 - **输入框。** 多行编辑器，只有一条上边框，`› ` 提示符占自己的两列 gutter，最多显示八行；更长的输入在内部滚动。开启了 bracketed paste，多行粘贴作为文本落入，而不是一串按键。
-- **Footer。** 左侧是 `codest · <provider/model> · effort <等级> · <上下文>`，然后一个 `│` 和状态词——`ready`，或回合进行中的转轮加 `working · Esc interrupt`。上下文读数始终存在：两值都已知时是 `used/window (n%)`，只知道窗口时是 `—/window`，只知道用量时是 `used tok`，两者都未知时是 `—`。它随每个流式回合报出的 usage 更新，长工具轮次期间也不会停在旧值，回合结束后由完成的那次 usage 定稿。右侧是当前情境的提示行；`thinking expanded` 这类短暂反馈会临时占位两秒左右。
+- **Footer。** 左侧是 `codest · <provider/model> · effort <等级> · <上下文>`，然后一个 `│` 和状态词——`ready`，或回合进行中的转轮加 `working · Esc interrupt`。上下文读数始终存在：两值都已知时是 `used/window (n%)`，只知道窗口时是 `—/window`，只知道用量时是 `used tok`，两者都未知时是 `—`。它随每个流式回合报出的 usage 更新，长工具轮次期间也不会停在旧值，回合结束后由完成的那次 usage 定稿。右侧是当前情境的提示行；`thinking expanded` 这类短暂反馈会临时占位两秒左右。窄终端上提示按整条裁剪——在 `·` 边界切开而不是从词中间截断，所以 `Enter send · / commands` 会变成 `Enter send`，而不是 `Enter send · / comma`。
 
 终端 resize 在下一帧重绘；`fullscreen` 下全部按新宽度重新换行，`inline` 下只有尚未进入 scrollback 的行会重排（见[已知边界](development.md#已知边界)）。
 
@@ -101,19 +101,20 @@ CST_TUI_MODE=inline codest
 
 ```text
 ● bash(cargo build) · 4.2s   # Windows 宿主上是 `pwsh(...)`
- ⎿  Compiling codest
-    … +3 lines (ctrl+o to expand)
+ ┌  Compiling codest
+ │  Finished `dev` profile
+ └  … +3 lines (ctrl+o to expand)
 ```
 
-头部是 `● name(args) · duration`，工具名用所属类别的颜色，`⎿` 脊线同色。正文预览前 3 行；`Ctrl+O` 展开/折叠完整输出。调用仍在执行时，转轮占据状态图标位，耗时行挂在脊线下方。失败时 `●` 换成 `✗`，错误信息以错误色代替输出显示。参数摘要被折叠时（典型是多行命令），展开会在输出上方恢复完整参数。
+头部是 `● name(args) · duration`，工具名用所属类别的颜色，正文外框同色。正文用同一套制表符画成一个框——`┌` 起头、`│` 承载中间行、`└` 收尾——折角与竖线落在同一列，因此多深的正文都连成一块。正文预览前 3 行；`Ctrl+O` 展开/折叠完整输出。调用仍在执行时，转轮占据状态图标位，耗时行作为收尾的框挂在标题下方。失败时 `●` 换成 `✗`，错误信息以错误色代替输出显示。参数摘要被折叠时（典型是多行命令），展开会在输出上方恢复完整参数。
 
 文件类工具渲染 **结构化正文** 而不是结果文本，因为它们比结果字符串知道得更多——`write`/`edit` 卡片显示高亮的 `-`/`+` 节选并配一条 `(+N -M)` 统计行，`read` 卡片把带编号的窗口放在暗色行号列下：
 
 ```text
 ● edit(src/tui/chat.rs) · 1.2s
- ⎿    (+2 -1) replaced 1 occurrence
-    - fn body(…) { dim }
-    + fn body(…) { highlighted }
+ ┌    (+2 -1) replaced 1 occurrence
+ │  - fn body(…) { dim }
+ └  + fn body(…) { highlighted }
 ```
 
 这类正文折叠到 8 行而不是 3 行，按文件扩展名语法高亮，并像代码一样按列宽硬折行。细节见 [tools.md](tools.md#文件类工具的正文)。

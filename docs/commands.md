@@ -89,6 +89,7 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 | `Ctrl+U` / `Ctrl+K` | Kill to line start / end. |
 | Mouse wheel (fullscreen) | Scroll the transcript (3 lines per notch; `Alt`+wheel = 15). |
 | `PageUp` / `PageDown` | Scroll the transcript (fullscreen); handed to the terminal in inline mode. |
+| `Ctrl+End` | Jump to the newest line and resume following (fullscreen); `End` alone in inline mode. |
 | `Esc` | Close the candidate popup; interrupt the turn while generating. |
 | `Ctrl+T` | Expand/collapse thinking cards. |
 | `Ctrl+O` | Expand/collapse tool output (folded preview shows the first 3 lines). |
@@ -97,7 +98,7 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 
 ### Notes
 
-- **Fullscreen vs inline.** `PageUp`/`PageDown` belong to the app only in `fullscreen`, where it owns the alternate screen. In `inline` the terminal owns the scrollback, so those keys are passed through to it.
+- **Fullscreen vs inline.** `PageUp`/`PageDown` belong to the app only in `fullscreen`, where it owns the alternate screen. In `inline` the terminal owns the scrollback, so those keys are passed through to it. `Ctrl+End` follows the same rule: it jumps the fullscreen viewport back to the newest line and re-arms follow mode, and in `inline` it stays a plain end-of-input cursor move.
 - **`Ctrl+T` is `/thinking`.** Both toggle whether thinking cards are expanded when settled; the card itself is always recorded.
 - **`Ctrl+O` folds tool output.** The card body shows the first 3 lines plus `… +N lines (ctrl+o to expand)`; `Ctrl+O` applies to all tool cards in the transcript.
 - **`Ctrl+C` has three states.** While generating it interrupts the turn; with text in the composer it clears the input; on empty input it must be pressed twice in quick succession to quit.

@@ -89,6 +89,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | `Ctrl+U` / `Ctrl+K` | 删除到行首 / 行尾。 |
 | 滚轮（fullscreen） | 滚动 transcript（每格 3 行，`Alt`+滚轮 15 行）。 |
 | `PageUp` / `PageDown` | 滚动 transcript（fullscreen）；inline 下交给终端。 |
+| `Ctrl+End` | 跳到最新一行并恢复跟随（fullscreen）；inline 下等同 `End`。 |
 | `Esc` | 关闭候选；生成中则中断当前回合。 |
 | `Ctrl+T` | 展开/折叠 thinking 卡片。 |
 | `Ctrl+O` | 展开/折叠工具输出（折叠时显示前 3 行预览）。 |
@@ -97,7 +98,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 
 ### 说明
 
-- **fullscreen 与 inline 的差异。** `PageUp`/`PageDown` 只在 `fullscreen` 归应用处理——它持有 alternate screen。`inline` 下 scrollback 归终端所有，因此这两个键直接交给终端。
+- **fullscreen 与 inline 的差异。** `PageUp`/`PageDown` 只在 `fullscreen` 归应用处理——它持有 alternate screen。`inline` 下 scrollback 归终端所有，因此这两个键直接交给终端。`Ctrl+End` 同理：fullscreen 下把视口跳回最新一行并恢复跟随模式，inline 下仍是普通的移动到输入末尾。
 - **`Ctrl+T` 就是 `/thinking`。** 两者都切换 thinking 卡片定型后是否展开；卡片本身始终被记录。
 - **`Ctrl+O` 折叠工具输出。** 卡片正文显示前 3 行，其余折叠为 `… +N lines (ctrl+o to expand)`；`Ctrl+O` 作用于 transcript 中全部工具卡片。
 - **`Ctrl+C` 有三种状态。** 生成中中断当前回合；输入框有文本时清空输入；空输入时必须快速连按两次才退出。
