@@ -6,6 +6,7 @@
 //! works without racing the submission queue.
 
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -65,6 +66,44 @@ impl InterruptHandle {
             && let Some(token) = current.as_ref()
         {
             token.cancel();
+        }
+    }
+}
+
+/// Shared inbox for messages steered into the running turn.
+///
+/// The submission channel is only read between turns, so a mid-turn message
+/// sent there would wait out the whole turn. A steer takes the direct path:
+/// the worker owns the receiving end for the whole run, and [`run_turn`]
+/// drains it at every step boundary — after a tool round's results are
+/// recorded, before the next model request is assembled — appending each
+/// message to the conversation. Whatever never reaches a boundary (the turn
+/// completed, errored, or was aborted first) is handed back to the
+/// front-end as [`EventMsg::SteerUnclaimed`] rather than dropped.
+#[derive(Debug, Clone, Default)]
+pub struct SteerHandle {
+    tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+}
+
+impl SteerHandle {
+    fn install(&self, tx: mpsc::UnboundedSender<String>) {
+        if let Ok(mut current) = self.tx.lock() {
+            *current = Some(tx);
+        }
+    }
+
+    /// Offer `text` to the running turn. `false` means nothing can claim it
+    /// (the channel is closed or the lock is poisoned); the caller should
+    /// queue a regular turn instead.
+    pub fn steer(&self, text: impl Into<String>) -> bool {
+        match self.tx.lock() {
+            Ok(guard) => {
+                let Some(tx) = guard.as_ref() else {
+                    return false;
+                };
+                tx.send(text.into()).is_ok()
+            }
+            Err(_) => false,
         }
     }
 }
@@ -170,6 +209,7 @@ pub struct AgentSession {
     tx: mpsc::UnboundedSender<Submission>,
     rx: mpsc::UnboundedReceiver<Event>,
     interrupt: InterruptHandle,
+    steer: SteerHandle,
     next_id: AtomicU64,
 }
 
@@ -231,6 +271,9 @@ impl AgentSession {
         let (tx, submission_rx) = mpsc::unbounded_channel();
         let (event_tx, rx) = mpsc::unbounded_channel();
         let interrupt = InterruptHandle::default();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
+        let steer = SteerHandle::default();
+        steer.install(steer_tx);
 
         tokio::spawn(run_worker(
             backend,
@@ -238,6 +281,7 @@ impl AgentSession {
             submission_rx,
             event_tx,
             interrupt.clone(),
+            steer_rx,
             bootstrap,
         ));
 
@@ -245,6 +289,7 @@ impl AgentSession {
             tx,
             rx,
             interrupt,
+            steer,
             next_id: AtomicU64::new(1),
         }
     }
@@ -276,6 +321,14 @@ impl AgentSession {
     /// Cancel the in-flight turn. No-op when idle.
     pub fn interrupt(&self) {
         self.interrupt.interrupt();
+    }
+
+    /// Steer the running turn: the message joins the conversation at the
+    /// next step boundary (after the current tool round, before the next
+    /// model request). `false` means nothing can claim it right now — the
+    /// caller should queue a regular turn instead.
+    pub fn steer(&self, text: impl Into<String>) -> bool {
+        self.steer.steer(text)
     }
 
     /// Ask the worker to stop. `ShutdownComplete` is emitted once any active
@@ -605,12 +658,65 @@ fn declared_tools(tools: &[ToolSpec], enabled: &BTreeSet<String>) -> Vec<ToolSpe
         .collect()
 }
 
+/// Wait for the next submission while the worker is idle, handing steered
+/// messages that arrive meanwhile straight back: with no turn running there
+/// is no step boundary to claim them, so the front-end requeues them as a
+/// regular turn. Biased so a steer and a submission landing together settle
+/// the steer first.
+async fn recv_submission(
+    rx: &mut mpsc::UnboundedReceiver<Submission>,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+    tx: &mpsc::UnboundedSender<Event>,
+) -> Option<Submission> {
+    loop {
+        let mut texts = Vec::new();
+        while let Ok(text) = steer_rx.try_recv() {
+            texts.push(text);
+        }
+        if !texts.is_empty() {
+            let _ = tx.send(Event::new("steer", EventMsg::SteerUnclaimed { texts }));
+        }
+        tokio::select! {
+            biased;
+            steered = steer_rx.recv() => {
+                match steered {
+                    Some(text) => {
+                        let _ = tx.send(Event::new(
+                            "steer",
+                            EventMsg::SteerUnclaimed { texts: vec![text] },
+                        ));
+                        continue;
+                    }
+                    // The steer channel cannot close while the worker holds
+                    // its receiver; fall back to submissions alone.
+                    None => return rx.recv().await,
+                }
+            }
+            submission = rx.recv() => return submission,
+        }
+    }
+}
+
+/// The "applies between turns" op family (`/model`, `/effort`, `/profile`,
+/// `/tools`). Their contract is the next turn's setup, not the queue's
+/// order, so they may jump ahead of an already-queued turn.
+fn is_config_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::SwitchModel { .. }
+            | Op::SetReasoningEffort { .. }
+            | Op::SwitchProfile { .. }
+            | Op::SetToolsEnabled { .. }
+    )
+}
+
 async fn run_worker(
     backend: ModelBackend,
     system_prompt: String,
     mut rx: mpsc::UnboundedReceiver<Submission>,
     tx: mpsc::UnboundedSender<Event>,
     interrupt: InterruptHandle,
+    mut steer_rx: mpsc::UnboundedReceiver<String>,
     mut bootstrap: SessionBootstrap,
 ) {
     // One worker owns every conversation and streams at most one turn at a
@@ -705,6 +811,10 @@ async fn run_worker(
     };
     let mut current = sessions.len() - 1;
     let mut active: Option<ActiveTurn> = None;
+    // Submissions taken out of the channel but not yet processed: the config
+    // pre-drain (below) reorders around a turn start, and this keeps every
+    // op's FIFO place otherwise.
+    let mut queue: VecDeque<Submission> = VecDeque::new();
     // Reasoning effort for the next turn (`Op::SetReasoningEffort`,
     // `/effort`). Tracked per session in `session_efforts`; this scalar is the
     // active session's mirror, so a turn's `TurnOptions` and the `/effort`
@@ -751,14 +861,44 @@ async fn run_worker(
                 &tx,
                 &interrupt,
                 &deps,
+                &mut steer_rx,
             )
             .await;
             continue;
         }
 
-        let Some(submission) = rx.recv().await else {
-            break;
+        let submission = match queue.pop_front() {
+            Some(submission) => submission,
+            None => match recv_submission(&mut rx, &mut steer_rx, &tx).await {
+                Some(submission) => submission,
+                None => break,
+            },
         };
+
+        // Config ops apply "between turns" by contract. A turn queued before
+        // a mid-stream `/model` switch must not run on the old model, so
+        // before starting any turn, config ops already waiting in the queue
+        // jump ahead of it; everything else keeps its FIFO place behind.
+        if matches!(submission.op, Op::UserTurn { .. } | Op::ContinueTurn) {
+            let mut ahead: Vec<Submission> = Vec::new();
+            let mut behind: Vec<Submission> = Vec::new();
+            while let Ok(next) = rx.try_recv() {
+                if is_config_op(&next.op) {
+                    ahead.push(next);
+                } else {
+                    behind.push(next);
+                }
+            }
+            if !ahead.is_empty() || !behind.is_empty() {
+                let jumped = ahead.len();
+                for next in ahead.into_iter().rev() {
+                    queue.push_front(next);
+                }
+                queue.insert(jumped, submission);
+                queue.extend(behind);
+                continue;
+            }
+        }
 
         match submission.op {
             Op::UserTurn { text } => {
@@ -1266,6 +1406,7 @@ struct TurnContext {
     max_tool_rounds: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     turn: &mut ActiveTurn,
     conversation: &mut Conversation,
@@ -1274,6 +1415,7 @@ async fn run_turn(
     tx: &mpsc::UnboundedSender<Event>,
     interrupt: &InterruptHandle,
     deps: &TurnContext,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
 ) {
     let mut round = 0usize;
     loop {
@@ -1287,6 +1429,7 @@ async fn run_turn(
             tokio::select! {
                 biased;
                 _ = turn.cancel.cancelled() => {
+                    return_steers(&turn.id, tx, steer_rx);
                     finalize_aborted(turn, conversation, rollouts, current, tx);
                     interrupt.clear();
                     return;
@@ -1336,6 +1479,7 @@ async fn run_turn(
                         // rather than ending the turn.
                         Some(Ok(_)) => {}
                         Some(Err(error)) => {
+                            return_steers(&turn.id, tx, steer_rx);
                             finalize_error(turn, conversation, rollouts, current, tx, &error.to_string());
                             interrupt.clear();
                             return;
@@ -1348,6 +1492,7 @@ async fn run_turn(
 
         // No tool calls: the turn is over, exactly like the tool-less past.
         if requested.is_empty() {
+            return_steers(&turn.id, tx, steer_rx);
             finalize_complete(turn, conversation, rollouts, current, tx);
             interrupt.clear();
             return;
@@ -1367,6 +1512,7 @@ async fn run_turn(
         );
         for call in requested {
             if turn.cancel.is_cancelled() {
+                return_steers(&turn.id, tx, steer_rx);
                 finalize_aborted(turn, conversation, rollouts, current, tx);
                 interrupt.clear();
                 return;
@@ -1374,6 +1520,7 @@ async fn run_turn(
             // `false` = interrupted while the tool ran; its unrecorded result
             // is dropped and the turn ends aborted.
             if !execute_tool_call(turn, conversation, rollouts, current, tx, deps, call).await {
+                return_steers(&turn.id, tx, steer_rx);
                 finalize_aborted(turn, conversation, rollouts, current, tx);
                 interrupt.clear();
                 return;
@@ -1383,6 +1530,7 @@ async fn run_turn(
         if let Some(max) = deps.max_tool_rounds
             && round >= max
         {
+            return_steers(&turn.id, tx, steer_rx);
             finalize_error(
                 turn,
                 conversation,
@@ -1395,12 +1543,57 @@ async fn run_turn(
             return;
         }
 
+        // Stepped boundary: steered messages join here, before the next
+        // request is assembled, so the model reads them alongside the tool
+        // results it just received.
+        claim_steers(turn, conversation, rollouts, current, tx, steer_rx);
         // The next round sees the tool results in the snapshot.
         turn.stream = deps.client.stream_chat(
             conversation.snapshot(),
             deps.options.clone(),
             turn.cancel.clone(),
         );
+    }
+}
+
+/// Pull steered messages in at a step boundary: each becomes a user message
+/// in the conversation and the rollout, and the front-end learns of the
+/// claim so its pending preview can retire the entry. The request assembled
+/// right after this at the same boundary carries them.
+fn claim_steers(
+    turn: &ActiveTurn,
+    conversation: &mut Conversation,
+    rollouts: &mut Rollouts,
+    current: usize,
+    tx: &mpsc::UnboundedSender<Event>,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+) {
+    while let Ok(text) = steer_rx.try_recv() {
+        conversation.push_user(text.clone());
+        rollouts.append(
+            current,
+            RolloutItem::UserMessage {
+                message: text.clone(),
+            },
+        );
+        let _ = tx.send(Event::new(turn.id.clone(), EventMsg::SteerClaimed { text }));
+    }
+}
+
+/// Hand steered messages that never reached a step boundary back to the
+/// front-end: the turn completed, errored, or was aborted before one, so
+/// the model never saw them. The front-end requeues them as regular turns.
+fn return_steers(
+    turn_id: &str,
+    tx: &mpsc::UnboundedSender<Event>,
+    steer_rx: &mut mpsc::UnboundedReceiver<String>,
+) {
+    let mut texts = Vec::new();
+    while let Ok(text) = steer_rx.try_recv() {
+        texts.push(text);
+    }
+    if !texts.is_empty() {
+        let _ = tx.send(Event::new(turn_id, EventMsg::SteerUnclaimed { texts }));
     }
 }
 
@@ -1935,6 +2128,186 @@ mod tests {
             name: name.to_string(),
             arguments: "{}".to_string(),
         }
+    }
+
+    /// `ping` with a real delay, so a test can land a steer while the tool
+    /// runs — the window a mid-round steer occupies.
+    struct SlowExecutor;
+
+    impl ToolExecutor for SlowExecutor {
+        fn execute(&self, call: &ToolCall) -> Result<String, String> {
+            match call.name.as_str() {
+                "ping" => {
+                    std::thread::sleep(Duration::from_millis(80));
+                    Ok(format!("pong {}", call.arguments))
+                }
+                other => Err(format!("nope: {other}")),
+            }
+        }
+    }
+
+    /// Collect events until the `turns`th `TurnComplete`, inclusive.
+    async fn collect_turns(session: &mut AgentSession, turns: usize) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut done = 0;
+        while done < turns {
+            let Some(event) = session.next_event().await else {
+                break;
+            };
+            if matches!(event.msg, EventMsg::TurnComplete) {
+                done += 1;
+            }
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn steered_message_joins_at_the_tool_boundary() {
+        let client = ScriptedClient::new(vec![
+            vec![
+                StreamItem::Delta("checking".to_string()),
+                StreamItem::ToolCalls(vec![tool_call("c1", "ping")]),
+                StreamItem::Usage {
+                    input: 10,
+                    output: 2,
+                    cached: None,
+                },
+            ],
+            vec![
+                StreamItem::Delta("all done".to_string()),
+                StreamItem::Usage {
+                    input: 20,
+                    output: 4,
+                    cached: None,
+                },
+            ],
+        ]);
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(SlowExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("hi");
+        // Steer once the tool round is running: the boundary right after it
+        // is where the message joins.
+        loop {
+            let event = session.next_event().await.expect("worker event");
+            if matches!(event.msg, EventMsg::AgentToolCallStarted { .. }) {
+                break;
+            }
+        }
+        assert!(session.steer("focus on the pong"));
+
+        let events = collect_turn(&mut session).await;
+
+        // Exactly one claim, and the next request carries the steered
+        // message after the tool result, before the second round.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.msg, EventMsg::SteerClaimed { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        let snapshots = seen.lock().expect("lock");
+        assert_eq!(snapshots.len(), 2);
+        let last = &snapshots[1];
+        assert_eq!(last.len(), 6);
+        assert_eq!(last[4].role, Role::Tool);
+        assert_eq!(last[4].content, "pong {}");
+        assert_eq!(last[5].role, Role::User);
+        assert_eq!(last[5].content, "focus on the pong");
+    }
+
+    #[tokio::test]
+    async fn steer_on_a_tool_less_turn_comes_back_unclaimed() {
+        let client = Arc::new(EchoModelClient::new(Duration::from_millis(10)));
+        let mut session = AgentSession::spawn(client);
+
+        session.submit_user_turn("hello");
+        // The turn starts streaming at once; with no tool round there is no
+        // boundary, so the steer can only be handed back.
+        loop {
+            let event = session.next_event().await.expect("worker event");
+            if matches!(event.msg, EventMsg::AgentMessageDelta { .. }) {
+                break;
+            }
+        }
+        assert!(session.steer("one more thing"));
+
+        let events = collect_turn(&mut session).await;
+        assert!(matches!(
+            events.last().map(|event| &event.msg),
+            Some(EventMsg::TurnComplete)
+        ));
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::SteerUnclaimed { texts }
+                if texts.as_slice() == ["one more thing"]
+        )));
+    }
+
+    #[tokio::test]
+    async fn steer_while_idle_comes_back_unclaimed() {
+        let client = Arc::new(EchoModelClient::new(Duration::ZERO));
+        let mut session = AgentSession::spawn(client);
+
+        // No turn is running, so there is no boundary to claim the message:
+        // the idle drain hands it straight back.
+        assert!(session.steer("late"));
+        let event = session.next_event().await.expect("worker event");
+        assert!(matches!(
+            event.msg,
+            EventMsg::SteerUnclaimed { texts } if texts.as_slice() == ["late"]
+        ));
+    }
+
+    #[tokio::test]
+    async fn config_ops_queued_behind_a_turn_still_apply_to_it() {
+        let client = Arc::new(EchoModelClient::new(Duration::from_millis(5)));
+        let mut session = AgentSession::spawn(client);
+
+        session.submit_user_turn("first");
+        // Queue a second turn, then an effort change behind it. Strict FIFO
+        // would let the change apply only from a third turn; the pre-drain
+        // applies it before the second turn starts, so "next turn" wins
+        // over queue order.
+        loop {
+            let event = session.next_event().await.expect("worker event");
+            if matches!(event.msg, EventMsg::TurnStarted) {
+                break;
+            }
+        }
+        session.submit_user_turn("second");
+        session.set_reasoning_effort(Some("high".to_string()));
+
+        let events = collect_turns(&mut session, 2).await;
+
+        // The switch lands between the two turns.
+        let switch_index = events
+            .iter()
+            .position(|event| matches!(event.msg, EventMsg::ReasoningEffortSwitched { .. }))
+            .expect("the effort switch is announced");
+        let first_complete = events
+            .iter()
+            .position(|event| matches!(event.msg, EventMsg::TurnComplete))
+            .unwrap();
+        let second_start = events
+            .iter()
+            .rposition(|event| matches!(event.msg, EventMsg::TurnStarted))
+            .unwrap();
+        assert!(
+            switch_index > first_complete && switch_index < second_start,
+            "the switch must land between the turns: {events:?}"
+        );
     }
 
     #[tokio::test]

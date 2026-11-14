@@ -661,6 +661,8 @@ fn plugin_event_kind(msg: &crate::core::EventMsg) -> PluginEventKind<'_> {
         },
         EventMsg::TurnAborted { reason } => PluginEventKind::TurnAborted { reason },
         EventMsg::Error { message } => PluginEventKind::Error { message },
+        EventMsg::SteerClaimed { text } => PluginEventKind::SteerClaimed { text },
+        EventMsg::SteerUnclaimed { texts } => PluginEventKind::SteerUnclaimed { texts },
         EventMsg::TurnComplete => PluginEventKind::TurnComplete,
         EventMsg::ConversationCleared => PluginEventKind::ConversationCleared,
         EventMsg::ConversationSnapshot { messages } => {
@@ -1527,19 +1529,26 @@ mod tests {
         let effects = host
             .dispatch_command(&invocation(&host, "/status"), info(&host))
             .effects;
-        let [PluginEffect::Notice(text)] = effects.as_slice() else {
-            panic!("expected one status notice, got {effects:?}");
+        let [PluginEffect::PresentReport(block)] = effects.as_slice() else {
+            panic!("expected one status report popup, got {effects:?}");
         };
-        assert!(text.contains("backend: test-model"), "{text}");
-        assert!(text.contains("mode: fullscreen"), "{text}");
-        assert!(text.contains("context: 9.3k/200.0k (4%)"), "{text}");
-        assert!(
-            text.contains("tokens: session in 16.2k / out 2.4k"),
-            "{text}"
-        );
-        assert!(
-            text.contains("plugins: help, clear, quit, status"),
-            "{text}"
+        assert_eq!(block.title, "codest status");
+        let entry = |label: &str| {
+            block.groups[0]
+                .entries
+                .iter()
+                .find(|entry| entry.label == label)
+                .unwrap_or_else(|| panic!("missing {label} entry: {:?}", block.groups[0]))
+                .text
+                .clone()
+        };
+        assert_eq!(entry("backend"), "test-model");
+        assert_eq!(entry("mode"), "fullscreen");
+        assert_eq!(entry("context"), "9.3k/200.0k (4%)");
+        assert_eq!(entry("tokens"), "session in 16.2k / out 2.4k");
+        assert_eq!(
+            entry("plugins"),
+            "help, clear, quit, status, continue, tps, ask_user_question, bash, fs"
         );
     }
 }

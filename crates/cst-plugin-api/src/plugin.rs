@@ -212,6 +212,10 @@ pub enum PluginEffect {
     Error(String),
     /// Append a titled report block to the transcript (`/context`).
     Report(ReportBlock),
+    /// Open the bottom floating report window (`/status`): a transient,
+    /// scrollable pane over the transcript that survives streaming output
+    /// and leaves nothing behind when dismissed.
+    PresentReport(ReportBlock),
     /// Drop the transcript and the core conversation.
     ClearConversation,
     /// Exit the application.
@@ -470,6 +474,13 @@ impl<'a> PluginContext<'a> {
 
     pub fn report(&mut self, block: ReportBlock) {
         self.effects.push(PluginEffect::Report(block));
+    }
+
+    /// Queue [`PluginEffect::PresentReport`]: open the bottom floating
+    /// report window instead of appending to the transcript. For readouts
+    /// meant to be glanced at (`/status`) rather than kept in the record.
+    pub fn present_report(&mut self, block: ReportBlock) {
+        self.effects.push(PluginEffect::PresentReport(block));
     }
 
     pub fn clear_conversation(&mut self) {

@@ -65,7 +65,29 @@ Plugin-contributed commands join the same table, so they get the popup and `/hel
 - An empty query (a bare `/`) lists every command in registration order.
 - The popup shows at most **6 rows**; the visible window follows the selection, and `↑`/`↓` wrap at both ends.
 - A visible popup is authoritative: `Enter` runs the highlighted command even when only a prefix has been typed. `Esc` dismisses the popup and keeps the text; any edit re-opens it and re-anchors the selection to the first candidate.
-- The popup stays closed while a turn is generating, or while a picker or wizard (`/sessions`, `/model`, `/effort`, `/tools`, `/provider`) is open.
+- The popup works **mid-turn** too: a command typed while streaming runs as itself instead of queueing. It stays closed while a picker or wizard (`/sessions`, `/model`, `/effort`, `/tools`, `/provider`) is open.
+
+```text
+/co
+▸ /context                 before the first message: show the prompt report; in a session: browse, delete, and edit the context
+  /continue                continue the current session without a new message (resume an interrupted turn)
+```
+
+Each row is `▸ /name` (fixed-width name column), the command summary, and — for an alias — `(alias of /name)`; a primary name lists its aliases instead.
+
+## Mid-turn input
+
+The composer stays live while a turn streams, and what `Enter` does depends on the state:
+
+- **Idle:** `Enter` submits a new turn.
+- **Generating:** `Enter` **queues** the message — it runs as its own turn the moment the current one finishes. `Alt+Enter` **steers** instead: the message joins the running turn at its next step boundary (after the current tool round, before the next request), without waiting for the turn to end. On a turn with no tool rounds the boundary never comes, so a steered message is handed back and requeued automatically.
+- Pending messages show as rows above the composer (`⏳ queued · after this turn`, `⚡ steer · next boundary`) until the core reports them delivered; only then do they become transcript cells, so the record never shows a message above the answer still streaming.
+- A command typed mid-turn runs as itself — steering is reserved for messages. The exceptions that would strand a streaming turn's output (`/new`, `/sessions`, `/clear`) are refused with a footer flash until the agent is idle again.
+- Config changes made mid-turn (`/model`, `/effort`, `/profile`, `/tools`) apply from the next turn; `/model` says so in its notice.
+
+## The report window
+
+`/status` and `/usage` open a **floating window** anchored to the bottom of the frame instead of printing into the transcript. It floats over whatever is streaming — the output underneath keeps repainting without disturbing it — scrolls with `↑`/`↓`/`PgUp`/`PgDn`/`Home`/`End`, and closes with `Esc`, `Enter`, or `q`, leaving nothing behind in the transcript.
 
 ```text
 /co
@@ -79,9 +101,10 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 
 | Key | Behavior |
 | --- | --- |
-| `Enter` | Send; run the selected command when the candidate popup is open. |
+| `Enter` | Send; queue the message while generating; run the selected command when the candidate popup is open. |
+| `Alt+Enter` | Deliver now: send when idle, steer into the running turn's next step boundary while generating. |
 | `Tab` | Complete the selected command. |
-| `Ctrl+J` / `Alt+Enter` / `Shift+Enter` | Insert a newline. |
+| `Ctrl+J` / `Shift+Enter` / `Ctrl+Enter` | Insert a newline. |
 | `↑` / `↓` | Select candidates; move the cursor in multi-line input; browse input history when single-line. |
 | `Ctrl+P` / `Ctrl+N` | Browse input history. |
 | `←` / `→` / `Home` / `End` | Cursor movement. |
@@ -102,7 +125,7 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 - **Fullscreen vs inline.** `PageUp`/`PageDown` belong to the app only in `fullscreen`, where it owns the alternate screen. In `inline` the terminal owns the scrollback, so those keys are passed through to it. `Ctrl+End` follows the same rule: it jumps the fullscreen viewport back to the newest line and re-arms follow mode, and in `inline` it stays a plain end-of-input cursor move.
 - **`Ctrl+T` is `/thinking`.** Both toggle whether thinking cards are expanded when settled; the card itself is always recorded.
 - **`Ctrl+O` folds tool output.** The card body shows the first 3 lines plus `… +N lines (ctrl+o to expand)`; `Ctrl+O` applies to all tool cards in the transcript.
-- **`Ctrl+C` has three states.** While generating it interrupts the turn; with text in the composer it clears the input; on empty input it must be pressed twice in quick succession to quit.
+- **`Ctrl+C` has three states.** While generating it interrupts the turn (queued messages keep their place and run next); with text in the composer it clears the input; on empty input it must be pressed twice in quick succession to quit.
 - **`Ctrl+D`** quits only on empty input — with text present it does nothing.
 
 ## Related

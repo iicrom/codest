@@ -135,6 +135,15 @@ pub enum EventMsg {
     Error { message: String },
     /// The turn is over; the front-end may accept the next submission.
     TurnComplete,
+    /// A steered message joined the running turn at a step boundary: it was
+    /// appended to the conversation and rides in this turn's next model
+    /// request. `text` is what was steered.
+    SteerClaimed { text: String },
+    /// Steered messages that never reached a step boundary — the turn
+    /// completed, errored, or was aborted first — handed back so the
+    /// front-end can queue them as regular turns instead of losing the
+    /// input. FIFO order matches the `steer` calls.
+    SteerUnclaimed { texts: Vec<String> },
     /// The conversation history was dropped (system prompt retained).
     ConversationCleared,
     /// A fresh session was created by `Op::NewSession` and is now active.

@@ -5,7 +5,10 @@
 //! no-argument command and only reads from [`PluginContext`].
 
 use crate::core::tokens::{cache_percent, format_cache_rate, format_context_usage, format_tokens};
-use crate::plugins::{ArgsPolicy, CommandSpec, Invocation, Plugin, PluginContext, PluginError};
+use crate::plugins::{
+    ArgsPolicy, CommandSpec, Invocation, Plugin, PluginContext, PluginError, ReportBlock,
+    ReportEntry, ReportGroup,
+};
 
 pub static STATUS: Status = Status;
 
@@ -59,7 +62,7 @@ impl Plugin for Status {
                     .map(|rate| format!("{rate} (last)"));
                 let session = (ctx.total_cached() > 0).then(|| {
                     format!(
-                        "cache {}% (session)",
+                        "{}% (session)",
                         cache_percent(ctx.total_cached(), ctx.total_input()).unwrap_or(0)
                     )
                 });
@@ -72,26 +75,45 @@ impl Plugin for Status {
             }
             None => None,
         };
-        let cache_line = cache
-            .map(|cache| format!("  cache: {cache}\n"))
-            .unwrap_or_default();
-        let text = format!(
-            "codest status\n  backend: {}\n  mode: {}\n  transcript: {} cells\n  context: {}\n{}  tokens: session in {} / out {}\n  commands: {}\n  plugins: {}",
-            ctx.model(),
-            ctx.mode(),
-            ctx.transcript_len(),
-            context_line(
-                ctx.last_usage()
-                    .map(|(input, output)| input.saturating_add(output)),
-                ctx.context_window(),
+        // The readout opens the floating report window: it is a glance, not
+        // a record — nothing lands in the transcript, and the popup survives
+        // a turn streaming underneath it.
+        let mut entries = vec![
+            ReportEntry::new("backend", ctx.model()),
+            ReportEntry::new("mode", ctx.mode()),
+            ReportEntry::new("transcript", format!("{} cells", ctx.transcript_len())),
+            ReportEntry::new(
+                "context",
+                context_line(
+                    ctx.last_usage()
+                        .map(|(input, output)| input.saturating_add(output)),
+                    ctx.context_window(),
+                ),
             ),
-            cache_line,
-            format_tokens(ctx.total_input()),
-            format_tokens(ctx.total_output()),
-            ctx.command_table().len(),
-            ctx.plugin_ids().join(", ")
-        );
-        ctx.notice(text);
+        ];
+        if let Some(cache) = cache {
+            entries.push(ReportEntry::new("cache", cache));
+        }
+        entries.push(ReportEntry::new(
+            "tokens",
+            format!(
+                "session in {} / out {}",
+                format_tokens(ctx.total_input()),
+                format_tokens(ctx.total_output())
+            ),
+        ));
+        entries.push(ReportEntry::new(
+            "commands",
+            ctx.command_table().len().to_string(),
+        ));
+        entries.push(ReportEntry::new("plugins", ctx.plugin_ids().join(", ")));
+        ctx.present_report(ReportBlock {
+            title: "codest status".to_string(),
+            groups: vec![ReportGroup {
+                heading: "session".to_string(),
+                entries,
+            }],
+        });
         Ok(())
     }
 }
