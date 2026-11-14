@@ -15,9 +15,8 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::config::ProfileSet;
 use crate::core::config::ModelInfo;
-use crate::core::reasoning::normalize_effort;
+use crate::core::config::ProfileSet;
 use crate::core::conversation::Conversation;
 use crate::core::conversation::DEFAULT_SYSTEM_PROMPT;
 use crate::core::model::ModelClient;
@@ -31,6 +30,7 @@ use crate::core::protocol::Op;
 use crate::core::protocol::Submission;
 use crate::core::providers::ModelPool;
 use crate::core::providers::Selection;
+use crate::core::reasoning::normalize_effort;
 use crate::core::rollout::LoadedSession;
 use crate::core::rollout::RolloutFile;
 use crate::core::rollout::RolloutItem;
@@ -83,7 +83,9 @@ pub enum ModelBackend {
         pool: Arc<ModelPool>,
         current: Selection,
     },
-    Empty { pool: Arc<ModelPool> },
+    Empty {
+        pool: Arc<ModelPool>,
+    },
 }
 
 impl ModelBackend {
@@ -99,7 +101,9 @@ impl ModelBackend {
         match self {
             ModelBackend::Fixed(client) => Ok(client.clone()),
             ModelBackend::Pooled { pool, current } => Self::client_for(pool, current),
-            ModelBackend::Empty { .. } => unreachable!("Empty backend has no client; guard turns with has_client()"),
+            ModelBackend::Empty { .. } => {
+                unreachable!("Empty backend has no client; guard turns with has_client()")
+            }
         }
     }
 
@@ -189,11 +193,7 @@ impl AgentSession {
         system_prompt: impl Into<String>,
         bootstrap: SessionBootstrap,
     ) -> Self {
-        Self::spawn_with_backend(
-            ModelBackend::Fixed(client),
-            system_prompt,
-            bootstrap,
-        )
+        Self::spawn_with_backend(ModelBackend::Fixed(client), system_prompt, bootstrap)
     }
 
     /// Spawn the worker on a multi-provider pool, starting at `selection`
@@ -388,6 +388,9 @@ struct ActiveTurn {
     /// Usage reported by the backend for this turn, surfaced with
     /// `TurnUsage` on completion.
     usage: Option<(u64, u64)>,
+    /// The prompt-cache subset of the last round's `usage` input, when the
+    /// backend reports one. Settled with `usage` on completion.
+    usage_cached: Option<u64>,
     /// The selection that serves this turn, recorded with the usage in the
     /// rollout. `None` on a fixed backend.
     model: Option<String>,
@@ -805,6 +808,7 @@ async fn run_worker(
                     cancel,
                     assistant: String::new(),
                     usage: None,
+                    usage_cached: None,
                     model: backend
                         .selection()
                         .map(|selection| selection.as_str().to_string()),
@@ -825,7 +829,10 @@ async fn run_worker(
                     ModelBackend::Fixed(_) => None,
                 };
                 if let Some(message) = blocked {
-                    let _ = tx.send(Event::new(submission.id.clone(), EventMsg::Error { message }));
+                    let _ = tx.send(Event::new(
+                        submission.id.clone(),
+                        EventMsg::Error { message },
+                    ));
                     // Paired with TurnComplete so a front-end that marked the
                     // turn as running eagerly (the TUI does) unblocks.
                     let _ = tx.send(Event::new(submission.id, EventMsg::TurnComplete));
@@ -874,6 +881,7 @@ async fn run_worker(
                     cancel,
                     assistant: String::new(),
                     usage: None,
+                    usage_cached: None,
                     model: backend
                         .selection()
                         .map(|selection| selection.as_str().to_string()),
@@ -1054,7 +1062,9 @@ async fn run_worker(
                 session_efforts[current] = Some(new_effort.clone());
                 rollouts.append(
                     current,
-                    RolloutItem::ReasoningEffortSwitched { effort: new_effort.clone() },
+                    RolloutItem::ReasoningEffortSwitched {
+                        effort: new_effort.clone(),
+                    },
                 );
                 let _ = tx.send(Event::new(
                     submission.id,
@@ -1107,7 +1117,9 @@ async fn run_worker(
                     session_efforts[current] = Some(applied.clone());
                     rollouts.append(
                         current,
-                        RolloutItem::ReasoningEffortSwitched { effort: applied.clone() },
+                        RolloutItem::ReasoningEffortSwitched {
+                            effort: applied.clone(),
+                        },
                     );
                     let _ = tx.send(Event::new(
                         submission.id.clone(),
@@ -1136,7 +1148,10 @@ async fn run_worker(
                         enabled: enabled.clone(),
                     },
                 );
-                let _ = tx.send(Event::new(submission.id, EventMsg::ToolsSwitched { enabled }));
+                let _ = tx.send(Event::new(
+                    submission.id,
+                    EventMsg::ToolsSwitched { enabled },
+                ));
             }
             Op::InspectConversation => {
                 let _ = tx.send(Event::new(
@@ -1158,17 +1173,12 @@ async fn run_worker(
                             Conversation::validate_tool_structure(conversation.messages())
                         {
                             conversation.undo_last_edit();
-                            let _ = tx.send(Event::new(
-                                submission.id,
-                                EventMsg::Error { message },
-                            ));
+                            let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
                         } else {
                             let (indices, removed): (Vec<usize>, Vec<Message>) =
                                 removed.into_iter().unzip();
-                            rollouts.append(
-                                current,
-                                RolloutItem::ContextDeleted { indices, removed },
-                            );
+                            rollouts
+                                .append(current, RolloutItem::ContextDeleted { indices, removed });
                             let _ = tx.send(Event::new(
                                 submission.id,
                                 EventMsg::ConversationSnapshot {
@@ -1307,8 +1317,9 @@ async fn run_turn(
                         Some(Ok(StreamItem::ToolCalls(calls))) => {
                             requested = calls;
                         }
-                        Some(Ok(StreamItem::Usage { input, output })) => {
+                        Some(Ok(StreamItem::Usage { input, output, cached })) => {
                             turn.usage = Some((input, output));
+                            turn.usage_cached = cached;
                             // The context readout should track a long turn,
                             // not wait for its end: this round's usage is
                             // already the transcript size the next request
@@ -1316,7 +1327,7 @@ async fn run_turn(
                             // session totals still come from `TurnUsage`.
                             let _ = tx.send(Event::new(
                                 turn.id.clone(),
-                                EventMsg::ContextUsage { input, output },
+                                EventMsg::ContextUsage { input, output, cached },
                             ));
                         }
                         // `StreamItem` is `#[non_exhaustive]` and lives in the
@@ -1410,8 +1421,16 @@ fn commit_round_text(
     }
     let text = std::mem::take(&mut turn.assistant);
     conversation.push_assistant(text.clone());
-    rollouts.append(current, RolloutItem::AssistantMessage { message: text.clone() });
-    let _ = tx.send(Event::new(turn.id.clone(), EventMsg::AgentMessage { message: text }));
+    rollouts.append(
+        current,
+        RolloutItem::AssistantMessage {
+            message: text.clone(),
+        },
+    );
+    let _ = tx.send(Event::new(
+        turn.id.clone(),
+        EventMsg::AgentMessage { message: text },
+    ));
 }
 
 /// Record this round's reasoning as display metadata for a resumed session,
@@ -1430,7 +1449,10 @@ fn commit_reasoning(turn: &mut ActiveTurn, rollouts: &mut Rollouts, current: usi
         .thinking_started
         .take()
         .map(|started| started.elapsed().as_millis() as u64);
-    rollouts.append(current, RolloutItem::AssistantReasoning { text, duration_ms });
+    rollouts.append(
+        current,
+        RolloutItem::AssistantReasoning { text, duration_ms },
+    );
 }
 
 /// Run one tool call, record it everywhere, and tell the front-end. Failures
@@ -1597,11 +1619,15 @@ fn apply_model_switch(
         session_efforts[current] = Some(effort.clone());
         rollouts.append(
             current,
-            RolloutItem::ReasoningEffortSwitched { effort: effort.clone() },
+            RolloutItem::ReasoningEffortSwitched {
+                effort: effort.clone(),
+            },
         );
         let _ = tx.send(Event::new(
             submission_id.to_string(),
-            EventMsg::ReasoningEffortSwitched { effort: default_effort },
+            EventMsg::ReasoningEffortSwitched {
+                effort: default_effort,
+            },
         ));
     }
     Ok(parsed)
@@ -1635,9 +1661,18 @@ fn finalize_complete(
                 model: turn.model.clone(),
                 input,
                 output,
+                cached: turn.usage_cached,
             },
         );
-        let _ = tx.send(Event::new(turn.id.clone(), EventMsg::TurnUsage { input, output }));
+        let _ = tx.send(Event::new(
+            turn.id.clone(),
+            EventMsg::TurnUsage {
+                input,
+                output,
+                cached: turn.usage_cached,
+                model: turn.model.clone(),
+            },
+        ));
     }
     let _ = tx.send(Event::new(turn.id.clone(), EventMsg::TurnComplete));
 }
@@ -1868,7 +1903,9 @@ mod tests {
                 }
             };
             Box::pin(futures_util::stream::iter(
-                script.into_iter().map(Ok::<_, crate::core::model::ModelError>),
+                script
+                    .into_iter()
+                    .map(Ok::<_, crate::core::model::ModelError>),
             ))
         }
     }
@@ -1909,6 +1946,7 @@ mod tests {
                 StreamItem::Usage {
                     input: 10,
                     output: 2,
+                    cached: None,
                 },
             ],
             vec![
@@ -1916,6 +1954,7 @@ mod tests {
                 StreamItem::Usage {
                     input: 20,
                     output: 4,
+                    cached: Some(15),
                 },
             ],
         ]);
@@ -1944,14 +1983,14 @@ mod tests {
             [
                 EventMsg::TurnStarted,
                 EventMsg::AgentMessageDelta { .. },
-                EventMsg::ContextUsage { input: 10, output: 2 },
+                EventMsg::ContextUsage { input: 10, output: 2, cached: None },
                 EventMsg::AgentMessage { message },
                 EventMsg::AgentToolCallStarted { .. },
                 EventMsg::AgentToolCall { name, result, error: None, .. },
                 EventMsg::AgentMessageDelta { .. },
-                EventMsg::ContextUsage { input: 20, output: 4 },
+                EventMsg::ContextUsage { input: 20, output: 4, cached: Some(15) },
                 EventMsg::AgentMessage { .. },
-                EventMsg::TurnUsage { input: 20, output: 4 },
+                EventMsg::TurnUsage { input: 20, output: 4, cached: Some(15), .. },
                 EventMsg::TurnComplete,
             ] if message == "checking" && name == "ping" && result == "pong {}"
         ));
@@ -2151,10 +2190,7 @@ mod tests {
         let messages: Vec<&EventMsg> = events.iter().map(|event| &event.msg).collect();
         assert!(matches!(
             messages.as_slice(),
-            [
-                EventMsg::Error { .. },
-                EventMsg::TurnComplete
-            ]
+            [EventMsg::Error { .. }, EventMsg::TurnComplete]
         ));
         assert!(seen.lock().expect("lock").is_empty());
     }
@@ -2181,7 +2217,10 @@ mod tests {
         assert_eq!(seen[1][1].content, "hello");
         assert_eq!(seen[1][2].content, "ok");
         assert_eq!(
-            seen[1].iter().filter(|message| message.role == Role::User).count(),
+            seen[1]
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
             1
         );
     }
@@ -2231,10 +2270,7 @@ mod tests {
         assert_eq!(messages.len(), 4); // system + user + calls + interrupted result
         assert_eq!(
             messages[3],
-            Message::tool_result(
-                "c1",
-                crate::core::conversation::INTERRUPTED_TOOL_RESULT
-            )
+            Message::tool_result("c1", crate::core::conversation::INTERRUPTED_TOOL_RESULT)
         );
         assert_eq!(
             Conversation::validate_tool_structure(&messages[1..]),
@@ -2247,10 +2283,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(
             loaded[0].messages[2],
-            Message::tool_result(
-                "c1",
-                crate::core::conversation::INTERRUPTED_TOOL_RESULT
-            )
+            Message::tool_result("c1", crate::core::conversation::INTERRUPTED_TOOL_RESULT)
         );
     }
 
@@ -2285,9 +2318,7 @@ mod tests {
     #[tokio::test]
     async fn a_runaway_tool_loop_hits_the_configured_round_limit() {
         let rounds = 3usize;
-        let calls = || {
-            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])]
-        };
+        let calls = || vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])];
         let client = ScriptedClient::new((0..rounds).map(|_| calls()).collect());
         let seen = client.snapshots();
         let mut session = AgentSession::spawn_with_bootstrap(
@@ -2324,9 +2355,7 @@ mod tests {
         // the model going quiet ends it. The script keeps calling tools well
         // past the old eight-round ceiling, then answers.
         let rounds = 20usize;
-        let calls = || {
-            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])]
-        };
+        let calls = || vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])];
         let mut scripts: Vec<Vec<StreamItem>> = (0..rounds).map(|_| calls()).collect();
         scripts.push(vec![StreamItem::Delta("done".to_string())]);
         let client = ScriptedClient::new(scripts);
@@ -2465,7 +2494,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_turn_sends_the_full_history() {        let client = RecordingClient::new();
+    async fn second_turn_sends_the_full_history() {
+        let client = RecordingClient::new();
         let seen = client.snapshots();
         let mut session = AgentSession::spawn(Arc::new(client));
 
@@ -2901,9 +2931,8 @@ mod tests {
             options: Default::default(),
             requires_api_key: false,
         };
-        let registry =
-            crate::core::providers::ProviderRegistry::build(&[], vec![instance])
-                .expect("valid registry");
+        let registry = crate::core::providers::ProviderRegistry::build(&[], vec![instance])
+            .expect("valid registry");
         Arc::new(ModelPool::new(registry))
     }
 
@@ -2914,10 +2943,7 @@ mod tests {
     /// handles with [`recording_handles`] and use this factory.
     struct RecordingFactory;
 
-    type RecordingHandles = (
-        Arc<Mutex<Vec<Vec<Message>>>>,
-        Arc<Mutex<Vec<TurnOptions>>>,
-    );
+    type RecordingHandles = (Arc<Mutex<Vec<Vec<Message>>>>, Arc<Mutex<Vec<TurnOptions>>>);
 
     static RECORDINGS: std::sync::OnceLock<Mutex<HashMap<String, RecordingHandles>>> =
         std::sync::OnceLock::new();
@@ -2952,14 +2978,12 @@ mod tests {
             _model: &str,
         ) -> Result<Arc<dyn ModelClient>, crate::core::model::ModelError> {
             let mut map = recordings().lock().expect("lock");
-            let (seen, options) = map
-                .entry(instance.name.clone())
-                .or_insert_with(|| {
-                    (
-                        Arc::new(Mutex::new(Vec::new())),
-                        Arc::new(Mutex::new(Vec::new())),
-                    )
-                });
+            let (seen, options) = map.entry(instance.name.clone()).or_insert_with(|| {
+                (
+                    Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(Mutex::new(Vec::new())),
+                )
+            });
             Ok(Arc::new(RecordingClient {
                 seen: seen.clone(),
                 options: options.clone(),
@@ -2982,11 +3006,9 @@ mod tests {
             options: Default::default(),
             requires_api_key: false,
         };
-        let registry = crate::core::providers::ProviderRegistry::build(
-            &[&RecordingFactory],
-            vec![instance],
-        )
-        .expect("valid registry");
+        let registry =
+            crate::core::providers::ProviderRegistry::build(&[&RecordingFactory], vec![instance])
+                .expect("valid registry");
         Arc::new(ModelPool::new(registry))
     }
 
@@ -3044,8 +3066,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_fixed_backend_rejects_switching() {
-        let mut session =
-            AgentSession::spawn(Arc::new(EchoModelClient::new(Duration::ZERO)));
+        let mut session = AgentSession::spawn(Arc::new(EchoModelClient::new(Duration::ZERO)));
         session.switch_model("test/one");
         let event = session.next_event().await.expect("error event");
         match &event.msg {
@@ -3189,12 +3210,15 @@ mod tests {
         let content = std::fs::read_to_string(&loaded[0].path).expect("read rollout");
         let mut models = Vec::new();
         for line in content.lines() {
-            let Ok(parsed) = serde_json::from_str::<crate::core::rollout::RolloutLine>(line)
-            else {
+            let Ok(parsed) = serde_json::from_str::<crate::core::rollout::RolloutLine>(line) else {
                 continue;
             };
-            if let crate::core::rollout::RolloutItem::TurnUsage { model, input, output } =
-                parsed.item
+            if let crate::core::rollout::RolloutItem::TurnUsage {
+                model,
+                input,
+                output,
+                ..
+            } = parsed.item
             {
                 assert!(input > 0, "echo usage input is positive");
                 assert!(output > 0, "echo usage output is positive");
@@ -3205,10 +3229,7 @@ mod tests {
             models,
             vec![Some("test/one".to_string()), Some("test/two".to_string())]
         );
-        assert_eq!(
-            loaded[0].last_usage.map(|(input, _)| input > 0),
-            Some(true)
-        );
+        assert_eq!(loaded[0].last_usage.map(|(input, _)| input > 0), Some(true));
         assert!(loaded[0].total_input > 0);
         assert!(loaded[0].total_output > 0);
     }
@@ -3231,8 +3252,7 @@ mod tests {
             requires_api_key: false,
         };
         let registry =
-            crate::core::providers::ProviderRegistry::build(&[], vec![instance])
-                .expect("registry");
+            crate::core::providers::ProviderRegistry::build(&[], vec![instance]).expect("registry");
         let pool = Arc::new(ModelPool::new(registry));
 
         // A saved session that last ran on test/two.
@@ -3252,8 +3272,11 @@ mod tests {
             model: Some("test/two".to_string()),
             effort: None,
             last_usage: None,
+            last_cached: None,
             total_input: 0,
             total_output: 0,
+            total_cached: 0,
+            turns: Vec::new(),
             messages: vec![Message::user("hello"), Message::assistant("hi")],
             thinking: Vec::new(),
             undo: Vec::new(),
@@ -3310,7 +3333,10 @@ mod tests {
             }
         }
         assert_eq!(events.len(), 1, "{events:?}");
-        assert!(matches!(&events[0].msg, EventMsg::SessionSwitched { session: 1 }));
+        assert!(matches!(
+            &events[0].msg,
+            EventMsg::SessionSwitched { session: 1 }
+        ));
 
         // And back again: the backend already runs the session's model, so
         // the switch is a no-op — only the confirmation arrives.
@@ -3324,7 +3350,10 @@ mod tests {
             }
         }
         assert_eq!(events.len(), 1, "{events:?}");
-        assert!(matches!(&events[0].msg, EventMsg::SessionSwitched { session: 0 }));
+        assert!(matches!(
+            &events[0].msg,
+            EventMsg::SessionSwitched { session: 0 }
+        ));
     }
 
     /// Drain events up to (and including) the one matching `done`.
@@ -3877,7 +3906,10 @@ mod tests {
         // A second undo source: an out-of-range index answers with an error.
         session.delete_messages(vec![9]);
         let events = collect_until(&mut session, |msg| {
-            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
         })
         .await;
         let [event] = events.as_slice() else {
@@ -3902,7 +3934,10 @@ mod tests {
 
         session.edit_message(0, "hello (fixed)");
         let events = collect_until(&mut session, |msg| {
-            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
         })
         .await;
         let [event] = events.as_slice() else {
@@ -3916,7 +3951,10 @@ mod tests {
 
         session.undo_context_edit();
         let events = collect_until(&mut session, |msg| {
-            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
         })
         .await;
         let [event] = events.as_slice() else {
@@ -3934,7 +3972,10 @@ mod tests {
 
         session.undo_context_edit();
         let events = collect_until(&mut session, |msg| {
-            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
         })
         .await;
         let [event] = events.as_slice() else {
@@ -3972,7 +4013,10 @@ mod tests {
 
         session.delete_messages(vec![1]);
         let events = collect_until(&mut session, |msg| {
-            matches!(msg, EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. })
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
         })
         .await;
         let [event] = events.as_slice() else {

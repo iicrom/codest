@@ -139,7 +139,10 @@ impl OpenAiCompatClient {
         &'a self,
         options: &'a TurnOptions,
     ) -> Vec<(&'a str, &'a str)> {
-        match (self.session_header.as_deref(), options.session_id.as_deref()) {
+        match (
+            self.session_header.as_deref(),
+            options.session_id.as_deref(),
+        ) {
             (Some(header), Some(session_id)) => vec![(header, session_id)],
             _ => Vec::new(),
         }
@@ -162,13 +165,7 @@ impl OpenAiCompatClient {
         if !options.tools.is_empty() {
             object.insert(
                 "tools".to_string(),
-                Value::Array(
-                    options
-                        .tools
-                        .iter()
-                        .map(ToolSpec::function_json)
-                        .collect(),
-                ),
+                Value::Array(options.tools.iter().map(ToolSpec::function_json).collect()),
             );
         }
         for (key, value) in &self.body_overrides {
@@ -430,11 +427,7 @@ impl ToolCallAccumulator {
                 },
             })
             .collect::<Vec<_>>();
-        if calls.is_empty() {
-            None
-        } else {
-            Some(calls)
-        }
+        if calls.is_empty() { None } else { Some(calls) }
     }
 }
 
@@ -478,15 +471,12 @@ fn parse_sse_frame(
 
     // The reasoning delta under the instance's spellings, first hit wins.
     // An empty `thinking_fields` list opts the instance out entirely.
-    let reasoning = quirks
-        .thinking_fields
-        .iter()
-        .find_map(|field| {
-            delta
-                .and_then(|delta| delta.get(field.as_str()))
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-        });
+    let reasoning = quirks.thinking_fields.iter().find_map(|field| {
+        delta
+            .and_then(|delta| delta.get(field.as_str()))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    });
     if let Some(reasoning) = reasoning {
         return Ok(Parsed::Delta(StreamItem::Thinking(reasoning.to_string())));
     }
@@ -497,6 +487,17 @@ fn parse_sse_frame(
 /// A final chunk's usage report. Both OpenAI's
 /// `prompt_tokens`/`completion_tokens` and the `input_tokens`/`output_tokens`
 /// spelling are accepted; a usage object without either pair is ignored.
+///
+/// Cached tokens ride along when the provider reports them, under the
+/// spellings where `cached ⊆ input` (the same inclusive semantics the
+/// context readout assumes):
+///
+/// * `prompt_tokens_details.cached_tokens` — the OpenAI-compatible shape;
+/// * `prompt_cache_hit_tokens` — DeepSeek's flat spelling.
+///
+/// Anthropic's `cache_read_input_tokens` is deliberately not consumed: there
+/// `input_tokens` *excludes* cache reads, so folding it into `cached` would
+/// break the hit-rate math against `input`.
 fn parse_usage(value: &Value) -> Option<StreamItem> {
     let usage = value.get("usage")?;
     if !usage.is_object() {
@@ -510,8 +511,16 @@ fn parse_usage(value: &Value) -> Option<StreamItem> {
         .get("completion_tokens")
         .or_else(|| usage.get("output_tokens"))
         .and_then(Value::as_u64);
+    let cached = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
     match (input, output) {
-        (Some(input), Some(output)) => Some(StreamItem::Usage { input, output }),
+        (Some(input), Some(output)) => Some(StreamItem::Usage {
+            input,
+            output,
+            cached,
+        }),
         _ => None,
     }
 }
@@ -616,8 +625,14 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(body["messages"][0]["tool_calls"][0]["type"], "function");
-        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["name"], "ping");
-        assert_eq!(body["messages"][0]["tool_calls"][0]["function"]["arguments"], r#"{ "n": 2 }"#);
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["name"],
+            "ping"
+        );
+        assert_eq!(
+            body["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            r#"{ "n": 2 }"#
+        );
 
         assert_eq!(body["messages"][1]["role"], "tool");
         assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
@@ -642,8 +657,12 @@ mod tests {
         );
 
         assert_eq!(
-            parse_sse_frame(&frame(""), &mut ToolCallAccumulator::default(), &WireQuirks::default())
-                .unwrap(),
+            parse_sse_frame(
+                &frame(""),
+                &mut ToolCallAccumulator::default(),
+                &WireQuirks::default()
+            )
+            .unwrap(),
             Parsed::Ignore
         );
         assert_eq!(
@@ -697,7 +716,14 @@ mod tests {
             &WireQuirks::default(),
         )
         .unwrap();
-        assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 10, output: 4 }));
+        assert_eq!(
+            parsed,
+            Parsed::Delta(StreamItem::Usage {
+                input: 10,
+                output: 4,
+                cached: None
+            })
+        );
 
         let parsed = parse_sse_frame(
             &frame(r#"{"usage":{"input_tokens":7,"output_tokens":2}}"#),
@@ -705,7 +731,14 @@ mod tests {
             &WireQuirks::default(),
         )
         .unwrap();
-        assert_eq!(parsed, Parsed::Delta(StreamItem::Usage { input: 7, output: 2 }));
+        assert_eq!(
+            parsed,
+            Parsed::Delta(StreamItem::Usage {
+                input: 7,
+                output: 2,
+                cached: None
+            })
+        );
 
         // No usage pair at all: ignored, not an error.
         let parsed = parse_sse_frame(
@@ -715,6 +748,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed, Parsed::Ignore);
+    }
+
+    #[test]
+    fn parse_reads_cached_tokens_in_both_spellings() {
+        let frame = |data: &str| crate::core::sse::SseFrame {
+            event: None,
+            data: data.to_string(),
+        };
+        // OpenAI: the nested details object, cached ⊆ prompt_tokens.
+        let parsed = parse_sse_frame(
+            &frame(
+                r#"{"usage":{"prompt_tokens":100,"completion_tokens":4,
+                    "prompt_tokens_details":{"cached_tokens":80}}}"#,
+            ),
+            &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Parsed::Delta(StreamItem::Usage {
+                input: 100,
+                output: 4,
+                cached: Some(80)
+            })
+        );
+
+        // DeepSeek: the flat hit spelling.
+        let parsed = parse_sse_frame(
+            &frame(r#"{"usage":{"prompt_tokens":50,"completion_tokens":2,"prompt_cache_hit_tokens":45}}"#),
+            &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Parsed::Delta(StreamItem::Usage {
+                input: 50,
+                output: 2,
+                cached: Some(45)
+            })
+        );
+
+        // The nested spelling wins when an endpoint reports both.
+        let parsed = parse_sse_frame(
+            &frame(
+                r#"{"usage":{"prompt_tokens":50,"completion_tokens":2,
+                    "prompt_cache_hit_tokens":10,
+                    "prompt_tokens_details":{"cached_tokens":40}}}"#,
+            ),
+            &mut ToolCallAccumulator::default(),
+            &WireQuirks::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Parsed::Delta(StreamItem::Usage {
+                input: 50,
+                output: 2,
+                cached: Some(40)
+            })
+        );
     }
 
     #[test]
@@ -731,12 +826,9 @@ mod tests {
         };
         for field in ["reasoning", "thinking"] {
             let data = format!(r#"{{"choices":[{{"delta":{{"{field}":"thinking…"}}}}]}}"#);
-            let parsed = parse_sse_frame(
-                &frame(&data),
-                &mut ToolCallAccumulator::default(),
-                &quirks,
-            )
-            .unwrap();
+            let parsed =
+                parse_sse_frame(&frame(&data), &mut ToolCallAccumulator::default(), &quirks)
+                    .unwrap();
             assert_eq!(
                 parsed,
                 Parsed::Delta(StreamItem::Thinking("thinking…".to_string()))
@@ -874,7 +966,10 @@ mod tests {
             ]}}]}"#,
         );
         assert_eq!(
-            feed(&mut accumulator, r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+            feed(
+                &mut accumulator,
+                r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#
+            ),
             Parsed::Ignore
         );
 
@@ -894,7 +989,8 @@ mod tests {
     #[tokio::test]
     async fn empty_key_yields_not_configured() {
         let client = OpenAiCompatClient::new("  ", "https://example.test/v1", "m").unwrap();
-        let mut stream = client.stream_chat(vec![], TurnOptions::default(), CancellationToken::new());
+        let mut stream =
+            client.stream_chat(vec![], TurnOptions::default(), CancellationToken::new());
         let error = stream.next().await.expect("one item").unwrap_err();
         assert!(matches!(error, ModelError::NotConfigured(_)));
     }

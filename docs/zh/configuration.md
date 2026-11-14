@@ -35,7 +35,7 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 | --- | --- | --- | --- |
 | `default` | string | — | 初始模型选择，`"provider/model"`。 |
 | `max_tool_rounds` | integer | 缺省 | 每个用户回合「模型 → 工具 → 模型」轮数的可选上限。 |
-| `[status_bar]` | table | 分段开启 | 页脚：`plugin_segments` 总开关与插件分段的 `order` 显示优先级。 |
+| `[status_bar]` | table | 分段开启 | 页脚：`plugin_segments` 总开关与插件分段的 `order` 显示优先级，外加宿主上下文读数的 `context` / `cache_rate` 开关。 |
 | `[plugins."<id>"]` | table | — | 插件私有的配置口袋；宿主不解释任何键。 |
 
 ```toml
@@ -55,7 +55,7 @@ enabled = true                        # 启动即开启计量（默认关闭）
 
 `default` 是启动选择链的第三环：`--provider`/`--model` > 激活 profile 的 `default` > `config.toml` 的 `default` > 第一个实例的第一个模型。它以 `"provider/model"` 指名某个实例的某个模型，在第一个 `/` 处解析，因此模型 id 本身可以带 `/`。
 
-**`[status_bar]`** 只控制页脚的插件一侧——宿主自己的分段（模型、effort、上下文、状态）始终渲染。`order` 以显示优先级列出完整分段键（`plugin:key`）；未列出的分段保持注册顺序，当前没有东西在显示的键会被忽略，所以过期条目没有代价。窄终端上优先级最低的分段先丢弃。
+**`[status_bar]`** 控制页脚的可选部分。`plugin_segments` 是插件一侧的总开关；`order` 以显示优先级列出完整分段键（`plugin:key`）；未列出的分段保持注册顺序，当前没有东西在显示的键会被忽略，所以过期条目没有代价。窄终端上优先级最低的分段先丢弃。宿主自己的上下文读数有两个开关：`context`（`used/window (n%)` 分段本体；关闭后只剩模型 · effort · 状态骨架）和 `cache_rate`（其中的 `cache 80%` 部分，仅在后端上报缓存 prompt token 时出现）。两者默认开启，可在 `/settings` 中实时修改。
 
 **`[plugins."<id>"]`** 是按插件的配置口袋——整张表原样交给插件
 （[plugins.md](plugins.md) 第 6 节），插件经 `PluginContext::plugin_settings()`

@@ -50,13 +50,29 @@ pub static SETTINGS_COMMANDS: &[CommandSpec] = &[SETTINGS_COMMAND];
 
 /// The host's own settings section — what `/settings` shows besides the
 /// plugins. Keys are dotted paths in `config.toml`.
-static HOST_FIELDS: [SettingField; 1] = [SettingField::toggle(
-    "status_bar.plugin_segments",
-    "Plugin status segments",
-    "Draw plugin-contributed footer segments (tps rate and sparkline, …). \
-     The host's own readouts never hide.",
-    true,
-)];
+static HOST_FIELDS: [SettingField; 3] = [
+    SettingField::toggle(
+        "status_bar.plugin_segments",
+        "Plugin status segments",
+        "Draw plugin-contributed footer segments (tps rate and sparkline, …). \
+         The host's own readouts never hide.",
+        true,
+    ),
+    SettingField::toggle(
+        "status_bar.context",
+        "Context readout",
+        "The footer's `used/window (n%)` context segment. Off leaves the \
+         model · effort · state skeleton.",
+        true,
+    ),
+    SettingField::toggle(
+        "status_bar.cache_rate",
+        "Cache hit rate",
+        "The context segment's `cache 80%` part, when the backend reports \
+         cached prompt tokens.",
+        true,
+    ),
+];
 
 pub static HOST_SETTINGS: SettingsSection =
     SettingsSection::new("codest", "host settings", &HOST_FIELDS);

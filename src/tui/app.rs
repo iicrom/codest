@@ -76,6 +76,7 @@ use crate::core::SessionBootstrap;
 use crate::core::ToolSpec;
 use crate::core::config::StatusBarConfig;
 use crate::core::context_percent;
+use crate::core::format_cache_rate;
 use crate::core::format_context_usage;
 use crate::core::format_tokens;
 use crate::core::openai_compat::endpoint_url;
@@ -208,10 +209,7 @@ pub async fn run(
         }
         system_prompt.push_str(text.trim());
         let name = profiles.active.as_deref().unwrap_or_default();
-        system_sections.push((
-            format!("profile:{name}"),
-            text.trim().to_string(),
-        ));
+        system_sections.push((format!("profile:{name}"), text.trim().to_string()));
     }
 
     // The workspace's saved sessions are always loaded so `/sessions` shows
@@ -247,7 +245,10 @@ pub async fn run(
             .and_then(|active| active.effort.as_deref())
             .map(reasoning::normalize_effort)
     } else {
-        loaded.last().map(|session| session.effort.clone()).unwrap_or(None)
+        loaded
+            .last()
+            .map(|session| session.effort.clone())
+            .unwrap_or(None)
     };
     let active_profile = if fresh {
         profiles.active.clone()
@@ -314,9 +315,7 @@ pub async fn run(
     // a saved set names only what that session left enabled, and names this
     // run does not declare are dropped; a session without one starts with
     // everything enabled (already the case in the App).
-    if !fresh
-        && let Some(saved) = loaded.last().and_then(|session| session.tools.as_ref())
-    {
+    if !fresh && let Some(saved) = loaded.last().and_then(|session| session.tools.as_ref()) {
         app.enabled_tools = saved
             .iter()
             .filter(|name| app.tools.iter().any(|spec| spec.name == name.as_str()))
@@ -597,8 +596,7 @@ struct App {
     /// The question dialog's inbox: `TuiPromptHost` forwards forms here from
     /// the blocking tool thread, and the event loop opens a dialog per
     /// request.
-    prompt_requests:
-        tokio::sync::mpsc::UnboundedReceiver<crate::tui::prompt_dialog::PromptRequest>,
+    prompt_requests: tokio::sync::mpsc::UnboundedReceiver<crate::tui::prompt_dialog::PromptRequest>,
     prompt_requests_closed: bool,
     /// The file `/settings` edits. Normally `~/.codest/config.toml`; a field
     /// so a test can point the screen at a temporary document.
@@ -819,10 +817,8 @@ impl App {
         });
 
         let tools = plugins.tools();
-        let enabled_tools: std::collections::BTreeSet<String> = tools
-            .iter()
-            .map(|spec| spec.name.to_string())
-            .collect();
+        let enabled_tools: std::collections::BTreeSet<String> =
+            tools.iter().map(|spec| spec.name.to_string()).collect();
         let enabled_tools_vec: Vec<String> = enabled_tools.iter().cloned().collect();
         let mut app = Self {
             session,
@@ -914,9 +910,7 @@ impl App {
                 overrides: instance
                     .body_overrides
                     .iter()
-                    .map(|(key, value)| {
-                        (key.clone(), compact_value(value))
-                    })
+                    .map(|(key, value)| (key.clone(), compact_value(value)))
                     .collect(),
             },
             None => RequestFacts::default(),
@@ -1151,9 +1145,8 @@ impl App {
         let live = self.inline_live_tail(width, live_rows);
         let pane_height = inline_pane_height(rows, desired_rows, live_rows, menu_rows);
         let composer_height = desired_rows as u16 + 1;
-        let menu_height = (menu_rows as u16).min(
-            pane_height.saturating_sub(live_rows as u16 + composer_height + 1),
-        );
+        let menu_height = (menu_rows as u16)
+            .min(pane_height.saturating_sub(live_rows as u16 + composer_height + 1));
         let new_top = rows.saturating_sub(pane_height);
 
         let resized = rows != self.inline_rows || size.width != self.inline_columns;
@@ -1532,7 +1525,9 @@ impl App {
             match key.code {
                 KeyCode::Up => return self.move_effort_selection(-1),
                 KeyCode::Down => return self.move_effort_selection(1),
-                KeyCode::Enter if !ctrl && !alt && !shift => return self.confirm_effort_selection(),
+                KeyCode::Enter if !ctrl && !alt && !shift => {
+                    return self.confirm_effort_selection();
+                }
                 KeyCode::Esc => {
                     self.effort_menu = None;
                     return;
@@ -1874,6 +1869,16 @@ impl App {
             // `/settings` opens the settings screen; an optional argument
             // names the section to focus (host or plugin id).
             "settings" => return self.open_settings(&invocation.args),
+            // `/usage` prints the consumption report inline, like the
+            // plugin-authored reports do.
+            "usage" => {
+                let report = self.build_usage_report();
+                // A report is read from its top, like every plugin report.
+                let view = self.view_mut();
+                view.history.push(HistoryCell::Report(report));
+                view.park_on_last_report = true;
+                return;
+            }
             _ => {}
         }
         let output = self
@@ -2009,10 +2014,7 @@ impl App {
                 selection,
             })
             .collect();
-        let selected = items
-            .iter()
-            .position(|item| item.current)
-            .unwrap_or(0);
+        let selected = items.iter().position(|item| item.current).unwrap_or(0);
         self.command_menu_dismissed = true;
         self.model_menu = Some(ModelMenu { items, selected });
     }
@@ -2381,8 +2383,9 @@ impl App {
             plugin.begin_sign_in(&instance_name, &method, secret, notifier, token.clone())
         else {
             if let Some(wizard) = self.provider_wizard.as_mut() {
-                wizard.status =
-                    Some(format!("`{instance_name}` does not support that sign-in method"));
+                wizard.status = Some(format!(
+                    "`{instance_name}` does not support that sign-in method"
+                ));
                 wizard.step = crate::tui::provider_wizard::Step::Action;
             }
             return;
@@ -2430,10 +2433,9 @@ impl App {
             .collect();
         instances.push(instance.clone());
 
-        if let Err(error) = crate::core::config::save_providers(
-            &crate::core::config::providers_path(),
-            &instances,
-        ) {
+        if let Err(error) =
+            crate::core::config::save_providers(&crate::core::config::providers_path(), &instances)
+        {
             if let Some(wizard) = self.provider_wizard.as_mut() {
                 wizard.status = Some(format!("cannot write providers.toml: {error}"));
             }
@@ -2442,8 +2444,9 @@ impl App {
 
         if let Err(error) = self.pool.install_instance(instance) {
             if let Some(wizard) = self.provider_wizard.as_mut() {
-                wizard.status =
-                    Some(format!("provider `{name}` was written but is unusable: {error}"));
+                wizard.status = Some(format!(
+                    "provider `{name}` was written but is unusable: {error}"
+                ));
             }
             return;
         }
@@ -2496,8 +2499,12 @@ impl App {
                 .map(|level| (*level).to_string())
                 .collect(),
         };
-        if let Some(default) = info.as_ref().and_then(|model| model.default_level.as_deref())
-            && !levels.iter().any(|level| level.eq_ignore_ascii_case(default))
+        if let Some(default) = info
+            .as_ref()
+            .and_then(|model| model.default_level.as_deref())
+            && !levels
+                .iter()
+                .any(|level| level.eq_ignore_ascii_case(default))
         {
             levels.push(default.to_string());
         }
@@ -2525,17 +2532,48 @@ impl App {
     /// The footer's context readout, always present so the segment never
     /// appears and disappears as metadata arrives: `13.0k/200.0k (6%)` when
     /// both are known, `—/200.0k` with only a window, `13.0k tok` with only
-    /// measured usage, and `—` when neither is known yet. The boolean flags a
-    /// nearly full window (≥90%) for a warning color.
+    /// measured usage, and `—` when neither is known yet. When the backend
+    /// reports cached tokens the readout carries the prompt-cache hit rate
+    /// (`… · cache 80%`), unless `[status_bar] cache_rate` is off. The
+    /// boolean flags a nearly full window (≥90%) for a warning color.
     fn context_segment(&self) -> (String, bool) {
-        match (self.context_tokens(), self.context_window()) {
+        let (usage, warn) = match (self.context_tokens(), self.context_window()) {
             (Some(used), window) => {
                 let warn = window.is_some_and(|window| context_percent(used, window) >= 90);
                 (format_context_usage(used, window), warn)
             }
             (None, Some(window)) => (format!("—/{}", format_tokens(window)), false),
             (None, None) => ("—".to_string(), false),
-        }
+        };
+        // The hit rate rates the same measured round the usage quotes, so the
+        // two halves of the segment can never disagree.
+        let cache = match (self.status_bar.cache_rate, self.view().last_usage) {
+            (true, Some((input, _))) => {
+                format_cache_rate(self.view().last_cached, input).map(|rate| format!(" · {rate}"))
+            }
+            _ => None,
+        };
+        (format!("{usage}{}", cache.unwrap_or_default()), warn)
+    }
+
+    /// `/usage`: the consumption report as a [`ReportBlock`]. The measured
+    /// numbers come from the active session's view; the composition
+    /// estimates walk the transcript cells and the assembled system prompt.
+    fn build_usage_report(&self) -> crate::plugins::ReportBlock {
+        let view = self.view();
+        let data = crate::tui::usage_view::UsageReportData {
+            model: &self.model_label,
+            context_window: self.context_window(),
+            last_usage: view.last_usage,
+            last_cached: view.last_cached,
+            total_input: view.total_input,
+            total_output: view.total_output,
+            total_cached: view.total_cached,
+            turns: &view.turns,
+            system_sections: &self.system_sections,
+            cells: &view.history,
+        };
+        crate::tui::usage_view::build_usage_report(&data)
     }
 
     /// `/effort <level|off>`: validate the argument against the active
@@ -2803,7 +2841,9 @@ impl App {
                     return;
                 };
                 let info = self.plugin_info();
-                let output = self.plugins.settings_changed(id, global.plugins.get(id), info);
+                let output = self
+                    .plugins
+                    .settings_changed(id, global.plugins.get(id), info);
                 self.apply_output(output);
             }
         }
@@ -3000,8 +3040,10 @@ impl App {
             transcript_len: view.history.len(),
             context_window: self.context_window(),
             last_usage: view.last_usage,
+            last_cached: view.last_cached,
             total_input: view.total_input,
             total_output: view.total_output,
+            total_cached: view.total_cached,
             plugin_ids: self.plugins.plugin_ids(),
             system_sections: &self.system_sections,
             effort: self.effort.as_deref(),
@@ -3013,19 +3055,18 @@ impl App {
             },
             tools: &self.tools,
             enabled_tools: self.enabled_tools_vec.as_slice(),
-            message_count: 1
-                + view
-                    .history
-                    .iter()
-                    .filter(|cell| {
-                        matches!(
-                            cell,
-                            HistoryCell::User(_)
-                                | HistoryCell::Assistant(_)
-                                | HistoryCell::ToolCall { .. }
-                        )
-                    })
-                    .count(),
+            message_count: 1 + view
+                .history
+                .iter()
+                .filter(|cell| {
+                    matches!(
+                        cell,
+                        HistoryCell::User(_)
+                            | HistoryCell::Assistant(_)
+                            | HistoryCell::ToolCall { .. }
+                    )
+                })
+                .count(),
             plugin_configs: &self.plugin_settings,
         }
     }
@@ -3108,7 +3149,8 @@ impl App {
                     }
                 }
                 PluginEffect::ClearStatus(key) => {
-                    self.status_segments.retain(|(existing, _)| existing != &key);
+                    self.status_segments
+                        .retain(|(existing, _)| existing != &key);
                 }
             }
         }
@@ -3172,8 +3214,11 @@ impl App {
         // The dropped turns' usage no longer describes the context; the
         // replayed rollout resets the same counters on `/clear`.
         view.last_usage = None;
+        view.last_cached = None;
         view.total_input = 0;
         view.total_output = 0;
+        view.total_cached = 0;
+        view.turns.clear();
     }
 
     fn handle_agent_event(&mut self, event: crate::core::Event) {
@@ -3211,19 +3256,39 @@ impl App {
                     .get_or_insert_with(String::new)
                     .push_str(&delta);
             }
-            EventMsg::ContextUsage { input, output } => {
+            EventMsg::ContextUsage {
+                input,
+                output,
+                cached,
+            } => {
                 // Display-only liveness: the footer follows the turn as it
                 // streams. The session totals and the rollout record are the
                 // completed-turn `TurnUsage`'s business.
-                self.view_mut().last_usage = Some((input, output));
-            }
-            EventMsg::TurnUsage { input, output } => {
-                // Record per session view: the last turn's usage doubles as
-                // the current context size, the sums accumulate for /status.
                 let view = self.view_mut();
                 view.last_usage = Some((input, output));
+                view.last_cached = cached;
+            }
+            EventMsg::TurnUsage {
+                input,
+                output,
+                cached,
+                model,
+            } => {
+                // Record per session view: the last turn's usage doubles as
+                // the current context size, the sums accumulate for /status,
+                // and the per-turn record feeds `/usage`'s breakdowns.
+                let view = self.view_mut();
+                view.last_usage = Some((input, output));
+                view.last_cached = cached;
                 view.total_input = view.total_input.saturating_add(input);
                 view.total_output = view.total_output.saturating_add(output);
+                view.total_cached = view.total_cached.saturating_add(cached.unwrap_or(0));
+                view.turns.push(crate::core::rollout::UsageTurn {
+                    model,
+                    input,
+                    output,
+                    cached,
+                });
             }
             EventMsg::ModelSwitched { model } => {
                 // `/model` already updated the label optimistically; this is
@@ -3261,8 +3326,7 @@ impl App {
                 // lives in the transcript tail (spinner + elapsed) until the
                 // completion event settles it into history.
                 self.finalize_live();
-                let parsed: Option<serde_json::Value> =
-                    serde_json::from_str(arguments.trim()).ok();
+                let parsed: Option<serde_json::Value> = serde_json::from_str(arguments.trim()).ok();
                 self.view_mut().running_tool = Some(crate::tui::session::RunningTool {
                     name,
                     arguments,
@@ -3522,8 +3586,8 @@ impl App {
             let composer_height = (desired_rows as u16 + 1).min(max_composer_height);
             let visible_composer_rows = composer_height.saturating_sub(1) as usize;
 
-            let menu_height = (self.menu_row_count() as u16)
-                .min(area.height.saturating_sub(composer_height + 2));
+            let menu_height =
+                (self.menu_row_count() as u16).min(area.height.saturating_sub(composer_height + 2));
 
             let chunks = Layout::vertical([
                 Constraint::Min(1),
@@ -3580,10 +3644,7 @@ impl App {
         .split(area);
 
         if !live_tail.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Text::from(live_tail.to_vec())),
-                chunks[0],
-            );
+            frame.render_widget(Paragraph::new(Text::from(live_tail.to_vec())), chunks[0]);
         }
         self.render_menu(frame, chunks[1], menu);
         self.render_composer(
@@ -3627,13 +3688,7 @@ impl App {
         if let Some(menu) = self.model_menu.as_ref() {
             let window = command_menu_window(menu.items.len(), menu.selected, height);
             return window
-                .map(|index| {
-                    model_menu_line(
-                        index + 1,
-                        &menu.items[index],
-                        index == menu.selected,
-                    )
-                })
+                .map(|index| model_menu_line(index + 1, &menu.items[index], index == menu.selected))
                 .collect();
         }
         if let Some(menu) = self.effort_menu.as_ref() {
@@ -3818,7 +3873,10 @@ impl App {
             }
         }
         let mut part_start = history_end;
-        for part in [running_part, thinking_part, live_part].into_iter().flatten() {
+        for part in [running_part, thinking_part, live_part]
+            .into_iter()
+            .flatten()
+        {
             let part_end = part_start + part.len();
             if part_start < end && start < part_end {
                 let from = start.saturating_sub(part_start).min(part.len());
@@ -3959,6 +4017,14 @@ impl App {
 
         let effort_label = self.effort.as_deref().unwrap_or(reasoning::EFFORT_OFF);
         let (context, context_warn) = self.context_segment();
+        // `[status_bar] context = false` drops the readout whole — never a
+        // bare ` · ` dangling where it was. The cache part inside is gated by
+        // its own flag in `context_segment`.
+        let context_part = if self.status_bar.context {
+            format!(" · {context}")
+        } else {
+            String::new()
+        };
 
         // Plugin segments sit between the context readout and the state
         // separator, in `[status_bar]` priority order. The existing priority
@@ -3967,12 +4033,13 @@ impl App {
         // segments take what is left before the hint, then drop from their
         // own tail once they stop fitting.
         let base_plain = format!(
-            " codest · {} · effort {effort_label} · {context}",
+            " codest · {} · effort {effort_label}{context_part}",
             self.model_label
         );
         let state_width = display_width(&format!("  │  {state}")) as u16 + 1;
-        let mut segment_budget =
-            area.width.saturating_sub(display_width(&base_plain) as u16 + state_width);
+        let mut segment_budget = area
+            .width
+            .saturating_sub(display_width(&base_plain) as u16 + state_width);
         let mut chosen: Vec<&crate::plugins::StatusSegment> = Vec::new();
         for segment in self.ordered_status_segments() {
             // " · " joins each plugin segment to the host's own readouts.
@@ -4020,8 +4087,9 @@ impl App {
                 Style::default().fg(theme::DIM),
             ),
             // A nearly full window renders in the accent color as a warning.
+            // Absent whole when `[status_bar] context` is off.
             Span::styled(
-                format!(" · {context}"),
+                context_part,
                 Style::default().fg(if context_warn {
                     theme::ACCENT
                 } else {
@@ -4049,8 +4117,7 @@ impl App {
             Style::default().fg(theme::DIM)
         };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(hints, hint_style)))
-                .alignment(Alignment::Right),
+            Paragraph::new(Line::from(Span::styled(hints, hint_style))).alignment(Alignment::Right),
             parts[1],
         );
     }
@@ -4069,7 +4136,11 @@ fn fit_hints(hints: &str, room: usize) -> String {
     let mut width = 0usize;
     for item in hints.split(" · ") {
         let item_width = display_width(item);
-        let needed = if out.is_empty() { item_width } else { 3 + item_width };
+        let needed = if out.is_empty() {
+            item_width
+        } else {
+            3 + item_width
+        };
         if width + needed + 1 > room {
             break;
         }
@@ -4748,7 +4819,6 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
             plugin_effects,
             "test/one".to_string(),
             TuiMode::Fullscreen,
@@ -4784,7 +4854,6 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
             plugin_effects,
             "test/one".to_string(),
             TuiMode::Fullscreen,
@@ -4823,7 +4892,6 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
             plugin_effects,
             "test/one".to_string(),
             TuiMode::Fullscreen,
@@ -4878,8 +4946,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
-            plugin_effects,            "openai/m1".to_string(),
+            plugin_effects,
+            "openai/m1".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -4935,8 +5003,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
-            plugin_effects,            "test/one".to_string(),
+            plugin_effects,
+            "test/one".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -4991,8 +5059,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
-            plugin_effects,            "test/one".to_string(),
+            plugin_effects,
+            "test/one".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -5068,8 +5136,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
-            plugin_effects,            "no model".to_string(),
+            plugin_effects,
+            "no model".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -5105,8 +5173,8 @@ mod tests {
             notice_rx,
             provider_tx,
             provider_tasks,
-
-            plugin_effects,            "no model".to_string(),
+            plugin_effects,
+            "no model".to_string(),
             TuiMode::Fullscreen,
             Arc::new(PluginHost::shipped().expect("shipped plugins")),
             Vec::new(),
@@ -5178,16 +5246,21 @@ mod tests {
             .map(|n| format!("Step {n}: consider the approach for this subtask, weigh the trade-offs, and check the edge cases before committing to it. "))
             .collect();
         let write_content: String = (1..=20000)
-            .map(|n| format!("line {n} of a generated fixture that the model once wrote in one call\n"))
+            .map(|n| {
+                format!("line {n} of a generated fixture that the model once wrote in one call\n")
+            })
             .collect();
         let bash_output: String = (1..=2000)
-            .map(|n| format!("row {n}: some process output line that a build or a grep once printed\n"))
+            .map(|n| {
+                format!("row {n}: some process output line that a build or a grep once printed\n")
+            })
             .collect();
         {
             let view = app.view_mut();
             for i in 0..30 {
-                view.history
-                    .push(HistoryCell::User(format!("question {i}: look into module {i} and summarize what the tests cover")));
+                view.history.push(HistoryCell::User(format!(
+                    "question {i}: look into module {i} and summarize what the tests cover"
+                )));
                 view.history.push(HistoryCell::Thinking {
                     text: thinking.clone(),
                     duration_ms: Some(4_200),
@@ -5258,8 +5331,8 @@ mod tests {
         let Some(path) = std::env::var_os("CODEST_TIMING_ROLLOUT") else {
             panic!("set CODEST_TIMING_ROLLOUT to a rollout .jsonl file");
         };
-        let loaded = crate::core::rollout::load_session(std::path::Path::new(&path))
-            .expect("load rollout");
+        let loaded =
+            crate::core::rollout::load_session(std::path::Path::new(&path)).expect("load rollout");
         let mut app = test_app();
         *app.view_mut() = SessionView::restored(&loaded);
         println!(
@@ -5302,8 +5375,9 @@ mod tests {
             total
         );
         for (elapsed, index, _) in card_costs.iter().take(8) {
-            if let Some(HistoryCell::ToolCall { name, arguments, .. }) =
-                app.view().history.get(*index)
+            if let Some(HistoryCell::ToolCall {
+                name, arguments, ..
+            }) = app.view().history.get(*index)
             {
                 let path = serde_json::from_str::<serde_json::Value>(arguments)
                     .ok()
@@ -5316,7 +5390,10 @@ mod tests {
         app.show_tool_detail = true;
         let t = std::time::Instant::now();
         let _ = render_lines(&mut app, 110, 40);
-        println!("ctrl+o rebuild (cells warm, viewport cold): {:?}", t.elapsed());
+        println!(
+            "ctrl+o rebuild (cells warm, viewport cold): {:?}",
+            t.elapsed()
+        );
 
         let t = std::time::Instant::now();
         let _ = render_lines(&mut app, 110, 40);
@@ -5345,7 +5422,11 @@ mod tests {
         // …and a settled frame at the same width and fold flags rebuilds none
         // of them, however much history sits above the viewport.
         let _ = render_lines(&mut app, 110, 20);
-        assert_eq!(chat::render_calls(), 0, "a settled frame must not rebuild cells");
+        assert_eq!(
+            chat::render_calls(),
+            0,
+            "a settled frame must not rebuild cells"
+        );
 
         // Toggling a fold flag re-renders only the card cells — the text and
         // markdown cells don't read the flags, and they are the bulk of a
@@ -5403,9 +5484,9 @@ mod tests {
             error: None,
             duration_ms: Some(1_000),
         });
-        app.view_mut().history.push(HistoryCell::Assistant(
-            "answer\n".repeat(60),
-        ));
+        app.view_mut()
+            .history
+            .push(HistoryCell::Assistant("answer\n".repeat(60)));
         let card = 4; // three banner notices + user
         let display = chat::CardDisplay {
             thinking: false,
@@ -5457,7 +5538,11 @@ mod tests {
             "the marker names what the budget hid: {joined}"
         );
         // 200 head rows + the marker + 50 tail rows, under the header.
-        assert!(lines.len() <= 260, "expanded card stays bounded: {}", lines.len());
+        assert!(
+            lines.len() <= 260,
+            "expanded card stays bounded: {}",
+            lines.len()
+        );
         assert!(
             joined.contains("line 2000"),
             "the tail rows are the true end of the output: {joined}"
@@ -5582,8 +5667,11 @@ mod tests {
                 model: None,
                 effort: None,
                 last_usage,
+                last_cached: None,
                 total_input: last_usage.map_or(0, |(input, _)| input),
                 total_output: last_usage.map_or(0, |(_, output)| output),
+                total_cached: 0,
+                turns: Vec::new(),
                 messages,
                 thinking: Vec::new(),
                 undo: Vec::new(),
@@ -5663,8 +5751,11 @@ mod tests {
             model: model.map(str::to_string),
             effort: None,
             last_usage: None,
+            last_cached: None,
             total_input: 0,
             total_output: 0,
+            total_cached: 0,
+            turns: Vec::new(),
             messages: Vec::new(),
             thinking: Vec::new(),
             undo: Vec::new(),
@@ -6105,23 +6196,49 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 1_000,
                 output: 200,
+                cached: Some(700),
+                model: Some("test/one".to_string()),
             },
         ));
         assert_eq!(app.view().last_usage, Some((1_000, 200)));
+        assert_eq!(app.view().last_cached, Some(700));
         assert_eq!(app.view().total_input, 1_000);
         assert_eq!(app.view().total_output, 200);
+        assert_eq!(app.view().total_cached, 700);
 
-        // Each turn replaces `last_usage` and grows the session totals.
+        // Each turn replaces `last_usage` and grows the session totals; the
+        // per-turn records keep the rollout's attribution.
         app.handle_agent_event(crate::core::Event::new(
             "sub-2",
             EventMsg::TurnUsage {
                 input: 1_300,
                 output: 300,
+                cached: None,
+                model: Some("test/two".to_string()),
             },
         ));
         assert_eq!(app.view().last_usage, Some((1_300, 300)));
+        assert_eq!(app.view().last_cached, None);
         assert_eq!(app.view().total_input, 2_300);
         assert_eq!(app.view().total_output, 500);
+        assert_eq!(app.view().total_cached, 700);
+        assert_eq!(
+            app.view().turns,
+            vec![
+                crate::core::rollout::UsageTurn {
+                    model: Some("test/one".to_string()),
+                    input: 1_000,
+                    output: 200,
+                    cached: Some(700),
+                },
+                crate::core::rollout::UsageTurn {
+                    model: Some("test/two".to_string()),
+                    input: 1_300,
+                    output: 300,
+                    cached: None,
+                },
+            ]
+        );
 
         // A fresh session tracks its own usage from zero…
         app.start_new_session();
@@ -6131,6 +6248,8 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 500,
                 output: 50,
+                cached: None,
+                model: None,
             },
         ));
         assert_eq!(app.view().last_usage, Some((500, 50)));
@@ -6140,6 +6259,121 @@ mod tests {
         assert_eq!(app.view().last_usage, Some((1_300, 300)));
         assert_eq!(app.view().total_input, 2_300);
         assert_eq!(app.view().total_output, 500);
+        assert_eq!(app.view().turns.len(), 2);
+    }
+
+    /// The context segment's cache part follows the last measured round and
+    /// folds away under `[status_bar] cache_rate = false`.
+    #[tokio::test]
+    async fn footer_cache_part_follows_the_measured_round() {
+        let mut app = test_app();
+
+        // No reported cached tokens: no cache part at all — unknown, not 0%.
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ContextUsage {
+                input: 1_000,
+                output: 100,
+                cached: None,
+            },
+        ));
+        assert_eq!(app.context_segment().0, "1.1k tok");
+
+        // A reported hit rate rides the same round the usage quotes.
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-2",
+            EventMsg::ContextUsage {
+                input: 1_000,
+                output: 100,
+                cached: Some(800),
+            },
+        ));
+        assert_eq!(app.context_segment().0, "1.1k tok · cache 80%");
+
+        // The flag drops the part whole; the usage readout stays.
+        app.status_bar.cache_rate = false;
+        assert_eq!(app.context_segment().0, "1.1k tok");
+        app.status_bar.cache_rate = true;
+
+        // With a window the same pair renders as the full readout.
+        let mut app = test_app_context();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::ContextUsage {
+                input: 1_000,
+                output: 100,
+                cached: Some(800),
+            },
+        ));
+        assert_eq!(app.context_segment().0, "1.1k/200.0k (0%) · cache 80%");
+    }
+
+    /// `/clear` drops the cache accounting and the per-turn records with the
+    /// totals, like the replayed rollout's `Cleared` does.
+    #[tokio::test]
+    async fn clear_resets_the_cache_and_turn_records() {
+        let mut app = test_app();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnUsage {
+                input: 1_000,
+                output: 200,
+                cached: Some(700),
+                model: Some("test/one".to_string()),
+            },
+        ));
+        assert!(!app.view().turns.is_empty());
+
+        // `/clear` is a plugin command whose effect lands as
+        // `ClearConversation`; the reset runs through `apply_effects`, so the
+        // test feeds that effect straight through the same path.
+        app.apply_effects(vec![crate::plugins::PluginEffect::ClearConversation]);
+
+        assert_eq!(app.view().last_usage, None);
+        assert_eq!(app.view().last_cached, None);
+        assert_eq!(app.view().total_input, 0);
+        assert_eq!(app.view().total_output, 0);
+        assert_eq!(app.view().total_cached, 0);
+        assert!(app.view().turns.is_empty());
+    }
+
+    /// `/usage` prints the consumption report as an inline report cell.
+    #[tokio::test]
+    async fn usage_command_prints_the_consumption_report() {
+        let mut app = test_app();
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnUsage {
+                input: 1_000,
+                output: 200,
+                cached: Some(700),
+                model: Some("test/one".to_string()),
+            },
+        ));
+
+        app.run_command(Invocation {
+            spec: &crate::core::usage::USAGE_COMMAND,
+            args: String::new(),
+        });
+
+        match app.view().history.last() {
+            Some(HistoryCell::Report(block)) => {
+                assert_eq!(block.title, "usage");
+                let context = &block.groups[0];
+                assert!(
+                    context.entries[0]
+                        .text
+                        .contains("1.2k tok · window unknown · cache 70%"),
+                    "{context:?}"
+                );
+                // The turn record feeds the Turns group, newest last.
+                let turns = block.groups.iter().find(|g| g.heading == "Turns").unwrap();
+                assert_eq!(turns.entries.len(), 1);
+                assert_eq!(turns.entries[0].label, "test/one");
+                assert!(turns.entries[0].text.contains("cached 700"), "{turns:?}");
+            }
+            other => panic!("expected a report cell, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -6156,6 +6390,8 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 12_340,
                 output: 660,
+                cached: None,
+                model: None,
             },
         ));
         let lines = render_lines(&mut app, 110, 20);
@@ -6171,6 +6407,8 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 180_000,
                 output: 10_000,
+                cached: None,
+                model: None,
             },
         ));
         let lines = render_lines(&mut app, 110, 20);
@@ -6199,6 +6437,7 @@ mod tests {
             EventMsg::ContextUsage {
                 input: 4_000,
                 output: 200,
+                cached: None,
             },
         ));
         let lines = render_lines(&mut app, 110, 20);
@@ -6215,6 +6454,7 @@ mod tests {
             EventMsg::ContextUsage {
                 input: 900,
                 output: 100,
+                cached: None,
             },
         ));
         assert_eq!(app.view().last_usage, Some((900, 100)));
@@ -6227,6 +6467,8 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 1_000,
                 output: 200,
+                cached: None,
+                model: None,
             },
         ));
         assert_eq!(app.view().last_usage, Some((1_000, 200)));
@@ -6245,9 +6487,7 @@ mod tests {
             })
         };
         app.apply_effects(vec![set("tps:rate", "42 t/s")]);
-        let footer = render_lines(&mut app, 110, 20)
-            .pop()
-            .expect("footer line");
+        let footer = render_lines(&mut app, 110, 20).pop().expect("footer line");
         assert!(footer.contains("42 t/s"), "{footer}");
         assert!(footer.contains("· 42 t/s  │  ready"), "{footer}");
 
@@ -6295,11 +6535,13 @@ mod tests {
     #[tokio::test]
     async fn status_bar_plugin_segments_can_be_turned_off() {
         let mut app = test_app();
-        app.apply_effects(vec![PluginEffect::SetStatus(crate::plugins::StatusSegment {
-            key: "tps:rate".to_string(),
-            text: "42 t/s".to_string(),
-            tone: crate::plugins::StatusTone::Dim,
-        })]);
+        app.apply_effects(vec![PluginEffect::SetStatus(
+            crate::plugins::StatusSegment {
+                key: "tps:rate".to_string(),
+                text: "42 t/s".to_string(),
+                tone: crate::plugins::StatusTone::Dim,
+            },
+        )]);
         app.status_bar.plugin_segments = false;
         let footer = render_lines(&mut app, 110, 20).pop().expect("footer");
         assert!(!footer.contains("42 t/s"), "{footer}");
@@ -6314,6 +6556,8 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 12_340,
                 output: 660,
+                cached: None,
+                model: None,
             },
         ));
         let lines = render_lines(&mut app, 110, 20);
@@ -6353,6 +6597,8 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 12_340,
                 output: 660,
+                cached: None,
+                model: None,
             },
         ));
 
@@ -7019,7 +7265,10 @@ mod tests {
         // `⚓` is a double-width cell, so the framebuffer pads it; ask for the
         // label and the chip, and check the marker separately.
         assert!(rendered.contains("thinking · 4.2s"), "{rendered}");
-        assert!(lines.iter().any(|line| line.starts_with('⚓')), "{rendered}");
+        assert!(
+            lines.iter().any(|line| line.starts_with('⚓')),
+            "{rendered}"
+        );
         assert!(rendered.contains("long thoughts"), "{rendered}");
 
         // Folded (the default): the marker line naming the expand key over a
@@ -7116,7 +7365,12 @@ mod tests {
         let rows = app.inline_live_tail(80, 10);
         let text: Vec<String> = rows
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect();
         assert_eq!(text.len(), 2, "header + elapsed row, not bottom-cropped");
         assert!(text[0].contains("bash(cargo build)"), "{text:?}");
@@ -7136,7 +7390,12 @@ mod tests {
         let pending = app.take_inline_pending(60);
         let text: Vec<String> = pending
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect();
         let header = text
             .iter()
@@ -7275,8 +7534,8 @@ mod tests {
         app.composer.set_text("/".to_string());
         assert_eq!(
             app.command_matches().len(),
-            21,
-            "seventeen commands plus four aliases"
+            22,
+            "eighteen commands plus four aliases"
         );
 
         app.composer.set_text("/cl".to_string());
@@ -7324,9 +7583,9 @@ mod tests {
 
         app.composer.set_text("/".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 20);
+        assert_eq!(app.command_selection, 21);
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.command_selection, 19);
+        assert_eq!(app.command_selection, 20);
     }
 
     #[tokio::test]

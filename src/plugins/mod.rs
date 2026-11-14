@@ -47,6 +47,7 @@ use cst_plugin_api::tools::ToolExecutor;
 use cst_plugin_api::tools::ToolSpec;
 use tokio_util::sync::CancellationToken;
 
+pub use builtin::BUILTIN_PLUGINS;
 pub use cst_plugin_api::commands::{ArgsPolicy, CommandCandidate, CommandSpec, Invocation};
 pub use cst_plugin_api::config::PluginSettings;
 pub use cst_plugin_api::event::{DeltaKind, EventSubscription, PluginEvent, PluginEventKind};
@@ -59,7 +60,6 @@ pub use cst_plugin_api::prompt::{
     PromptResponse,
 };
 pub use cst_plugin_api::status::{StatusSegment, StatusTone};
-pub use builtin::BUILTIN_PLUGINS;
 
 /// The effect sink every dispatch's bridges share: sends land on the host's
 /// effect channel for the front-end to apply.
@@ -120,6 +120,7 @@ static SHIPPED_COMMAND_GROUPS: &[&[CommandSpec]] = &[
     crate::core::tools_switch::TOOLS_COMMANDS,
     crate::core::context::CONTEXT_COMMANDS,
     crate::core::settings::SETTINGS_COMMANDS,
+    crate::core::usage::USAGE_COMMANDS,
 ];
 
 /// Owns the static plugin list and the command table they contribute.
@@ -168,8 +169,10 @@ impl PluginHost {
         extra: &[&'static [CommandSpec]],
         tool_filter: Option<Vec<String>>,
     ) -> Result<Self, PluginHostError> {
-        let plugins: Vec<&'static dyn Plugin> =
-            groups.iter().flat_map(|group| group.iter().copied()).collect();
+        let plugins: Vec<&'static dyn Plugin> = groups
+            .iter()
+            .flat_map(|group| group.iter().copied())
+            .collect();
 
         let mut ids = Vec::with_capacity(plugins.len());
         for plugin in &plugins {
@@ -428,11 +431,7 @@ impl PluginHost {
     }
 
     /// Run the owning plugin for an invocation and collect its output.
-    pub fn dispatch_command(
-        &self,
-        invocation: &Invocation,
-        info: PluginInfo<'_>,
-    ) -> PluginOutput {
+    pub fn dispatch_command(&self, invocation: &Invocation, info: PluginInfo<'_>) -> PluginOutput {
         match self.owner(invocation.spec.name) {
             Some(plugin) => {
                 let mut ctx = self.context(plugin.id(), info);
@@ -541,11 +540,7 @@ impl PluginHost {
     /// Build one plugin's context: its id scopes the status helpers, its
     /// settings resolve from `info.plugin_configs`, and its bridge clones the
     /// host's effect sink and cancellation token.
-    fn context<'a>(
-        &'a self,
-        plugin_id: &'static str,
-        info: PluginInfo<'a>,
-    ) -> PluginContext<'a> {
+    fn context<'a>(&'a self, plugin_id: &'static str, info: PluginInfo<'a>) -> PluginContext<'a> {
         let bridge = PluginBridge::new(
             plugin_id,
             self.cancel.clone(),
@@ -653,11 +648,14 @@ fn plugin_event_kind(msg: &crate::core::EventMsg) -> PluginEventKind<'_> {
             error: error.as_deref(),
             duration_ms: *duration_ms,
         },
-        EventMsg::ContextUsage { input, output } => PluginEventKind::RoundUsage {
+        EventMsg::ContextUsage { input, output, .. } => PluginEventKind::RoundUsage {
             input: *input,
             output: *output,
         },
-        EventMsg::TurnUsage { input, output } => PluginEventKind::TurnUsage {
+        // The plugin-facing kinds stay (input, output): cache attribution and
+        // model records are front-end concerns (`/usage`, the rollout), not
+        // something the shipped plugins consume.
+        EventMsg::TurnUsage { input, output, .. } => PluginEventKind::TurnUsage {
             input: *input,
             output: *output,
         },
@@ -668,12 +666,12 @@ fn plugin_event_kind(msg: &crate::core::EventMsg) -> PluginEventKind<'_> {
         EventMsg::ConversationSnapshot { messages } => {
             PluginEventKind::ConversationSnapshot { messages }
         }
-        EventMsg::SessionStarted { session } => PluginEventKind::SessionStarted {
-            session: *session,
-        },
-        EventMsg::SessionSwitched { session } => PluginEventKind::SessionSwitched {
-            session: *session,
-        },
+        EventMsg::SessionStarted { session } => {
+            PluginEventKind::SessionStarted { session: *session }
+        }
+        EventMsg::SessionSwitched { session } => {
+            PluginEventKind::SessionSwitched { session: *session }
+        }
         EventMsg::SessionRenamed { session, name } => PluginEventKind::SessionRenamed {
             session: *session,
             name,
@@ -700,12 +698,12 @@ impl fmt::Debug for PluginHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Event;
+    use crate::core::EventMsg;
     use crate::core::ModelClient;
     use crate::core::config::ProviderInstance;
     use crate::core::echo_model::EchoModelClient;
     use crate::core::model::ModelError;
-    use crate::core::Event;
-    use crate::core::EventMsg;
 
     static ECHO_COMMAND: CommandSpec = CommandSpec::new(
         "echo",
@@ -824,8 +822,10 @@ mod tests {
             transcript_len: 2,
             context_window: Some(200_000),
             last_usage: Some((8_100, 1_200)),
+            last_cached: Some(6_400),
             total_input: 16_200,
             total_output: 2_400,
+            total_cached: 12_800,
             plugin_ids: host.plugin_ids(),
             system_sections: &[],
             effort: None,
@@ -853,14 +853,20 @@ mod tests {
     fn dispatch_runs_the_owning_plugin() {
         let host = host();
         let output = host.dispatch_command(&invocation(&host, "/echo hi"), info(&host));
-        assert_eq!(output.effects, vec![PluginEffect::Notice("echo: hi".to_string())]);
+        assert_eq!(
+            output.effects,
+            vec![PluginEffect::Notice("echo: hi".to_string())]
+        );
     }
 
     #[test]
     fn plugin_errors_become_error_effects() {
         let host = PluginHost::new(FAILING_PLUGINS).expect("valid plugins");
         let output = host.dispatch_command(&invocation(&host, "/fail"), info(&host));
-        assert_eq!(output.effects, vec![PluginEffect::Error("boom".to_string())]);
+        assert_eq!(
+            output.effects,
+            vec![PluginEffect::Error("boom".to_string())]
+        );
     }
 
     #[test]
@@ -931,17 +937,14 @@ mod tests {
             EventMsg::TurnUsage {
                 input: 10,
                 output: 2,
+                cached: None,
+                model: None,
             },
         );
         assert!(host.dispatch_event(&usage, info(&host)).effects.is_empty());
 
         // Deltas are.
-        let delta = Event::new(
-            "t",
-            EventMsg::AgentMessageDelta {
-                delta: "hi".into(),
-            },
-        );
+        let delta = Event::new("t", EventMsg::AgentMessageDelta { delta: "hi".into() });
         assert_eq!(
             host.dispatch_event(&delta, info(&host)).effects,
             vec![PluginEffect::Notice("meter:delta:2".to_string())]
@@ -1030,14 +1033,11 @@ mod tests {
         static READER_PLUGINS: &[&dyn Plugin] = &[&READER];
         let host = PluginHost::new(READER_PLUGINS).expect("valid plugins");
 
-        let configs = vec![(
-            "reader".to_string(),
-            {
-                let mut options = serde_json::Map::new();
-                options.insert("enabled".to_string(), serde_json::json!(true));
-                PluginSettings { options }
-            },
-        )];
+        let configs = vec![("reader".to_string(), {
+            let mut options = serde_json::Map::new();
+            options.insert("enabled".to_string(), serde_json::json!(true));
+            PluginSettings { options }
+        })];
         let mut configured = info(&host);
         configured.plugin_configs = &configs;
         assert_eq!(
@@ -1097,7 +1097,8 @@ mod tests {
         options.insert("enabled".to_string(), serde_json::json!(true));
         let pocket = PluginSettings { options };
         assert_eq!(
-            host.settings_changed("tunable", Some(&pocket), info(&host)).effects,
+            host.settings_changed("tunable", Some(&pocket), info(&host))
+                .effects,
             vec![PluginEffect::Notice("tunable:Some(true)".to_string())]
         );
         assert_eq!(
@@ -1272,12 +1273,9 @@ mod tests {
         // TOOLER declares the `ping` tool; ECHO declares the `/echo` command.
         // Enabling only echo's tools strips the tool but keeps its command.
         static FILTERED: &[&dyn Plugin] = &[&ECHO, &TOOLER_PLUGIN];
-        let host = PluginHost::with_extra_commands(
-            &[FILTERED],
-            &[],
-            Some(vec!["echo".to_string()]),
-        )
-        .expect("valid host");
+        let host =
+            PluginHost::with_extra_commands(&[FILTERED], &[], Some(vec!["echo".to_string()]))
+                .expect("valid host");
         assert!(host.tools().is_empty(), "tooler's tool is filtered out");
         assert!(
             matches!(host.parse("/echo hi"), CommandInput::Command(_)),
@@ -1294,19 +1292,19 @@ mod tests {
         assert_eq!(host.execute(&call), Err("unknown tool `ping`".to_string()));
 
         // Enabling tooler keeps the tool, and `None` keeps everything.
-        let host = PluginHost::with_extra_commands(
-            &[FILTERED],
-            &[],
-            Some(vec!["tooler".to_string()]),
-        )
-        .expect("valid host");
+        let host =
+            PluginHost::with_extra_commands(&[FILTERED], &[], Some(vec!["tooler".to_string()]))
+                .expect("valid host");
         assert_eq!(host.tools(), vec![PING_TOOL]);
     }
 
     #[test]
     fn an_unknown_tool_filter_id_is_a_startup_error() {
         let error = PluginHost::builtin_with_tools(Some(&["nope".to_string()])).unwrap_err();
-        assert!(matches!(error, PluginHostError::UnknownFilteredPlugin { .. }));
+        assert!(matches!(
+            error,
+            PluginHostError::UnknownFilteredPlugin { .. }
+        ));
         assert!(error.to_string().contains("nope"), "{error}");
         assert!(
             error.to_string().contains("help"),
@@ -1320,7 +1318,11 @@ mod tests {
         // its own `static` slice to the host, so the plugin's command becomes
         // dispatchable without any shipped file changing.
         let host = PluginHost::with_local(FAILING_PLUGINS, None).expect("valid host");
-        assert!(host.plugin_ids().contains(&"failing"), "{:?}", host.plugin_ids());
+        assert!(
+            host.plugin_ids().contains(&"failing"),
+            "{:?}",
+            host.plugin_ids()
+        );
         assert!(
             host.plugin_ids().contains(&"help"),
             "the built-ins are still there: {:?}",
@@ -1354,12 +1356,11 @@ mod tests {
     #[test]
     fn the_tool_filter_also_applies_to_injected_plugins() {
         static TOOLERS: &[&dyn Plugin] = &[&TOOLER_PLUGIN];
-        let host = PluginHost::with_local(TOOLERS, Some(&["tooler".to_string()]))
-            .expect("valid host");
+        let host =
+            PluginHost::with_local(TOOLERS, Some(&["tooler".to_string()])).expect("valid host");
         assert_eq!(host.tools(), vec![PING_TOOL]);
 
-        let off = PluginHost::with_local(TOOLERS, Some(&["help".to_string()]))
-            .expect("valid host");
+        let off = PluginHost::with_local(TOOLERS, Some(&["help".to_string()])).expect("valid host");
         assert!(off.tools().is_empty(), "the local tool is filtered out");
     }
 
@@ -1394,9 +1395,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "help", "clear", "quit", "status", "continue", "tps", "new", "rename",
-                "sessions", "model", "provider", "effort", "thinking", "profile", "tools",
-                "context", "settings"
+                "help", "clear", "quit", "status", "continue", "tps", "new", "rename", "sessions",
+                "model", "provider", "effort", "thinking", "profile", "tools", "context",
+                "settings", "usage"
             ]
         );
     }
@@ -1469,24 +1470,26 @@ mod tests {
         };
         let registry = crate::core::providers::ProviderRegistry::build(&factories, vec![instance])
             .expect("the plugin protocol is known");
-        assert_eq!(registry.protocol_display_name("vendor-protocol"), "Vendor (example)");
+        assert_eq!(
+            registry.protocol_display_name("vendor-protocol"),
+            "Vendor (example)"
+        );
 
         // Registering the same protocol id twice in one build is an error.
-        let error = crate::core::providers::ProviderRegistry::build(
-            &[factories[0], factories[0]],
-            vec![],
-        )
-        .unwrap_err();
+        let error =
+            crate::core::providers::ProviderRegistry::build(&[factories[0], factories[0]], vec![])
+                .unwrap_err();
         assert!(error.to_string().contains("more than once"), "{error}");
     }
-
 
     #[test]
     fn help_lists_plugin_commands() {
         // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
         // must not break the shipped-table assertion.
         let host = PluginHost::shipped().expect("shipped plugins");
-        let effects = host.dispatch_command(&invocation(&host, "/help"), info(&host)).effects;
+        let effects = host
+            .dispatch_command(&invocation(&host, "/help"), info(&host))
+            .effects;
         let [PluginEffect::Notice(text)] = effects.as_slice() else {
             panic!("expected one help notice, got {effects:?}");
         };
@@ -1500,15 +1503,18 @@ mod tests {
         // must not break the shipped-table assertion.
         let host = PluginHost::shipped().expect("shipped plugins");
         assert_eq!(
-            host.dispatch_command(&invocation(&host, "/clear"), info(&host)).effects,
+            host.dispatch_command(&invocation(&host, "/clear"), info(&host))
+                .effects,
             vec![PluginEffect::ClearConversation]
         );
         assert_eq!(
-            host.dispatch_command(&invocation(&host, "/quit"), info(&host)).effects,
+            host.dispatch_command(&invocation(&host, "/quit"), info(&host))
+                .effects,
             vec![PluginEffect::Quit]
         );
         assert_eq!(
-            host.dispatch_command(&invocation(&host, "/continue"), info(&host)).effects,
+            host.dispatch_command(&invocation(&host, "/continue"), info(&host))
+                .effects,
             vec![PluginEffect::ContinueTurn]
         );
     }
@@ -1518,14 +1524,19 @@ mod tests {
         // `shipped()` rather than `builtin()`: a user's `plugins/local.rs`
         // must not break the shipped-table assertion.
         let host = PluginHost::shipped().expect("shipped plugins");
-        let effects = host.dispatch_command(&invocation(&host, "/status"), info(&host)).effects;
+        let effects = host
+            .dispatch_command(&invocation(&host, "/status"), info(&host))
+            .effects;
         let [PluginEffect::Notice(text)] = effects.as_slice() else {
             panic!("expected one status notice, got {effects:?}");
         };
         assert!(text.contains("backend: test-model"), "{text}");
         assert!(text.contains("mode: fullscreen"), "{text}");
         assert!(text.contains("context: 9.3k/200.0k (4%)"), "{text}");
-        assert!(text.contains("tokens: session in 16.2k / out 2.4k"), "{text}");
+        assert!(
+            text.contains("tokens: session in 16.2k / out 2.4k"),
+            "{text}"
+        );
         assert!(
             text.contains("plugins: help, clear, quit, status"),
             "{text}"

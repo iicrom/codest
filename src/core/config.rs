@@ -79,6 +79,12 @@ pub struct StatusBarConfig {
     /// entry costs nothing. On a narrow terminal the lowest-priority segments
     /// drop first.
     pub order: Vec<String>,
+    /// Whether the footer's context readout (`used/window (n%)`) renders at
+    /// all. Off leaves the footer's model · effort · state skeleton.
+    pub context: bool,
+    /// Whether the context readout carries the cache hit-rate part
+    /// (`cache 80%`) when the backend reports cached tokens.
+    pub cache_rate: bool,
 }
 
 impl Default for StatusBarConfig {
@@ -86,6 +92,8 @@ impl Default for StatusBarConfig {
         Self {
             plugin_segments: true,
             order: Vec::new(),
+            context: true,
+            cache_rate: true,
         }
     }
 }
@@ -178,11 +186,20 @@ struct ProfilesFile {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {path}: {source}")]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("cannot parse {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
     #[error("cannot write {path}: {source}")]
-    Write { path: PathBuf, source: std::io::Error },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("cannot serialize {path}: {message}")]
     Serialize { path: PathBuf, message: String },
 }
@@ -439,12 +456,18 @@ nested = { deep = [1, "two", true] }
         assert_eq!(instances[0].models.len(), 1);
         assert_eq!(instances[0].models[0].display_name(), "GLM-5.3");
         assert_eq!(instances[0].models[0].context_window, Some(200000));
-        assert_eq!(instances[0].models[0].default_level.as_deref(), Some("high"));
+        assert_eq!(
+            instances[0].models[0].default_level.as_deref(),
+            Some("high")
+        );
         assert!(instances[0].should_fetch_models());
 
         assert_eq!(instances[1].protocol_id(), "test");
         assert_eq!(instances[1].headers["X-A"], "1");
-        assert_eq!(instances[1].body_overrides["temperature"], serde_json::json!(0.5));
+        assert_eq!(
+            instances[1].body_overrides["temperature"],
+            serde_json::json!(0.5)
+        );
         assert_eq!(
             instances[1].body_overrides["nested"],
             serde_json::json!({"deep": [1, "two", true]})
@@ -526,7 +549,10 @@ effort_field = "none"
         let instances = load_providers(&path).unwrap();
         let wire = instances[0].wire.as_ref().expect("wire parsed");
         assert_eq!(wire.effort_field, EFFORT_FIELD_NONE);
-        assert_eq!(wire.thinking_fields, vec![DEFAULT_THINKING_FIELD.to_string()]);
+        assert_eq!(
+            wire.thinking_fields,
+            vec![DEFAULT_THINKING_FIELD.to_string()]
+        );
 
         // Unknown keys inside [wire] are rejected, like everywhere else.
         let path = write_temp(
@@ -540,7 +566,10 @@ base_url = "https://api.example.com/v1"
 effort_filed = "reasoning"
 "#,
         );
-        assert!(load_providers(&path).is_err(), "unknown wire keys are rejected");
+        assert!(
+            load_providers(&path).is_err(),
+            "unknown wire keys are rejected"
+        );
     }
 
     #[test]
@@ -563,7 +592,10 @@ effort_filed = "reasoning"
             effort_field: "thinking".to_string(),
             ..Default::default()
         };
-        assert!(quirks.validate().is_ok(), "free-form field names are the point");
+        assert!(
+            quirks.validate().is_ok(),
+            "free-form field names are the point"
+        );
         assert!(WireQuirks::default().validate().is_ok());
     }
 
@@ -671,7 +703,10 @@ append = "你是资深 Rust 工程师…"
         // Unknown keys are rejected, both at the profile and prompt level.
         let path = write_temp("profiles-unknown.toml", "[profiles.x]\nnope = 1\n");
         assert!(load_profiles(&path).is_err());
-        let path = write_temp("profiles-unknown-prompt.toml", "[profiles.x.prompt]\nnope = 1\n");
+        let path = write_temp(
+            "profiles-unknown-prompt.toml",
+            "[profiles.x.prompt]\nnope = 1\n",
+        );
         assert!(load_profiles(&path).is_err());
     }
 

@@ -71,9 +71,7 @@ pub trait Plugin: Sync {
     /// `Ok` output becomes the tool message content; `Err` reaches both the
     /// model (as `error: …` content) and the transcript (as a failure line).
     fn run_tool(&self, _call: &ToolCall) -> Result<String, PluginError> {
-        Err(PluginError::new(
-            "this plugin declares no tool executor",
-        ))
+        Err(PluginError::new("this plugin declares no tool executor"))
     }
 
     /// Hand this plugin the front-end's prompt service, once at startup.
@@ -299,9 +297,16 @@ pub struct PluginInfo<'a> {
     /// Usage of the last completed turn: `(input, output)` tokens. `None`
     /// before the first measured turn of this run.
     pub last_usage: Option<(u64, u64)>,
+    /// The prompt-cache subset of [`Self::last_usage`]'s input, when the
+    /// backend reports cache accounting. `None` says "unknown", not zero.
+    pub last_cached: Option<u64>,
     /// Cumulative measured tokens across the session's completed turns.
     pub total_input: u64,
     pub total_output: u64,
+    /// Cumulative cached input across the session's completed turns. Lags
+    /// [`Self::total_input`] legitimately: many providers report no cache
+    /// accounting.
+    pub total_cached: u64,
     pub plugin_ids: &'a [&'static str],
     /// The assembled system prompt as labeled sections: `base` first, then
     /// one `plugin:<id>` entry per non-empty fragment.
@@ -395,6 +400,12 @@ impl<'a> PluginContext<'a> {
         self.info.last_usage
     }
 
+    /// The last completed turn's cached prompt tokens, when the backend
+    /// reports cache accounting.
+    pub fn last_cached(&self) -> Option<u64> {
+        self.info.last_cached
+    }
+
     /// Cumulative measured input tokens across the session.
     pub fn total_input(&self) -> u64 {
         self.info.total_input
@@ -403,6 +414,11 @@ impl<'a> PluginContext<'a> {
     /// Cumulative measured output tokens across the session.
     pub fn total_output(&self) -> u64 {
         self.info.total_output
+    }
+
+    /// Cumulative cached input tokens across the session.
+    pub fn total_cached(&self) -> u64 {
+        self.info.total_cached
     }
 
     pub fn plugin_ids(&self) -> &[&'static str] {
@@ -567,7 +583,11 @@ impl PluginBridge {
         cancel: CancellationToken,
         sink: Arc<dyn Fn(PluginEffect) + Send + Sync>,
     ) -> Self {
-        Self { sink, owner, cancel }
+        Self {
+            sink,
+            owner,
+            cancel,
+        }
     }
 
     /// Send one effect from a background task. Transcript-cell effects append

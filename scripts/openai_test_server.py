@@ -28,6 +28,12 @@ back as a `role: "tool"` message; the following response summarizes the round.
 
 Every message without a keyword gets the help reply, which lists these
 keywords — so the server documents itself on the first turn.
+
+The final usage report estimates tokens from the transcript each request
+actually carries (`usage_report`), so `prompt_tokens` grows with the
+conversation and `prompt_tokens_details.cached_tokens` counts the prefix
+before the newest user message — the client's context readout and cache
+hit rate therefore move the way they do against a real provider.
 """
 
 from __future__ import annotations
@@ -63,6 +69,64 @@ def tokenize(text: str) -> list[str]:
         chunks[-1] += trailing
         tokens.extend(chunks)
     return tokens or [""]
+
+
+CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(text: str) -> int:
+    """A rough token count for one piece of text (~4 characters per token)."""
+    return -(-len(text) // CHARS_PER_TOKEN)
+
+
+def message_tokens(message: dict[str, Any]) -> int:
+    """The token estimate for one request message: role, content, tool calls."""
+    pieces = [str(message.get("role", ""))]
+    content = message.get("content")
+    if isinstance(content, str):
+        pieces.append(content)
+    elif isinstance(content, list):
+        pieces.extend(
+            str(part.get("text", "")) for part in content if isinstance(part, dict)
+        )
+    for call in message.get("tool_calls") or []:
+        if isinstance(call, dict):
+            function = call.get("function")
+            if isinstance(function, dict):
+                pieces.append(f"{function.get('name', '')}{function.get('arguments', '')}")
+    return sum(estimate_tokens(piece) for piece in pieces)
+
+
+def usage_report(messages: Any, completion_text: str) -> dict[str, int]:
+    """The usage block a real provider would report for this request.
+
+    `prompt_tokens` is estimated from the transcript the request actually
+    carried, so it grows with every turn and the client's context readout
+    behaves as it does against a real backend. `cached_tokens` counts the
+    prefix before the newest user message — the stable part prompt caching
+    would hit — under the OpenAI spelling codest parses
+    (`prompt_tokens_details.cached_tokens`, cached ⊆ prompt).
+    """
+    if not isinstance(messages, list):
+        messages = []
+    counts = [
+        message_tokens(message) if isinstance(message, dict) else 0
+        for message in messages
+    ]
+    prompt = sum(counts)
+    cached = 0
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            cached = sum(counts[:index])
+            break
+    completion = estimate_tokens(completion_text)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }
 
 
 def last_user_text(messages: Any) -> str:
@@ -473,6 +537,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         call = self._call_for(messages)
         if call is not None:
             name, arguments = call
+            completion_text = arguments
             message: dict[str, Any] = {
                 "role": "assistant",
                 "content": None,
@@ -486,7 +551,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             }
             finish_reason = "tool_calls"
         else:
-            message = {"role": "assistant", "content": self._text_reply(messages)}
+            completion_text = self._text_reply(messages)
+            message = {"role": "assistant", "content": completion_text}
             finish_reason = "stop"
         self._send_json(
             200,
@@ -502,7 +568,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         "finish_reason": finish_reason,
                     }
                 ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": usage_report(messages, completion_text),
             },
         )
 
@@ -604,8 +670,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 }
             )
             # A final usage report, mirroring `stream_options.include_usage`:
-            # an empty choices array plus the token counts. Fixed values keep
-            # the smoke test's footer assertions stable.
+            # an empty choices array plus the token counts, estimated from the
+            # transcript the request carried (see `usage_report`).
             self._send_chunk(
                 {
                     "id": "chatcmpl-test",
@@ -613,11 +679,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "created": created,
                     "model": model,
                     "choices": [],
-                    "usage": {
-                        "prompt_tokens": 42,
-                        "completion_tokens": 7,
-                        "total_tokens": 49,
-                    },
+                    "usage": usage_report(messages, reply),
                 }
             )
             self.wfile.write(b"data: [DONE]\n\n")
@@ -636,6 +698,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         created = int(time.time())
         delay = getattr(self.server, "delay", 0.0)
         name, arguments = call
+        messages = body.get("messages")
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -689,11 +752,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "created": created,
                     "model": model,
                     "choices": [],
-                    "usage": {
-                        "prompt_tokens": 30,
-                        "completion_tokens": 5,
-                        "total_tokens": 35,
-                    },
+                    "usage": usage_report(messages, arguments),
                 }
             )
             self.wfile.write(b"data: [DONE]\n\n")
