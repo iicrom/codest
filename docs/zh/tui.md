@@ -34,7 +34,7 @@ CST_TUI_MODE=inline codest
 - **菜单带。** slash 指令候选弹窗，或打开中的某个选择器（`/sessions`、`/model`、`/effort`、`/tools`）。没有内容需要它时收缩为零行。`/provider` 向导也渲染在这里，是一组选项行而不是覆盖层。整帧界面（`/context`、`/settings`）则整体替换布局，而不是占用这条带。
 - **整帧界面。** `/settings` 与 `/context` 共用同一套框架（`src/tui/screen.rs`）：带 `n/m` 计数器的头部、可滚动的列表、可选的固定面板（`/context` 的检视区）、分隔线、提示行和帮助栏。两者都是 `↑`/`↓` 在列表中移动并在两端循环——第一行按 `↑` 跳到末行，末行按 `↓` 跳回首行——滚轮只滚动列表、不移动选择，所以浏览不会改变按键作用的对象；下一次按键会把视口重新锚定到选择上。
 - **输入框。** 多行编辑器，只有一条上边框，`› ` 提示符占自己的两列 gutter，最多显示八行；更长的输入在内部滚动。开启了 bracketed paste，多行粘贴作为文本落入，而不是一串按键。
-- **Footer。** 左侧是 `codest · <provider/model> · effort <等级> · <上下文>`，然后一个 `│` 和状态词——`ready`，或回合进行中的转轮加 `working · Esc interrupt`。上下文读数始终存在：两值都已知时是 `used/window (n%)`，只知道窗口时是 `—/window`，只知道用量时是 `used tok`，两者都未知时是 `—`。它随每个流式回合报出的 usage 更新，长工具轮次期间也不会停在旧值，回合结束后由完成的那次 usage 定稿。右侧是当前情境的提示行；`thinking expanded` 这类短暂反馈会临时占位两秒左右。
+- **Footer。** 左侧是 `codest · <provider/model> · effort <等级> · <上下文>`，然后一个 `│` 和状态词——`ready`，或回合进行中的转轮加 `working · Esc interrupt`。上下文读数始终存在：两值都已知时是 `used/window (n%)`，只知道窗口时是 `—/window`，只知道用量时是 `used tok`，两者都未知时是 `—`。它随每个流式回合报出的 usage 更新，长工具轮次期间也不会停在旧值，回合结束后由完成的那次 usage 定稿。右侧是当前情境的提示行；`thinking expanded` 这类短暂反馈会临时占位两秒左右。窄终端上提示按整条裁剪——在 `·` 边界切开而不是从词中间截断，所以 `Enter send · / commands` 会变成 `Enter send`，而不是 `Enter send · / comma`。
 
 终端 resize 在下一帧重绘；`fullscreen` 下全部按新宽度重新换行，`inline` 下只有尚未进入 scrollback 的行会重排（见[已知边界](development.md#已知边界)）。
 

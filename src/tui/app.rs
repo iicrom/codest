@@ -113,6 +113,14 @@ const MAX_LIVE_TAIL_ROWS: usize = 4;
 const MAX_COMMAND_MENU_ROWS: usize = 6;
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
+/// The idle footer's key hints, most useful first. A narrow terminal drops
+/// whole items from the tail — a hint clipped to `Ctrl+J newlin` reads as
+/// damage, a shorter list of complete hints reads as intent. `Ctrl+T` and
+/// `Ctrl+O` are not listed: the cards themselves name their expand key.
+const IDLE_HINTS_FULLSCREEN: &str = "Enter send · / commands · Ctrl+J newline · wheel scroll";
+/// Inline mode owns no viewport, so it lists the terminal's paging instead of
+/// the app's jump-to-newest.
+const IDLE_HINTS_INLINE: &str = "Enter send · / commands · Ctrl+J newline · PgUp/PgDn scrollback";
 /// How long an ephemeral footer message (Ctrl+T's "thinking expanded",
 /// Ctrl+O's "tool output expanded") stays visible. Long enough to read at a
 /// glance, gone before it can accumulate.
@@ -3924,9 +3932,9 @@ impl App {
                 } else if self.busy {
                     "streaming…"
                 } else if self.mode == TuiMode::Fullscreen {
-                    "Enter · / commands · Ctrl+J newline · Ctrl+T thinking · Ctrl+O tools · wheel scroll"
+                    IDLE_HINTS_FULLSCREEN
                 } else {
-                    "Enter · / commands · Ctrl+J newline · Ctrl+T thinking · Ctrl+O tools · PgUp/PgDn scroll"
+                    IDLE_HINTS_INLINE
                 }
             }
         };
@@ -3962,11 +3970,19 @@ impl App {
             .map(|segment| format!(" · {}", segment.text))
             .collect();
         // The left side wins: on a narrow terminal the right
-        // hint is what degrades, never the state word.
+        // hint is what degrades, never the state word. It degrades by losing
+        // whole items off its tail, so whatever survives is a complete hint.
         let left_plain = format!("{base_plain}{plugin_plain}  │  {state}");
         let left_width = (display_width(&left_plain) as u16 + 1).min(area.width);
-        let hint_width =
-            (display_width(hints) as u16 + 1).min(area.width.saturating_sub(left_width));
+        let hint_room = area.width.saturating_sub(left_width) as usize;
+        // A flash is one short message, not a list of hints: it is not split
+        // on ` · `, only clipped to the room it has.
+        let hints = if flashing.is_some() {
+            hints.to_string()
+        } else {
+            fit_hints(hints, hint_room)
+        };
+        let hint_width = (display_width(&hints) as u16 + 1).min(hint_room as u16);
         let parts =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(hint_width)]).split(area);
 
@@ -4020,6 +4036,33 @@ impl App {
             parts[1],
         );
     }
+}
+
+/// Fit the footer's hint list into `room` columns by dropping whole items off
+/// its tail: `Enter send · / commands` truncates to `Enter send`, never to a
+/// half-word like `Enter send · / comma`. An empty result means nothing
+/// legible fits, and the row shows no hints at all.
+fn fit_hints(hints: &str, room: usize) -> String {
+    // One column of right padding keeps the row off the screen edge.
+    if display_width(hints) < room {
+        return hints.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0usize;
+    for item in hints.split(" · ") {
+        let item_width = display_width(item);
+        let needed = if out.is_empty() { item_width } else { 3 + item_width };
+        if width + needed + 1 > room {
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str(" · ");
+            width += 3;
+        }
+        out.push_str(item);
+        width += item_width;
+    }
+    out
 }
 
 /// The slice of command candidates to render so the selected row stays
@@ -6515,6 +6558,64 @@ mod tests {
         assert!(!footer.contains("expanded"), "{footer}");
         assert!(footer.contains("Ctrl+J newline"), "{footer}");
         assert_eq!(app.view().history.len(), before);
+    }
+
+    /// The footer's hints degrade by whole items: a narrow terminal keeps a
+    /// shorter list of complete hints instead of a half-word.
+    #[test]
+    fn footer_hints_drop_whole_items_on_a_narrow_terminal() {
+        let hints = IDLE_HINTS_FULLSCREEN;
+        assert_eq!(fit_hints(hints, 200), hints, "a wide footer keeps them all");
+        assert_eq!(fit_hints(hints, 5), "", "nothing legible fits");
+
+        for room in 1..display_width(hints) {
+            let fitted = fit_hints(hints, room);
+            assert!(
+                display_width(&fitted) < room,
+                "{fitted:?} does not fit in {room}"
+            );
+            // Every surviving item is complete: the fitted string is a prefix
+            // of the full one, cut at an item boundary.
+            assert!(
+                hints.starts_with(&fitted),
+                "{fitted:?} is not a prefix of {hints:?}"
+            );
+            if !fitted.is_empty() {
+                assert!(hints[fitted.len()..].starts_with(" · "), "{fitted:?}");
+                // One more column never loses an item.
+                assert!(
+                    fit_hints(hints, room + 1).len() >= fitted.len(),
+                    "{fitted:?}"
+                );
+            }
+        }
+    }
+
+    /// The rendered footer on a narrow terminal ends on a complete hint, not
+    /// mid-word, and never overruns the row.
+    #[tokio::test]
+    async fn narrow_footer_keeps_whole_hints_and_fits_the_row() {
+        let mut app = test_app();
+        // Narrow enough that the plugin-free hint list has to shed items,
+        // wide enough that the left readout still fits in full.
+        for width in [62u16, 78, 96] {
+            let lines = render_lines(&mut app, width, 20);
+            let footer = lines.last().expect("footer row");
+            assert!(
+                display_width(footer) <= width as usize,
+                "{width}: {footer:?} overruns"
+            );
+            let hint = footer.rsplit("│  ready").next().unwrap_or("").trim();
+            if !hint.is_empty() {
+                assert!(
+                    IDLE_HINTS_FULLSCREEN.contains(hint),
+                    "{width}: {hint:?} is not a run of whole hints"
+                );
+            }
+        }
+        // A wide terminal keeps the whole list.
+        let footer = render_lines(&mut app, 140, 20).pop().expect("footer");
+        assert!(footer.contains(IDLE_HINTS_FULLSCREEN), "{footer}");
     }
 
     #[tokio::test]
