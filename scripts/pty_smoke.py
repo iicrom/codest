@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import pty
 import re
@@ -38,10 +39,31 @@ from pathlib import Path
 ROWS = 24
 COLS = 100
 ESC_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-# The settled tool card's header, `● <name>(<args>)` (see `chat::tool_card_lines`).
-# The status dot is distinct from the `•` assistant gutter and the `⚓` thinking
-# marker, so the needle cannot match a plain transcript row.
-TOOL_CARD_MARKER = "● ping("
+# The settled tool card's header, `✗ <name>(<args>)` (see `chat.rs`: cards
+# carry `●` for success, `✗` on error — and this round's card is always an
+# error, since nothing registers `ping`). The status dot is distinct from
+# the `•` assistant gutter and the `⚓` thinking marker, so the needle cannot
+# match a plain transcript row. Fullscreen diff-frames skip cells a previous
+# frame already drew, so every word gap is `\s*`.
+TOOL_CARD_MARKER = re.compile(
+    r'✗\s*ping\(\s*\{\s*"note"\s*:\s*"called\s*by\s*the\s*test\s*server"\s*\}\s*\)'
+)
+
+# The footer's context segment once a turn's usage was measured:
+# `· 13.0k/200.0k (6%)`, preceded by `· —/<window>` before that. The used
+# figure depends on the binary's prompt size, so the assertions treat it
+# relationally (present, right window, growing) instead of pinning a value.
+CONTEXT_USED_RE = re.compile(r"· (\d+(?:\.\d+)?k?)/(\d+(?:\.\d+)?k) \(\d+%\)")
+CONTEXT_CACHE_RE = re.compile(r"· cache \d+%")
+
+
+def context_used(screen: str) -> int | None:
+    """The used-token figure the footer's context segment shows, in tokens."""
+    match = CONTEXT_USED_RE.search(screen)
+    if match is None:
+        return None
+    used = match.group(1)
+    return int(float(used[:-1]) * 1000) if used.endswith("k") else int(used)
 
 
 def pump(master: int, out: bytearray, seconds: float) -> bool:
@@ -208,7 +230,9 @@ def start_test_server() -> tuple[subprocess.Popen, str]:
 def continue_check(binary, mode, env, endpoint_args, expected_label, expected_context):
     """Second run with --continue over the same CODEST_HOME: the restored
     session must bring back both its last model (footer label) and its
-    recorded usage (footer context segment)."""
+    recorded usage (footer context segment). `expected_context` is a regex
+    over the segment: the exact figure depends on the binary's prompt size,
+    but a measured usage — not the `—` placeholder — must come back."""
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     process = subprocess.Popen(
@@ -256,7 +280,7 @@ def continue_check(binary, mode, env, endpoint_args, expected_label, expected_co
     print(screen)
     passed = (
         f"codest · {expected_label}" in screen
-        and expected_context in screen
+        and re.search(expected_context, screen) is not None
         and (process.poll() is not None or process.returncode == 0)
     )
     print(f"{'PASS' if passed else 'FAIL'}  continue restore")
@@ -394,7 +418,10 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
         os.write(master, b"hello from pty")
         pump(master, output, 0.4)
         os.write(master, b"\r")
-        if not pump(master, output, 3.0):
+        # The window must cover a full streamed help reply (~2s of chunks)
+        # with room for a slow machine; a truncated turn never reports its
+        # usage chunk, so the context assertions would see nothing.
+        if not pump(master, output, 8.0):
             print(f"[{mode}] process exited while streaming", file=sys.stderr)
             print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
             return {"streaming": False}
@@ -426,7 +453,7 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
         os.write(master, b"line two")
         pump(master, output, 0.3)
         os.write(master, b"\r")
-        if not pump(master, output, 5.0):
+        if not pump(master, output, 10.0):
             print(f"[{mode}] process exited on the second turn", file=sys.stderr)
             print(output.decode("utf-8", "replace")[-4000:], file=sys.stderr)
             return {"streaming": False}
@@ -434,8 +461,11 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
 
         # Fullscreen owns the mouse wheel and should scroll the transcript
         # back to the first turn after the second one overflowed the screen.
+        # A notch is 3 lines (WHEEL_LINES in tui/app.rs) and a completed
+        # conversation spans several screens, so keep scrolling until the
+        # top is well within reach.
         if mode == "fullscreen":
-            for _ in range(8):
+            for _ in range(30):
                 os.write(master, b"\x1b[<64;10;10M")
             pump(master, output, 0.8)
 
@@ -483,11 +513,20 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
         # The flags variant synthesizes its instance under the literal name
         # `untitled` (see cli.rs `synthesized_openai_instance`).
         expected_label = "untitled/test-model"
+    # The transcript auto-jumps to its newest line, so the messages and
+    # replies scroll off the visible grid as later content renders; the raw
+    # capture keeps the whole scrollback and is what these read, with escape
+    # sequences stripped since styling splits otherwise-contiguous text.
+    # Fullscreen repaints diff-print changed cells only, so spaces that a
+    # previous frame already drew are skipped (`"hello from\x1b[15;25Hpty"`);
+    # the `\s*` gaps accept those, inline's real spacing, and the newline
+    # the second composer carried alike.
+    plain = lambda text: re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
     checks = {
-        "first user message": "› hello from pty" in screen_turn1,
-        "first reply": 'You said: "hello from pty"' in screen_turn1,
-        "second user message": "› line one" in screen_turn2,
-        "second reply": 'You said: "line one' in screen_turn2,
+        "first user message": "› hello from pty" in plain(raw_turn1),
+        "first reply": re.search(r'You said: "hello\s*from\s*pty"', plain(raw)),
+        "second user message": "› line one" in plain(raw_turn2),
+        "second reply": re.search(r'You said: "line\s*one\s*line\s*two"', plain(raw)),
         "no stray cursor": "▌" not in screen,
         "test server footer": f"codest · {expected_label}" in screen,
         "idle state": "ready" in screen,
@@ -511,20 +550,45 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
         # After the picker switch the active model is the *discovered*
         # second-model, whose window came from the server's context_window
         # field — the discovery path, distinct from the declared one above.
-        checks["context window footer"] = "· 49/200.0k (0%)" in screen
+        match = CONTEXT_USED_RE.search(screen)
+        checks["context window footer"] = (
+            match is not None and match.group(2) == "200.0k"
+        )
     else:
         # The flags instance discovers its models: `test-model`'s window comes
         # from the server's `context_length` field, so the footer shows the
-        # measured tokens against it (42 in + 7 out per streamed turn).
-        checks["context window footer (discovered)"] = "· 49/128.0k (0%)" in screen
-    # The rollout records each completed turn's usage with the serving
-    # model; the test server reports 42 in / 7 out per turn.
-    rollout_text = "".join(
-        path.read_text(encoding="utf-8")
-        for path in Path(home).glob("sessions/*/rollout-*.jsonl")
+        # measured tokens against it.
+        match = CONTEXT_USED_RE.search(screen)
+        checks["context window footer (discovered)"] = (
+            match is not None and match.group(2) == "128.0k"
+        )
+    # The test server derives each turn's usage from the transcript the
+    # request carried, so the readout must grow from turn 1 to turn 2 — a
+    # usage report pinned to fixed values (the old shape) would show the
+    # same total forever and hide that the readout tracks the conversation.
+    used1, used2 = context_used(screen_turn1), context_used(screen_turn2)
+    checks["context readout grows across turns"] = (
+        used1 is not None and used2 is not None and used2 > used1
     )
+    # The server also reports `prompt_tokens_details.cached_tokens` (the
+    # prefix before the newest user message); the footer surfaces it as the
+    # hit rate.
+    checks["cache hit rate in the footer"] = CONTEXT_CACHE_RE.search(screen) is not None
+    # The rollout records each completed turn's usage with the serving
+    # model; its recorded inputs must grow across the turns too.
+    usage_inputs = []
+    for path in Path(home).glob("sessions/*/rollout-*.jsonl"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if '"type":"turn_usage"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record.get("input"), int):
+                usage_inputs.append(record["input"])
     checks["rollout records turn usage"] = (
-        '"type":"turn_usage"' in rollout_text and '"input":42' in rollout_text
+        len(usage_inputs) >= 2 and usage_inputs[-1] > usage_inputs[0]
     )
     # Second run with --continue over the same home: the restored session
     # brings back the model it last ran on plus its recorded usage. The
@@ -533,13 +597,23 @@ def run_case(binary: str, mode: str, base_url: str, variant: str = "flags") -> d
     if variant == "config":
         checks.update(
             continue_check(
-                binary, mode, env, endpoint_args, "pytest/second-model", "· 49/200.0k (0%)"
+                binary,
+                mode,
+                env,
+                endpoint_args,
+                "pytest/second-model",
+                r"· \d+(?:\.\d+)?k?/200\.0k \(\d+%\)",
             )
         )
     else:
         checks.update(
             continue_check(
-                binary, mode, env, endpoint_args, "untitled/test-model", "· 49/128.0k (0%)"
+                binary,
+                mode,
+                env,
+                endpoint_args,
+                "untitled/test-model",
+                r"· \d+(?:\.\d+)?k?/128\.0k \(\d+%\)",
             )
         )
     if mode == "fullscreen":
@@ -604,12 +678,18 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         deadline = time.time() + 10
         tool_end = 0
         while time.time() < deadline:
-            if TOOL_CARD_MARKER in output[turn_start:].decode("utf-8", "replace"):
+            # The card's line is split across styled spans on the wire, so
+            # the marker only matches once the escapes are stripped.
+            plain = re.sub(
+                r"\x1b\[[0-9;?]*[A-Za-z]", "",
+                output[turn_start:].decode("utf-8", "replace"),
+            )
+            if TOOL_CARD_MARKER.search(plain):
                 tool_end = len(output)
                 break
             if not pump(master, output, 0.2):
                 break
-        # `/context` needs an idle agent. The turn's `ready` footer does not
+        # `/usage` needs an idle agent. The turn's `ready` footer does not
         # survive the render of a full-screen repaint, so wait on the output
         # rate instead: the spinner's fixed per-tick repaint is far smaller
         # than a live stream.
@@ -623,12 +703,12 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
                 break
             previous = growth
         turn_end = len(output)
-        # `/context` needs an idle agent; the turn is done by now. The report
+        # `/usage` needs an idle agent; the turn is done by now. The report
         # is printed into a transcript that is already taller than the
         # 24-row grid, so the visible frame shows only its tail. Assertions
         # therefore read the *rendered transcript text* (via `screen_turn`
         # plus the report's own stream) rather than assuming what fits.
-        os.write(master, b"/context")
+        os.write(master, b"/usage")
         pump(master, output, 0.3)
         os.write(master, b"\r")
         pump(master, output, 1.2)
@@ -666,7 +746,7 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
     raw_before_quit = output[:before_quit].decode("utf-8", "replace")
     screen = render(raw_before_quit)
     # The report is taller than the grid and parks on its first line, so the
-    # frame right after `/context` shows its head and the frame after PgDn its
+    # frame right after `/usage` shows its head and the frame after PgDn its
     # tail. Fullscreen repaints only the visible window and inline prints to
     # the terminal's scrollback, so the assertions read the plain text of the
     # whole capture (escape sequences and cursor moves stripped) plus the
@@ -684,15 +764,18 @@ def tool_smoke(binary: str, mode: str, base_url: str) -> dict[str, bool]:
         for path in Path(home).glob("sessions/*/rollout-*.jsonl")
     )
     checks = {
-        "tool call rendered": '● ping({"note":"called by the test server"})' in screen_tool,
+        "tool call rendered": TOOL_CARD_MARKER.search(screen_tool) is not None,
         "unknown tool surfaced": "unknown tool `ping`" in screen_turn,
         "round trip reply": "tool-calling round trip of the test server" in screen_turn,
-        # The report is taller than the grid, so these read the transcript
-        # text (`report_screen`), not the visible frame.
-        "context report title": "▪ context" in report_screen,
-        "context shows sections": "System prompt" in report_screen,
-        "context shows request": "/chat/completions" in report_screen,
-        "context shows tools": "Tools (" in report_screen,
+        # The `/usage` report is taller than the grid, so these read the
+        # transcript text (`report_screen`), not the visible frame: its title
+        # line plus the Context, Session and per-turn sections — the last of
+        # which now carries the cache rate the server reports.
+        "usage report title": "▪ usage" in report_screen,
+        "usage shows context": "  Context" in report_screen,
+        "usage shows the session sums": "session in " in report_screen,
+        "usage shows the measured turn": "last turn" in report_screen,
+        "usage shows the cache rate": re.search(r"cache \d+%", report_screen) is not None,
         "clean exit": process.poll() is not None or process.returncode == 0,
     }
     checks["rollout records tool round"] = (
