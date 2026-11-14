@@ -138,8 +138,11 @@ pub fn reset_render_calls() {
 
 impl HistoryCell {
     /// Render this cell into owned lines for a transcript of `width` columns.
-    /// `display` carries the per-frame fold flags for the card cells.
-    pub fn lines(&self, width: usize, display: &CardDisplay) -> Vec<Line<'static>> {
+    /// `display` carries the per-frame fold flags for the card cells, and
+    /// `highlight` gates syntax tokenization — off-screen cells build without
+    /// it (identical layout, plain spans) and are re-rendered highlighted
+    /// once the viewport reaches them.
+    pub fn lines(&self, width: usize, display: &CardDisplay, highlight: bool) -> Vec<Line<'static>> {
         RENDER_CALLS.with(|count| count.set(count.get() + 1));
         match self {
             HistoryCell::User(text) => {
@@ -185,6 +188,7 @@ impl HistoryCell {
                 *duration_ms,
                 display.tool_detail,
                 width,
+                highlight,
             ),
             HistoryCell::Report(block) => report_lines(block, width),
         }
@@ -202,6 +206,7 @@ impl HistoryCell {
 /// Any other tool shows the head of its output text, capped at
 /// [`TOOL_BODY_MAX_LINES`]. Either way a folded card ends in a dim
 /// `… +N lines` hint, and a failure rides in the body in the error color.
+#[allow(clippy::too_many_arguments)]
 fn tool_card_lines(
     name: &str,
     arguments: &str,
@@ -210,6 +215,7 @@ fn tool_card_lines(
     duration_ms: Option<u64>,
     expanded: bool,
     width: usize,
+    highlight: bool,
 ) -> Vec<Line<'static>> {
     let width = width.max(4);
     let category = tool_category_color(name);
@@ -286,7 +292,9 @@ fn tool_card_lines(
             Style::default().fg(theme::ERROR),
             &gutter,
         ));
-    } else if let Some(body) = tool_body::build_parsed(name, parsed.as_ref(), result, budget) {
+    } else if let Some(body) =
+        tool_body::build_parsed(name, parsed.as_ref(), result, budget, highlight)
+    {
         lines.extend(body_lines(&body, width, text_style, &gutter));
     } else if !result.trim().is_empty() {
         let body = if expanded {
@@ -1040,7 +1048,7 @@ mod tests {
 
     #[test]
     fn user_cell_has_prompt_and_indent() {
-        let lines = HistoryCell::User("hello world".to_string()).lines(10, &expanded_all());
+        let lines = HistoryCell::User("hello world".to_string()).lines(10, &expanded_all(), true);
         assert_eq!(plain(&lines), vec!["› hello", "  world"]);
     }
 
@@ -1078,7 +1086,7 @@ mod tests {
 
     #[test]
     fn notice_is_dim_and_indented() {
-        let lines = HistoryCell::Notice("note".to_string()).lines(20, &expanded_all());
+        let lines = HistoryCell::Notice("note".to_string()).lines(20, &expanded_all(), true);
         assert_eq!(plain(&lines), vec!["  note"]);
     }
 
@@ -1089,13 +1097,13 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(20, &expanded_all())),
+            plain(&cell.lines(20, &expanded_all(), true)),
             vec!["⚓ thinking", "  │ reasoning hard"]
         );
 
         // The rail is the thinking card's own color, so the body reads as part
         // of the card; the text itself stays dim italic.
-        let rendered = cell.lines(20, &expanded_all());
+        let rendered = cell.lines(20, &expanded_all(), true);
         assert_eq!(rendered[0].spans[0].style.fg, Some(theme::THINKING));
         assert_eq!(
             rendered[1].spans[0].style.fg,
@@ -1124,7 +1132,7 @@ mod tests {
         // Folded: the header naming the expand key, then the newest reasoning
         // row as a preview, so a folded card still says what it was about.
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec![
                 "⚓ thinking · 4.2s (ctrl+t to expand)",
                 "  │ reasoning hard"
@@ -1132,7 +1140,7 @@ mod tests {
         );
 
         // Even folded the header is the thinking color, not the notice gray.
-        let rendered = cell.lines(60, &folded_all());
+        let rendered = cell.lines(60, &folded_all(), true);
         assert_eq!(rendered[0].spans[2].style.fg, Some(theme::THINKING));
         assert_eq!(
             rendered[0].spans[4].style.fg,
@@ -1158,7 +1166,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec!["⚓ thinking (ctrl+t to expand)", "  │ second thought"]
         );
 
@@ -1168,7 +1176,7 @@ mod tests {
             text: "aaaa bbbb cccc dddd eeee".to_string(),
             duration_ms: None,
         };
-        let rendered = plain(&cell.lines(20, &folded_all()));
+        let rendered = plain(&cell.lines(20, &folded_all(), true));
         assert_eq!(rendered[0], "⚓ thinking (ctrl+t to expand)");
         assert_eq!(rendered[1], "  │ …cccc dddd eeee");
         assert!(display_width(&rendered[1]) <= 20, "{rendered:?}");
@@ -1180,7 +1188,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec!["⚓ thinking (ctrl+t to expand)"]
         );
     }
@@ -1218,7 +1226,7 @@ mod tests {
         };
         // Folded: header, the three-line head preview, then the hint.
         assert_eq!(
-            plain(&cell.lines(60, &folded_all())),
+            plain(&cell.lines(60, &folded_all(), true)),
             vec![
                 "● bash(ls -la) · 4.2s",
                 " ⎿  a",
@@ -1229,7 +1237,7 @@ mod tests {
         );
         // Expanded: the whole output, no hint.
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● bash(ls -la) · 4.2s",
                 " ⎿  a",
@@ -1254,7 +1262,7 @@ mod tests {
         // column — the result string ("created … (14 bytes)") is gone, since
         // the body itself is the more useful statement.
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● write(src/a.py) · 120ms",
                 " ⎿    (+3 -0) created",
@@ -1274,7 +1282,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let rendered = cell.lines(60, &expanded_all());
+        let rendered = cell.lines(60, &expanded_all(), true);
         assert_eq!(
             plain(&rendered),
             vec![
@@ -1308,14 +1316,14 @@ mod tests {
         };
         // Folded: the stat row plus eight content rows, then the hint. Rows are
         // laid out first and folded second, so the hint is never content.
-        let folded = plain(&cell.lines(80, &folded_all()));
+        let folded = plain(&cell.lines(80, &folded_all(), true));
         assert_eq!(folded.len(), 1 + DIFF_BODY_MAX_LINES + 1);
         assert_eq!(folded[1], " ⎿    (+12 -0) created");
         assert_eq!(folded[8], "    + line 7");
         assert_eq!(folded[9], " … +5 lines (ctrl+o to expand)");
 
         // Expanded: every row, no hint.
-        let expanded = plain(&cell.lines(80, &expanded_all()));
+        let expanded = plain(&cell.lines(80, &expanded_all(), true));
         assert_eq!(expanded.len(), 1 + 13);
         assert_eq!(expanded.last().unwrap(), "    + line 12");
     }
@@ -1332,7 +1340,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● read(a.rs)",
                 " ⎿  1 fn main() {",
@@ -1354,7 +1362,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let rendered = plain(&cell.lines(20, &expanded_all()));
+        let rendered = plain(&cell.lines(20, &expanded_all(), true));
         // The code row wraps at the column budget and keeps every character,
         // including the space it broke at.
         let joined: String = rendered[2..]
@@ -1380,11 +1388,11 @@ mod tests {
         // The failure rides in the card body, outside any cap, in the error
         // style; no preview follows a failed call.
         assert_eq!(
-            plain(&cell.lines(40, &expanded_all())),
+            plain(&cell.lines(40, &expanded_all(), true)),
             vec![r#"✗ echo({ "x": 1 })"#, " ⎿  unknown tool"]
         );
         assert_eq!(
-            cell.lines(40, &expanded_all())[1].spans[1].style.fg,
+            cell.lines(40, &expanded_all(), true)[1].spans[1].style.fg,
             Some(theme::ERROR)
         );
 
@@ -1396,7 +1404,7 @@ mod tests {
             duration_ms: None,
         };
         assert_eq!(
-            plain(&cell.lines(40, &expanded_all())),
+            plain(&cell.lines(40, &expanded_all(), true)),
             vec!["● ping", " ⎿  pong"]
         );
     }
@@ -1411,13 +1419,13 @@ mod tests {
             duration_ms: Some(120),
         };
         // The header carries the command's first row only.
-        let folded = cell.lines(60, &folded_all());
+        let folded = cell.lines(60, &folded_all(), true);
         assert_eq!(plain(&folded)[0], "● bash(echo one) · 120ms");
         assert_eq!(folded.len(), 3, "header + two output rows, no args block");
 
         // Expanded, the full command rides above the output under the spine.
         assert_eq!(
-            plain(&cell.lines(60, &expanded_all())),
+            plain(&cell.lines(60, &expanded_all(), true)),
             vec![
                 "● bash(echo one) · 120ms",
                 " ⎿  echo one",
@@ -1437,7 +1445,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let lines = cell.lines(40, &expanded_all());
+        let lines = cell.lines(40, &expanded_all(), true);
         let glyph = &lines[0].spans[0];
         assert_eq!(glyph.content.as_ref(), "●");
         assert_eq!(glyph.style.fg, Some(theme::TOOL_MUTATE));
@@ -1450,7 +1458,7 @@ mod tests {
             error: Some("boom".to_string()),
             duration_ms: None,
         };
-        let lines = cell.lines(40, &expanded_all());
+        let lines = cell.lines(40, &expanded_all(), true);
         assert_eq!(lines[0].spans[0].content.as_ref(), "✗");
         assert_eq!(lines[0].spans[0].style.fg, Some(theme::ERROR));
     }
@@ -1464,7 +1472,7 @@ mod tests {
             error: None,
             duration_ms: None,
         };
-        let lines = cell.lines(40, &expanded_all());
+        let lines = cell.lines(40, &expanded_all(), true);
         // The `⎿` spine takes the read category color, the body stays dim.
         assert_eq!(lines[1].spans[0].content.as_ref(), BRACKET_FIRST);
         assert_eq!(lines[1].spans[0].style.fg, Some(theme::TOOL_READ));
@@ -1537,7 +1545,7 @@ mod tests {
                 ],
             }],
         });
-        let rendered = cell.lines(60, &expanded_all());
+        let rendered = cell.lines(60, &expanded_all(), true);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| {
@@ -1586,7 +1594,7 @@ mod tests {
                 )],
             }],
         });
-        let rendered = cell.lines(40, &expanded_all());
+        let rendered = cell.lines(40, &expanded_all(), true);
         let text: Vec<String> = rendered
             .iter()
             .map(|line| {

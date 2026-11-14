@@ -115,17 +115,24 @@ pub enum Budget {
 /// [`chat::DIFF_BODY_MAX_LINES`](crate::tui::chat).
 pub fn build(name: &str, arguments: &str, result: &str, budget: Budget) -> Option<Body> {
     let parsed: serde_json::Value = serde_json::from_str(arguments.trim()).ok()?;
-    build_parsed(name, Some(&parsed), result, budget)
+    build_parsed(name, Some(&parsed), result, budget, true)
 }
 
 /// [`build`] over an arguments value the caller already parsed — the card
 /// shares one parse between its header summary and this body, so a huge
 /// `write` payload is only deserialized once per rebuild.
+///
+/// `highlight` gates tokenization. Off-screen cards build without it: the
+/// transcript first renders every cell plain to get its line count, and only
+/// the cards the viewport actually shows are re-rendered highlighted —
+/// highlighting restyles spans without changing any text, so both builds
+/// agree on the layout.
 pub fn build_parsed(
     name: &str,
     parsed: Option<&serde_json::Value>,
     result: &str,
     budget: Budget,
+    highlight: bool,
 ) -> Option<Body> {
     let parsed = parsed?;
     let lang = parsed
@@ -135,7 +142,7 @@ pub fn build_parsed(
     match name {
         "write" => {
             let content = parsed.get("content").and_then(serde_json::Value::as_str)?;
-            Some(diff("", content, lang.as_deref(), caption(result), budget))
+            Some(diff("", content, lang.as_deref(), caption(result), budget, highlight))
         }
         "edit" => {
             let old = parsed
@@ -150,9 +157,10 @@ pub fn build_parsed(
                 lang.as_deref(),
                 caption(result),
                 budget,
+                highlight,
             ))
         }
-        "read" => Some(read(result, lang.as_deref(), budget)),
+        "read" => Some(read(result, lang.as_deref(), budget, highlight)),
         _ => None,
     }
 }
@@ -209,6 +217,7 @@ fn diff(
     lang: Option<&str>,
     caption: Option<String>,
     budget: Budget,
+    highlight: bool,
 ) -> Body {
     // The stat states the WHOLE change, so it counts every line even when the
     // rows below it are capped.
@@ -235,11 +244,11 @@ fn diff(
             let removed_rows = removed_total.min(left);
             hidden -= removed_rows;
             left -= removed_rows;
-            push_side(&mut rows, &lines_head(removed, removed_rows), Tone::Del, '-', lang);
+            push_side(&mut rows, &lines_head(removed, removed_rows), Tone::Del, '-', lang, highlight);
 
             let kept = lines_head(added, left);
             hidden -= kept.len();
-            push_side(&mut rows, &kept, Tone::Add, '+', lang);
+            push_side(&mut rows, &kept, Tone::Add, '+', lang, highlight);
             Body {
                 rows,
                 code: true,
@@ -261,17 +270,17 @@ fn diff(
                 lead: MARK.to_string(),
                 spans: vec![stat],
             });
-            push_side(&mut rows, &lines_head(removed, removed_rows), Tone::Del, '-', lang);
+            push_side(&mut rows, &lines_head(removed, removed_rows), Tone::Del, '-', lang, highlight);
 
             let added_head = head_budget - removed_rows;
             let kept_head = lines_head(added, added_head);
-            push_side(&mut rows, &kept_head, Tone::Add, '+', lang);
+            push_side(&mut rows, &kept_head, Tone::Add, '+', lang, highlight);
             let remaining = added_total - kept_head.len();
             if remaining > tail {
                 // Real omission: the marker stands for the middle, and the
                 // tail rows are the true end of the change.
                 rows.push(omitted_row(MARK, remaining - tail));
-                push_side(&mut rows, &lines_tail(added, tail), Tone::Add, '+', lang);
+                push_side(&mut rows, &lines_tail(added, tail), Tone::Add, '+', lang, highlight);
             } else if remaining > 0 {
                 // Everything left fits the tail budget: no marker, just the
                 // rows after the head.
@@ -281,6 +290,7 @@ fn diff(
                     Tone::Add,
                     '+',
                     lang,
+                    highlight,
                 );
             }
             Body {
@@ -319,8 +329,15 @@ fn omitted_row(lead: &str, omitted: usize) -> Row {
 
 /// One side of a diff: `lines` under their marker, highlighted as one block so
 /// a multi-line string or comment on that side parses across rows.
-fn push_side(rows: &mut Vec<Row>, lines: &[String], tone: Tone, mark: char, lang: Option<&str>) {
-    let segments = lang.filter(|_| !lines.is_empty()).map(|lang| {
+fn push_side(
+    rows: &mut Vec<Row>,
+    lines: &[String],
+    tone: Tone,
+    mark: char,
+    lang: Option<&str>,
+    highlight: bool,
+) {
+    let segments = lang.filter(|_| highlight && !lines.is_empty()).map(|lang| {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         highlight::block(lang, &refs)
     });
@@ -337,18 +354,18 @@ fn push_side(rows: &mut Vec<Row>, lines: &[String], tone: Tone, mark: char, lang
 /// A `read` result as a file body: the numbered window under a dim number
 /// column, with any non-numbered note (the `[N lines total]` caption, a
 /// truncation notice) kept below it as dim text.
-fn read(result: &str, lang: Option<&str>, budget: Budget) -> Body {
+fn read(result: &str, lang: Option<&str>, budget: Budget, highlight: bool) -> Body {
     match budget {
-        Budget::Head(max) => read_window(result, lang, Some(max)),
+        Budget::Head(max) => read_window(result, lang, Some(max), highlight),
         // Head+tail needs the total row count to place the marker, so the
         // window walk runs twice: once counting, once materializing each end.
         Budget::HeadTail { head, tail } => {
             let total = count_numbered_rows(result);
             if total <= head + tail {
-                return read_window(result, lang, None);
+                return read_window(result, lang, None, highlight);
             }
-            let head_rows = read_rows(result, lang, 0..head);
-            let tail_rows = read_rows(result, lang, total.saturating_sub(tail)..total);
+            let head_rows = read_rows(result, lang, 0..head, highlight);
+            let tail_rows = read_rows(result, lang, total.saturating_sub(tail)..total, highlight);
             let mut rows = head_rows;
             rows.push(omitted_row("", total - head - tail));
             rows.extend(tail_rows);
@@ -381,7 +398,7 @@ fn count_numbered_rows(result: &str) -> usize {
 
 /// The whole-window walk: at most `max` rows from the top (`None` = all of
 /// them), the rest counted into [`Body::hidden`] instead of materialized.
-fn read_window(result: &str, lang: Option<&str>, max: Option<usize>) -> Body {
+fn read_window(result: &str, lang: Option<&str>, max: Option<usize>, highlight: bool) -> Body {
     let max = max.unwrap_or(usize::MAX);
     let mut numbered: Vec<(String, String)> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -411,7 +428,7 @@ fn read_window(result: &str, lang: Option<&str>, max: Option<usize>) -> Body {
         .map(|(number, _)| number.len())
         .max()
         .unwrap_or(0);
-    let segments = lang.filter(|_| !numbered.is_empty()).map(|lang| {
+    let segments = lang.filter(|_| highlight && !numbered.is_empty()).map(|lang| {
         let refs: Vec<&str> = numbered.iter().map(|(_, text)| text.as_str()).collect();
         highlight::block(lang, &refs)
     });
@@ -446,7 +463,12 @@ fn read_window(result: &str, lang: Option<&str>, max: Option<usize>) -> Body {
 
 /// The numbered rows and notes of `result`'s `range` window, laid out under
 /// the number column, in the body's order: numbered rows first, then notes.
-fn read_rows(result: &str, lang: Option<&str>, range: std::ops::Range<usize>) -> Vec<Row> {
+fn read_rows(
+    result: &str,
+    lang: Option<&str>,
+    range: std::ops::Range<usize>,
+    highlight: bool,
+) -> Vec<Row> {
     let mut numbered: Vec<(String, String)> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     let mut seen = 0usize;
@@ -477,7 +499,7 @@ fn read_rows(result: &str, lang: Option<&str>, range: std::ops::Range<usize>) ->
         .map(|(number, _)| number.len())
         .max()
         .unwrap_or(0);
-    let segments = lang.filter(|_| !numbered.is_empty()).map(|lang| {
+    let segments = lang.filter(|_| highlight && !numbered.is_empty()).map(|lang| {
         let refs: Vec<&str> = numbered.iter().map(|(_, text)| text.as_str()).collect();
         highlight::block(lang, &refs)
     });

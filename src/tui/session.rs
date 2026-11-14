@@ -52,6 +52,10 @@ struct RenderedCell {
     /// cards (their body can be thousands of lines) and a Ctrl+T toggle
     /// must not invalidate tool cards.
     flag: Option<bool>,
+    /// Whether the lines carry syntax tokenization. Layout is identical
+    /// either way — highlighting restyles spans without changing text — so
+    /// off-screen cells stay plain until the viewport reaches them.
+    highlighted: bool,
     lines: Vec<Line<'static>>,
 }
 
@@ -116,13 +120,41 @@ impl SessionView {
     }
 
     /// The lines of cell `index` at `width` under `display`, rebuilt only
-    /// when the cached width or fold flags no longer match. Settled cells
+    /// when the cached width or fold flag no longer matches. Settled cells
     /// are immutable, so a hit is always current content.
+    ///
+    /// A miss builds without syntax highlighting: the caller only needs the
+    /// line count for the layout math (or is rendering off-screen), and a
+    /// plain build is identical in shape. Visible cells upgrade through
+    /// [`Self::cell_lines_highlighted`].
     pub fn cell_lines(
         &mut self,
         index: usize,
         width: usize,
         display: &CardDisplay,
+    ) -> &[Line<'static>] {
+        self.cell_lines_at(index, width, display, false)
+    }
+
+    /// [`Self::cell_lines`], guaranteed to carry syntax tokenization. Only
+    /// worth calling for cells the viewport shows — tokenizing a card's
+    /// 200-line head block is the expensive part of a rebuild, which is why
+    /// off-screen cells stay plain until scrolled into view.
+    pub fn cell_lines_highlighted(
+        &mut self,
+        index: usize,
+        width: usize,
+        display: &CardDisplay,
+    ) -> &[Line<'static>] {
+        self.cell_lines_at(index, width, display, true)
+    }
+
+    fn cell_lines_at(
+        &mut self,
+        index: usize,
+        width: usize,
+        display: &CardDisplay,
+        highlight: bool,
     ) -> &[Line<'static>] {
         self.sync_rendered();
         // Each card kind reads exactly one fold flag, and the text and
@@ -138,11 +170,22 @@ impl SessionView {
             width,
             display: *display,
         };
-        let current = matches!(&self.rendered[index], Some(rendered)
-            if rendered.key.width == width && rendered.flag == flag);
-        if !current {
-            let lines = self.history[index].lines(width, display);
-            self.rendered[index] = Some(RenderedCell { key, flag, lines });
+        let needs_build = match &self.rendered[index] {
+            Some(rendered) => {
+                rendered.key.width != width
+                    || rendered.flag != flag
+                    || (highlight && !rendered.highlighted)
+            }
+            None => true,
+        };
+        if needs_build {
+            let lines = self.history[index].lines(width, display, highlight);
+            self.rendered[index] = Some(RenderedCell {
+                key,
+                flag,
+                highlighted: highlight,
+                lines,
+            });
         }
         self.rendered[index]
             .as_ref()

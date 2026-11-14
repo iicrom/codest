@@ -1199,7 +1199,9 @@ impl App {
         // them would make the cache grow with the session for no benefit.
         while view.printed_cells < view.history.len() {
             let index = view.printed_cells;
-            let lines = view.cell_lines(index, width, &display);
+            // The flush is the cell's only render — scrollback cannot be
+            // rewritten later, so it carries the highlighted form.
+            let lines = view.cell_lines_highlighted(index, width, &display);
             pending.extend(lines.iter().cloned());
             view.drop_cell_render(index);
             pending.push(Line::from(""));
@@ -3658,7 +3660,13 @@ impl App {
             let cell_start = starts[index];
             let count = counts[index];
             if cell_start < end && start < cell_start + count {
-                let lines = view.cell_lines(index, width, &display);
+                // Visible cell: upgrade its cached render to the highlighted
+                // one. Off-screen cells stay plain — tokenizing a card's
+                // 200-line head block is the expensive part of a rebuild,
+                // and only the rows on screen are ever drawn. Highlighting
+                // restyles spans without changing text, so the layout from
+                // the plain pass stays valid.
+                let lines = view.cell_lines_highlighted(index, width, &display);
                 let from = start.saturating_sub(cell_start).min(count);
                 let to = (end - cell_start).min(count);
                 visible.extend(lines[from..to].iter().cloned());
@@ -5167,8 +5175,10 @@ mod tests {
 
         // Toggling a fold flag re-renders only the card cells — the text and
         // markdown cells don't read the flags, and they are the bulk of a
-        // long session's render cost. The expanded card is bounded by the
-        // head+tail budget, not the window.
+        // long session's render cost. The visible card costs two builds (the
+        // plain one for the layout counts, then the highlighted upgrade);
+        // off-screen cards stay plain until scrolled into view. The expanded
+        // card is bounded by the head+tail budget, not the window.
         app.show_tool_detail = true;
         chat::reset_render_calls();
         let _ = render_lines(&mut app, 110, 20);
@@ -5183,13 +5193,69 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(chat::render_calls(), card_cells);
+        assert!(
+            chat::render_calls() >= card_cells && chat::render_calls() <= card_cells * 2,
+            "one plain build per card, plus a highlight upgrade per visible card: {}",
+            chat::render_calls()
+        );
 
-        // A width change behaves the same way, one rebuild per cell.
+        // A width change behaves the same way.
         app.show_tool_detail = false;
         chat::reset_render_calls();
         let _ = render_lines(&mut app, 90, 20);
-        assert_eq!(chat::render_calls(), cells);
+        assert!(
+            chat::render_calls() >= cells && chat::render_calls() <= cells * 2,
+            "every cell rebuilds plain once; visible ones upgrade: {}",
+            chat::render_calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn off_screen_cards_build_plain_and_highlight_when_visible() {
+        // The read card sits above an assistant cell, so with follow mode the
+        // viewport shows only the tail and the card is off-screen.
+        let mut app = test_app();
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("hello".to_string()));
+        let big: String = (1..=2000)
+            .map(|n| format!("{n:6}\tlet field_{n} = compute({n});"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.view_mut().history.push(HistoryCell::ToolCall {
+            name: "read".to_string(),
+            arguments: r#"{"path": "src/big.rs"}"#.to_string(),
+            result: big,
+            error: None,
+            duration_ms: Some(1_000),
+        });
+        app.view_mut().history.push(HistoryCell::Assistant(
+            "answer\n".repeat(60),
+        ));
+        let card = 4; // three banner notices + user
+        let display = chat::CardDisplay {
+            thinking: false,
+            tool_detail: true,
+        };
+        // The render must cache under the same fold flag the queries use.
+        app.show_tool_detail = true;
+
+        // A settled render leaves the off-screen card plain.
+        let _ = render_lines(&mut app, 110, 20);
+        chat::reset_render_calls();
+        let plain = app.view_mut().cell_lines(card, 110, &display);
+        assert_eq!(chat::render_calls(), 0, "the plain cache already covers it");
+        let plain_len = plain.len();
+
+        // Asking for the highlighted render rebuilds it once — and the
+        // upgrade must not move a single row.
+        let highlighted = app.view_mut().cell_lines_highlighted(card, 110, &display);
+        assert_eq!(chat::render_calls(), 1, "the upgrade tokenizes");
+        assert_eq!(highlighted.len(), plain_len, "highlighting never relayouts");
+
+        // Then it is cached like any other render.
+        let _ = app.view_mut().cell_lines_highlighted(card, 110, &display);
+        assert_eq!(chat::render_calls(), 1);
     }
 
     #[tokio::test]
