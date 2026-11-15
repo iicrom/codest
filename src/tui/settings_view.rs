@@ -1279,7 +1279,7 @@ mod tests {
         // Esc cancels without touching the file.
         assert_eq!(view.handle_key(key(KeyCode::Esc)), None);
         assert!(view.capturing.is_none());
-        assert!(view.global().shortcuts.get("thinking").is_none());
+        assert!(!view.global().shortcuts.contains_key("thinking"));
     }
 
     #[test]

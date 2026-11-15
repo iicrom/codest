@@ -681,6 +681,18 @@ struct App {
     /// whenever the set changes (the struct is `Copy`, so it cannot borrow a
     /// lazily-built `Vec`).
     enabled_tools_vec: Vec<String>,
+    /// The active session's system-prompt appendix (plugin mode
+    /// instructions, `Op::SetSystemPromptAppendix`), mirroring the worker.
+    /// Updated optimistically by the applying effect and authoritatively on
+    /// `SystemAppendixSwitched` (which also resyncs after session switches:
+    /// the appendix is per session). Session state — never persisted, so a
+    /// restored run starts without it.
+    system_appendix: Option<String>,
+    /// [`Self::system_sections`] plus one `appendix` entry while
+    /// [`Self::system_appendix`] is set — the borrowed form [`PluginInfo`]
+    /// and the `/usage` estimate read. Rebuilt whenever either source
+    /// changes, so neither can observe a stale slice.
+    system_sections_with_appendix: Vec<(String, String)>,
     /// Whether thinking cards render expanded by default. Global across
     /// sessions; Ctrl+T and `/thinking` both toggle it, and committed
     /// Thinking cells re-fold with the next frame. Independent of
@@ -1035,6 +1047,11 @@ impl App {
         let enabled_tools: std::collections::BTreeSet<String> =
             tools.iter().map(|spec| spec.name.to_string()).collect();
         let enabled_tools_vec: Vec<String> = enabled_tools.iter().cloned().collect();
+        // No session has an appendix at startup; the mirror starts as the
+        // plain sections and grows the `appendix` entry with the first
+        // `SystemAppendixSwitched`.
+        let system_appendix: Option<String> = None;
+        let system_sections_with_appendix = system_sections.clone();
         // The shortcut rows `/settings` shows, built once from the registry
         // (`core::keymap::setting_field` leaks their static strings once per
         // run) so repeated `/settings` opens never rebuild them.
@@ -1081,6 +1098,8 @@ impl App {
             tools,
             enabled_tools,
             enabled_tools_vec,
+            system_appendix,
+            system_sections_with_appendix,
             show_thinking: false,
             show_tool_detail: false,
             status: None,
@@ -3393,7 +3412,7 @@ impl App {
             total_output: view.total_output,
             total_cached: view.total_cached,
             turns: &view.turns,
-            system_sections: &self.system_sections,
+            system_sections: &self.system_sections_with_appendix,
             cells: &view.history,
         };
         crate::tui::usage_view::build_usage_report(&data)
@@ -3857,6 +3876,28 @@ impl App {
         self.enabled_tools_vec = self.enabled_tools.iter().cloned().collect();
     }
 
+    /// Apply a system-prompt appendix change: update the mirror optimistically,
+    /// tell the core. The core's `SystemAppendixSwitched` event is the
+    /// authoritative confirmation (mirroring `/tools`).
+    fn apply_system_appendix(&mut self, appendix: Option<String>) {
+        self.set_system_appendix(appendix.clone());
+        self.session.set_system_prompt_appendix(appendix);
+    }
+
+    /// Store the appendix and the sections mirror together, so [`PluginInfo`]
+    /// and the `/usage` estimate can never observe a stale slice.
+    fn set_system_appendix(&mut self, appendix: Option<String>) {
+        self.system_appendix = appendix;
+        self.system_sections_with_appendix = match &self.system_appendix {
+            Some(text) if !text.trim().is_empty() => {
+                let mut sections = self.system_sections.clone();
+                sections.push(("appendix".to_string(), text.clone()));
+                sections
+            }
+            _ => self.system_sections.clone(),
+        };
+    }
+
     /// `/thinking`: fold or unfold the model's thinking cards. The command
     /// spelling of Ctrl+T, kept for discoverability and for hosts without the
     /// key. A global display flag, so committed Thinking cells in every
@@ -3921,7 +3962,7 @@ impl App {
             total_output: view.total_output,
             total_cached: view.total_cached,
             plugin_ids: self.plugins.plugin_ids(),
-            system_sections: &self.system_sections,
+            system_sections: &self.system_sections_with_appendix,
             effort: self.effort.as_deref(),
             request: crate::plugins::RequestFacts {
                 protocol: &self.request_facts.protocol,
@@ -4039,6 +4080,18 @@ impl App {
                 PluginEffect::ClearStatus(key) => {
                     self.status_segments
                         .retain(|(existing, _)| existing != &key);
+                }
+                PluginEffect::SetToolsEnabled(enabled) => {
+                    // Like `/tools` itself: optimistic mirror plus a notice,
+                    // the core's `ToolsSwitched` event is the authoritative
+                    // confirmation. Ops apply between turns, so a mid-turn
+                    // request still takes effect before the next one.
+                    self.apply_tools(enabled);
+                }
+                PluginEffect::SetSystemPromptAppendix(appendix) => {
+                    // Optimistic mirror, the core's `SystemAppendixSwitched`
+                    // event is the authoritative confirmation.
+                    self.apply_system_appendix(appendix);
                 }
             }
         }
@@ -4209,6 +4262,13 @@ impl App {
                 // send the same event with the session's own set, so the
                 // mirror resyncs here too.
                 self.set_enabled_tools(enabled);
+            }
+            EventMsg::SystemAppendixSwitched { appendix } => {
+                // The applying effect already updated optimistically; the
+                // core confirms. Session switches and creations send the
+                // same event with the session's own appendix, so the mirror
+                // resyncs here too.
+                self.set_system_appendix(appendix);
             }
             EventMsg::AgentMessage { message } => {
                 self.view_mut().live = Some(message);

@@ -85,6 +85,8 @@ collects them and applies each one. This is the only way a plugin can act:
 | `ContinueTurn` | `ctx.continue_turn()` | Drive the current transcript without a new message (`/continue`) — only while idle |
 | `SetStatus(StatusSegment)` | `ctx.set_status(segment)` | Upsert one footer segment (`plugin:key`) |
 | `ClearStatus(key)` | `ctx.clear_status(key)` | Remove one footer segment |
+| `SetToolsEnabled(Vec<String>)` | `ctx.set_tools_enabled(list)` | Replace the active session's enabled-tool set — the whole set, like `/tools`; applied between turns |
+| `SetSystemPromptAppendix(Option<String>)` | `ctx.set_system_prompt_appendix(text)` | Append one block to the session's system prompt for every request (`None` clears); session state, not persisted |
 
 Effects are collected in plugin order and applied in that order. The
 idle-gated effects make recursion impossible: `on_user_message` runs after

@@ -81,6 +81,8 @@ trait 及其交换的数据都在契约 crate
 | `ContinueTurn` | `ctx.continue_turn()` | 不追加新消息、直接驱动当前 transcript（`/continue`）——仅空闲时生效 |
 | `SetStatus(StatusSegment)` | `ctx.set_status(segment)` | 按键 upsert 一个页脚分段（`plugin:key`） |
 | `ClearStatus(key)` | `ctx.clear_status(key)` | 移除一个页脚分段 |
+| `SetToolsEnabled(Vec<String>)` | `ctx.set_tools_enabled(list)` | 整体替换当前会话的启用工具集——同 `/tools`，轮间生效 |
+| `SetSystemPromptAppendix(Option<String>)` | `ctx.set_system_prompt_appendix(text)` | 向会话 system prompt 追加一段文字，随每次请求发送（`None` 清除）；会话期状态，不持久化 |
 
 副作用按插件顺序收集、按同一顺序应用。受空闲门控的效果让递归不可能：
 `on_user_message` 在 `busy` 置位之后运行，`on_turn_complete` 在其清除之前

@@ -41,7 +41,7 @@ pub mod config;
 /// a plugin built against an incompatible contract simply fails to compile.
 /// This constant exists for diagnostics (`/status`, logs) and for the
 /// `cst-plugin-api` dependency range in a plugin's `Cargo.toml`.
-pub const PLUGIN_API_VERSION: u32 = 1;
+pub const PLUGIN_API_VERSION: u32 = 2;
 
 pub use auth::AuthMethod;
 pub use auth::AuthMethodKind;
