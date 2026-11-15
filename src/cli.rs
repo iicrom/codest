@@ -257,6 +257,7 @@ pub async fn run_with(
             .iter()
             .map(|(id, settings)| (id.clone(), settings.clone()))
             .collect(),
+        global.shortcuts,
     )
     .await
 }

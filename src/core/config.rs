@@ -74,6 +74,15 @@ pub struct GlobalConfig {
     /// plugin segments on, in the order the plugins set them.
     #[serde(default)]
     pub status_bar: StatusBarConfig,
+    /// Keyboard shortcut overrides (`[shortcuts]`): each key names a
+    /// registered shortcut (the host's own ids are bare, `"thinking"`; a
+    /// plugin's are scoped `"tps:rate"`), the value is a comma-separated
+    /// combo list (`"ctrl+t, alt+y"`). Validated against the shortcut
+    /// registry at startup — an unknown id, a reserved or malformed combo,
+    /// or a collision with another binding is an error, not a silent
+    /// no-op. Absent keys keep the registered defaults.
+    #[serde(default)]
+    pub shortcuts: BTreeMap<String, String>,
     /// Per-plugin settings (`[plugins."<id>"]`). The host interprets no
     /// plugin key — each table is that plugin's pocket
     /// ([`cst_plugin_api::config::PluginSettings`]); a plugin reads its own
@@ -105,6 +114,7 @@ impl Default for GlobalConfig {
             max_tool_rounds: None,
             tool_output_token_limit: default_tool_output_token_limit(),
             status_bar: StatusBarConfig::default(),
+            shortcuts: BTreeMap::new(),
             plugins: BTreeMap::new(),
         }
     }

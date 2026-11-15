@@ -29,7 +29,7 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 
 ## `config.toml`
 
-全局文件有若干顶层键加两张表：
+全局文件有若干顶层键加三张表：
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
@@ -39,6 +39,7 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 | `max_tool_rounds` | integer | 缺省 | 每个用户回合「模型 → 工具 → 模型」轮数的可选上限。 |
 | `tool_output_token_limit` | integer | `4000` | 单条工具结果进入会话的预算（估算 token）：超限的结果以「头部 + 截断提示 + 尾部」进入对话；rollout 文件与工具卡片保留完整输出。`0` 关闭裁剪。 |
 | `[status_bar]` | table | 分段开启 | 页脚：`plugin_segments` 总开关与插件分段的 `order` 显示优先级，外加宿主上下文读数的 `context` / `cache_rate` 开关。 |
+| `[shortcuts]` | table | — | 快捷键改绑；见下文小节。 |
 | `[plugins."<id>"]` | table | — | 插件私有的配置口袋；宿主不解释任何键。 |
 
 ```toml
@@ -52,6 +53,12 @@ default_effort = "high"               # /model 里 Ctrl+S 同时写入这两个�
 [status_bar]
 plugin_segments = true                # 页脚显示插件分段（默认开启）
 order = ["tps:rate", "tps:spark"]     # 显示优先级，从左到右
+
+[shortcuts]                           # 改绑已注册的快捷键（全部可选）
+thinking = "ctrl+t, alt+t"            # 备选组合以逗号分隔
+tool_detail = "ctrl+o"
+page_up = ""                          # 空值 = 彻底禁用
+"tps:meter" = "ctrl+g"                # 插件快捷键以 plugin:id 命名
 
 [plugins.tps]                         # 内置 tps 计量器的口袋
 enabled = true                        # 启动即开启计量（默认关闭）
@@ -67,6 +74,8 @@ enabled = true                        # 启动即开启计量（默认关闭）
 
 **`[status_bar]`** 控制页脚的可选部分。`plugin_segments` 是插件一侧的总开关；`order` 以显示优先级列出完整分段键（`plugin:key`）；未列出的分段保持注册顺序，当前没有东西在显示的键会被忽略，所以过期条目没有代价。窄终端上优先级最低的分段先丢弃。宿主自己的上下文读数有两个开关：`context`（`used/window (n%)` 分段本体；关闭后只剩模型 · effort · 状态骨架）和 `cache_rate`（其中的 `cache 80%` 部分，仅在后端上报缓存 prompt token 时出现）。两者默认开启，可在 `/settings` 中实时修改。
 
+**`[shortcuts]`** 改绑键盘快捷键。每个键指名一个已注册的快捷键——宿主自己的 id 是裸名（`thinking`、`tool_detail`、`page_up`、`page_down`、`jump_bottom`、`history_prev`、`history_next`、`quit`），插件的是 `plugin:id` 作用域形式（`tps:meter`）；值是逗号分隔的组合串（`"ctrl+t, alt+t"`）；**空值**（`thinking = ""`）表示彻底禁用该快捷键——任何键都不触发，而缺省（无此键）则按注册默认运行。语法约束：字符键必须带 `ctrl` 或 `alt`；`Esc`、`Enter`、`Tab` 与输入框的编辑键是保留键，会被拒绝；与其他快捷键已绑组合冲突同样是错误。注册时锁定（`fixed`）的快捷键不可改绑。校验与本文件其余部分同样严格：未知 id、非法组合或冲突都会让启动失败并指名问题键。同样的修改也可以在 `/settings` 的专属 **Shortcuts** 卡上完成（并且预先校验过）——每张卡按已注册快捷键自动生成一行，宿主动作与插件注册项都在这张卡上（插件的行会带上属主标注，如 `Toggle tps meter (tps)`）；注册了快捷键的插件天生就是可改绑的。改绑是**按键捕获**而非手动输入：`Enter` 进入捕获后，按下的组合即为新绑定，`Enter` 前继续按可添加备选；被拒绝的键（保留键、裸字符、已被绑定的组合）不会进入捕获；`Esc` 取消。`Backspace` 提交**空绑定**，即**彻底禁用**该快捷键——任何键都不触发它，行值显示 `(disabled)`——这与手工删除 `[shortcuts]` 中的键不同（删除后恢复注册默认）。要回到默认绑定，重新捕获默认组合即可。
+
 **`[plugins."<id>"]`** 是按插件的配置口袋——整张表原样交给插件
 （[plugins.md](plugins.md) 第 6 节），插件经 `PluginContext::plugin_settings()`
 读取。命名未知插件 id 的表是**启动错误**（静默无操作会掩盖拼写错误），所以
@@ -74,18 +83,20 @@ enabled = true                        # 启动即开启计量（默认关闭）
 
 ### `/settings`
 
-`/settings` 就是编辑这个文件的界面：一张卡放宿主自己的选项（目前是
-`[status_bar] plugin_segments`、`[status_bar] context`、`[status_bar] cache_rate`
-与 `double_press_interrupt`），每个声明了设置的插件各一张卡，每行显示已存
-的值或默认值。`↑`/`↓` 走行，`Enter` 翻转开关 / 推进列表 / 打开单行编辑器，
+/settings 就是编辑这个文件的界面：一张卡放宿主自己的选项（`[status_bar] plugin_segments`、`[status_bar] context`、`[status_bar] cache_rate`、`double_press_interrupt`），一张专属 **Shortcuts** 卡放所有已注册的键盘快捷键——宿主动作在前、插件注册项随后，绝不与选项卡混排，可用 `/settings shortcuts` 直接聚焦——每个声明了设置的插件各一张卡，每行显示已存的值或默认值。`↑`/`↓` 走行，`Enter` 翻转开关 / 推进列表 / 打开单行编辑器（Shortcuts 行改为捕获按下的组合），
 `←`/`→` 前后步进列表（与开关），`Esc` 关闭；`/settings tps` 打开时直接聚焦该
 卡。
 
 ```text
- Settings › tps                                            1/2
- codest  ·  tps
+ Settings › tps                                            1/3
+ codest  ·  Shortcuts  ·  tps
 ╭─ codest ─ 宿主设置 ──────────────────────────────────────╮
 │ ❯ 插件状态分段                                     [x]   │
+╰──────────────────────────────────────────────────────────╯
+╭─ Shortcuts ─ 键盘快捷键 ─────────────────────────────────╮
+│   Thinking cards                              ctrl+t     │
+│   …（每个已注册快捷键一行）                                │
+│   Toggle tps meter (tps)                      ctrl+g     │
 ╰──────────────────────────────────────────────────────────╯
 ╭─ tps ─ 吞吐计量 ─────────────────────────────────────────╮
 │   tokens/秒 计量器                                 [x]   │

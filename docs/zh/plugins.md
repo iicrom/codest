@@ -452,6 +452,47 @@ fn on_settings_changed(
 关，写进 `[plugins.tps] enabled`，并且即时应用，所以不重启也能打开计量器。它
 的 `/tps` 命令仍是同一个开关的「仅本次运行」快捷方式。
 
+### 快捷键
+
+插件可以在设置之外注册键盘快捷键：从 `Plugin::shortcuts()` 返回 spec 列表，
+`/settings` 的专属 **Shortcuts** 卡（与选项卡分开）就会为每个快捷键自动生成
+一行（与宿主自己的键一样可改绑，注册时 `fixed: true` 则锁定；行 label 带上属
+主标注 `Toggle tps meter (tps)`，不同插件同名也不会混淆），匹配的按键会带着
+spec 自身的 id 分发到 `Plugin::on_shortcut`。宿主把 id 作用域化为 `plugin:id`
+——与状态分段同一约定——并在启动时校验默认组合：非法组合、保留键（中断守卫、
+输入框编辑键、补全）、重复 id，或与其他注册冲突的组合都会让构建失败。
+
+```rust
+use cst_plugin_api::shortcuts::ShortcutSpec;
+
+static SHORTCUTS: [ShortcutSpec; 1] = [ShortcutSpec::new(
+    "meter",
+    "Toggle tps meter",
+    "Flip the tokens-per-second status meter, like /tps.",
+    "ctrl+g",
+    false, // `true` 锁定绑定，禁止改绑
+)];
+
+fn shortcuts(&self) -> &'static [ShortcutSpec] {
+    &SHORTCUTS
+}
+
+fn on_shortcut(&self, id: &str, ctx: &mut PluginContext<'_>) -> Result<(), PluginError> {
+    if id == "meter" {
+        self.toggle(ctx); // 经 ctx 返回副作用，与其他 hook 相同
+        return Ok(());
+    }
+    Err(PluginError::new(format!("unhandled shortcut `{id}`")))
+}
+```
+
+分发只发生在纯聊天状态——整帧界面、菜单与对话框先行持有键盘——处理函数与其
+他 hook 一样经 `PluginContext` 返回副作用。用户可以在 `config.toml` 的
+`[shortcuts] "tps:meter"` 下改绑，也可以在 Shortcuts 卡生成的行上直接按下新
+组合捕获（`Backspace` 彻底禁用该快捷键——任何键都不触发）。
+
+
+
 **监控插件端到端：**订阅 `EventSubscription::ALL`，把 `SNAPSHOT` 事件当作
 权威 transcript，在 spawn 出的 WebSocket 服务器里尽力转发分批的增量，用
 `ctx.submit_user_turn()` 支持远端提交 prompt。参考监控端（pi-monitor）的

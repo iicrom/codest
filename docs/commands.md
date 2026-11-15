@@ -112,11 +112,13 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 | `Ctrl+W` / `Alt+Backspace` | Delete the previous word. |
 | `Ctrl+U` / `Ctrl+K` | Kill to line start / end. |
 | Mouse wheel (fullscreen) | Scroll the transcript (3 lines per notch; `Alt`+wheel = 15). |
+| Mouse drag (fullscreen) | Select transcript text; releasing copies it to the clipboard (double-click = word, triple = line, `Esc` clears). |
 | `PageUp` / `PageDown` | Scroll the transcript (fullscreen); handed to the terminal in inline mode. |
 | `Ctrl+End` | Jump to the newest line and resume following (fullscreen); `End` alone in inline mode. |
-| `Esc` | Close the candidate popup; interrupt the turn while generating — twice, when the interrupt confirm is on (`double_press_interrupt`). |
+| `Esc` | Close the candidate popup; clear the selection; interrupt the turn while generating — twice, when the interrupt confirm is on (`double_press_interrupt`). |
 | `Ctrl+T` | Expand/collapse thinking cards. |
 | `Ctrl+O` | Expand/collapse tool output (folded preview shows the first 3 lines). |
+| `Ctrl+G` | Toggle the tps meter (`tps:meter`, registered by the plugin). |
 | `Ctrl+S` | In the `/model` menu, save the highlighted model and effort as the startup default. |
 | `Ctrl+C` | Interrupt while generating (twice with the interrupt confirm on); clear input; double-press on empty input to quit. |
 | `Ctrl+D` | Quit on empty input. |
@@ -129,6 +131,8 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 - **`Ctrl+C` has three states.** While generating it interrupts the turn (queued messages keep their place and run next) — with the interrupt confirm on (`/settings` → *Confirm interrupt*, `double_press_interrupt` in `config.toml`, on by default) the first press only shows a hint and a second press inside two seconds interrupts, for Esc alike; with text in the composer it clears the input; on empty input it must be pressed twice in quick succession to quit.
 - **The `/model` menu carries an effort strip.** Under the model rows it shows the highlighted model's levels plus `off`, bracketing what Enter would set: the drafted level, the active effort for the current model, or the model's own default. `Tab`/`Shift+Tab` cycle the draft and `Enter` applies model and effort together (nothing is sent while browsing); `Ctrl+S` writes the shown combination to `config.toml` as `default` and `default_effort`, which fresh sessions start from (a profile's `effort` still wins over it).
 - **`Ctrl+D`** quits only on empty input — with text present it does nothing.
+- **Mouse text selection (fullscreen).** Press and drag over the transcript to select; releasing copies the highlighted text to the clipboard — a native utility first (`pbcopy`, `wl-copy`/`xclip`/`xsel`), then `tmux load-buffer -w`, then the OSC 52 sequence for the terminal itself. The footer flash names the route when it is not the obvious one (`copied 128 chars (osc52)`). A double click selects the word under it, a triple click the whole line; wheel scrolling keeps the selection pinned to its text; `Esc` (or any other key) clears it. Inline mode does not capture the mouse, so the terminal's own selection applies there.
+- **Rebindable shortcuts.** The eight host actions above (`Ctrl+T`, `Ctrl+O`, `PageUp`/`PageDown`, `Ctrl+End`, `Ctrl+P`/`Ctrl+N`, `Ctrl+D`) and every registered plugin shortcut have their rows on the dedicated **Shortcuts** card in `/settings` (`/settings shortcuts` focuses it) — kept apart from the options cards; typing a combo list there (`ctrl+t, alt+y`) rebinds the action, an empty entry restores the default, and reserved keys (the interrupt guard, the composer's editing keys, completion) plus other bindings' combos are refused. Under the hood this is the `[shortcuts]` table in `config.toml` — see [configuration.md](configuration.md). The interrupt guard, the composer's keys, and completion itself are not rebindable.
 
 ## Related
 

@@ -106,6 +106,8 @@ pub enum PluginHostError {
     UnknownFilteredPlugin { id: String, known: String },
     #[error(transparent)]
     CommandTable(#[from] CommandTableError),
+    #[error(transparent)]
+    Shortcuts(#[from] crate::core::keymap::KeymapError),
 }
 
 /// Commands the front-end ships with and handles itself. They live in the
@@ -134,6 +136,12 @@ pub struct PluginHost {
     /// plugin's tools; `Some(ids)` keeps only the named plugins'. Commands,
     /// hooks, prompts, and protocols are never filtered.
     tool_filter: Option<Vec<String>>,
+    /// The merged shortcut registry: the host's own actions first, then each
+    /// plugin's declarations in registration order, validated at build time
+    /// ([`crate::core::keymap::build_registry`]). The front-end builds its
+    /// [`crate::core::keymap::Keymap`] over this plus the `[shortcuts]`
+    /// overrides.
+    shortcuts: Vec<crate::core::keymap::ShortcutEntry>,
     /// The sink background tasks send their effects through
     /// ([`PluginBridge`]). Shared by every dispatch; the paired receiver is
     /// claimed once by the front-end via [`PluginHost::take_effects_receiver`].
@@ -225,6 +233,14 @@ impl PluginHost {
             }
         }
 
+        // Shortcut registrations join the host's own into one registry. A
+        // spec with a malformed default combo, a reserved key, a duplicate
+        // id, or a binding another registration already claims is a startup
+        // error — the same discipline as duplicated tool names.
+        let plugin_specs: Vec<(&'static str, &'static [cst_plugin_api::shortcuts::ShortcutSpec])> =
+            plugins.iter().map(|plugin| (plugin.id(), plugin.shortcuts())).collect();
+        let shortcuts = crate::core::keymap::build_registry(&plugin_specs)?;
+
         let (effects_sink, effects_rx) = Self::build_effects_channel();
         Ok(Self {
             plugins,
@@ -232,6 +248,7 @@ impl PluginHost {
             ids,
             tools,
             tool_filter,
+            shortcuts,
             effects_sink,
             effects_rx,
             cancel: CancellationToken::new(),
@@ -496,6 +513,40 @@ impl PluginHost {
                 let mut ctx = self.context(plugin.id(), info);
                 plugin.on_settings_changed(settings, &mut ctx);
                 PluginOutput::from_ctx(ctx)
+            }
+            None => PluginOutput::empty(),
+        }
+    }
+
+    /// The merged shortcut registry: the host's own entries first, then each
+    /// plugin's, validated at build time. `/settings` renders rows from this;
+    /// the front-end's [`crate::core::keymap::Keymap`] resolves keys over it.
+    pub fn shortcut_registry(&self) -> &[crate::core::keymap::ShortcutEntry] {
+        &self.shortcuts
+    }
+
+    /// Dispatch one plugin shortcut trigger. `full_id` is the scoped id
+    /// (`"tps:meter"`); the plugin's [`Plugin::on_shortcut`] receives its own
+    /// (unscoped) spec id. An `Err` from the handler becomes a visible error
+    /// effect, like a failing command.
+    pub fn shortcut_triggered(&self, full_id: &str, info: PluginInfo<'_>) -> PluginOutput {
+        let Some(entry) = self.shortcuts.iter().find(|entry| entry.full_id == full_id) else {
+            return PluginOutput::empty();
+        };
+        let Some(plugin_id) = entry.owner else {
+            return PluginOutput::empty();
+        };
+        match self.owner_of_id(plugin_id) {
+            Some(plugin) => {
+                let mut ctx = self.context(plugin.id(), info);
+                let result = plugin.on_shortcut(entry.spec.id, &mut ctx);
+                let mut output = PluginOutput::from_ctx(ctx);
+                if let Err(error) = result {
+                    output
+                        .effects
+                        .push(PluginEffect::Error(error.message().to_string()));
+                }
+                output
             }
             None => PluginOutput::empty(),
         }

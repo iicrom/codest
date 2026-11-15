@@ -35,17 +35,33 @@ use crate::tui::theme;
 /// The marker a startup-only row carries, next to its label.
 const RESTART_MARK: &str = "⟲";
 
+/// The value chip of a shortcut row in capture mode: the combos pressed so
+/// far, in their display form — or the prompt while nothing has landed.
+fn capture_display(capture: &Capture) -> String {
+    if capture.combos.is_empty() {
+        return "press a combo…".to_string();
+    }
+    capture
+        .combos
+        .iter()
+        .map(cst_plugin_api::shortcuts::KeyCombo::display)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One card: a title, a one-line subtitle, and the fields it edits.
 pub struct Section {
     /// The card heading, shown on the border and in the section strip.
     pub title: String,
     /// The plugin that owns the card, when one does. `/settings <name>`
     /// accepts the id as well as the title, so a user who knows the id does
-    /// not have to know what the plugin called its card.
+    /// not have to know what a plugin called its card.
     pub id: Option<&'static str>,
     pub description: &'static str,
     pub owner: SettingOwner,
-    pub fields: &'static [SettingField],
+    /// The card's rows, owned: the static declared fields plus the shortcut
+    /// rows the registry generated for this owner.
+    pub fields: Vec<SettingField>,
 }
 
 /// What the screen asks the app to do after a key.
@@ -54,9 +70,16 @@ pub enum SettingsEvent {
     /// Esc: give the frame back to the chat.
     Close,
     /// A write landed; `section` names whose value changed so the app can
-    /// apply it (the file is already saved). `restart` is the edited field's
-    /// startup-only flag: the file changed, the running session must not.
-    Saved { section: usize, restart: bool },
+    /// apply it (the file is already saved), and `key` is the edited
+    /// setting's path — the app tells a shortcut save (a host-table key the
+    /// keymap consumes) from a plugin-pocket save (which notifies the
+    /// plugin). `restart` is the edited field's startup-only flag: the file
+    /// changed, the running session must not.
+    Saved {
+        section: usize,
+        restart: bool,
+        key: &'static str,
+    },
 }
 
 /// The row currently being edited.
@@ -66,11 +89,25 @@ struct Editor {
     line: LineEditor,
 }
 
+/// A shortcut row in capture mode: the pressed combos accumulate as the
+/// draft, `Enter` saves them, `Backspace` clears the binding outright, and
+/// `Esc` cancels. The capture is live — each keypress is validated the
+/// moment it lands (grammar, reserved keys, conflicts), so a rejected key
+/// never sneaks into the draft.
+struct Capture {
+    section: usize,
+    field: usize,
+    combos: Vec<cst_plugin_api::shortcuts::KeyCombo>,
+}
+
 pub struct SettingsView {
     file: SettingsFile,
     /// The document as of the last successful read or write.
     global: GlobalConfig,
     sections: Vec<Section>,
+    /// The shortcut registry the shortcut rows came from: draft validation
+    /// (grammar, reserved keys, conflicts, fixed bindings) runs against it.
+    shortcuts: Vec<crate::core::keymap::ShortcutEntry>,
     /// `values[section][field]`: the stored text, `None` while the key is
     /// absent (the row then shows the field's default).
     values: Vec<Vec<Option<String>>>,
@@ -78,6 +115,9 @@ pub struct SettingsView {
     focusable: Vec<(usize, usize)>,
     focus: usize,
     editing: Option<Editor>,
+    /// A shortcut row capturing keypresses. Mutually exclusive with
+    /// [`Self::editing`]: opening one dismisses the other.
+    capturing: Option<Capture>,
     /// The last save outcome: `(text, is_error)`.
     notice: Option<(String, bool)>,
     screen: Screen,
@@ -91,7 +131,11 @@ impl SettingsView {
     /// table and `GlobalConfig` disagree, which the validated write path
     /// prevents. Panicking names the file rather than silently showing
     /// defaults that are not what is stored.
-    pub fn new(file: SettingsFile, sections: Vec<Section>) -> Self {
+    pub fn new(
+        file: SettingsFile,
+        sections: Vec<Section>,
+        shortcuts: Vec<crate::core::keymap::ShortcutEntry>,
+    ) -> Self {
         let global = crate::core::config::load_global(file.path()).unwrap_or_else(|error| {
             panic!(
                 "{} parsed as TOML but not as a codest config: {error}",
@@ -102,10 +146,12 @@ impl SettingsView {
             file,
             global,
             sections,
+            shortcuts,
             values: Vec::new(),
             focusable: Vec::new(),
             focus: 0,
             editing: None,
+            capturing: None,
             notice: None,
             screen: Screen::default(),
         };
@@ -227,6 +273,13 @@ impl SettingsView {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+        // A shortcut capture owns the keyboard while it is open: every press
+        // is a candidate combo, with `Enter` to save, `Backspace` to clear
+        // the binding outright, and `Esc` to cancel.
+        if let Some(capture) = self.capturing.take() {
+            return self.handle_capture_key(capture, key);
+        }
+
         // The editor owns the keyboard while it is open.
         if let Some(mut editor) = self.editing.take() {
             match editor.line.handle_key(key) {
@@ -287,7 +340,8 @@ impl SettingsView {
     }
 
     /// Act on the focused row. `enter` distinguishes `Enter` (which opens a
-    /// text or number editor) from `→`/`Space` (which only step values).
+    /// text or number editor — or starts a shortcut capture) from
+    /// `→`/`Space` (which only step values).
     fn activate(&mut self, enter: bool) -> Option<SettingsEvent> {
         let (section, field) = self.focused()?;
         let spec = *self.sections.get(section)?.fields.get(field)?;
@@ -302,6 +356,25 @@ impl SettingsView {
             }),
             SettingKind::Number | SettingKind::Text => {
                 if enter {
+                    // A shortcut row captures the pressed combo instead of
+                    // taking typed text.
+                    if let Some(full_id) = self.shortcut_full_id(spec.key) {
+                        // A fixed registration locks its binding: the row
+                        // renders for discoverability, the capture never
+                        // opens.
+                        if self
+                            .shortcuts
+                            .iter()
+                            .find(|entry| entry.full_id == full_id)
+                            .is_some_and(|entry| entry.spec.fixed)
+                        {
+                            self.notice =
+                                Some((format!("{full_id} is fixed and cannot be rebound"), true));
+                            return None;
+                        }
+                        self.open_capture(section, field);
+                        return None;
+                    }
                     self.open_editor(section, field);
                 }
                 None
@@ -325,6 +398,105 @@ impl SettingsView {
             }),
             _ => None,
         }
+    }
+
+    /// Open capture mode on a shortcut row. The draft starts empty — the
+    /// row's current binding stays what it is until a key lands and is
+    /// accepted.
+    fn open_capture(&mut self, section: usize, field: usize) {
+        self.editing = None;
+        self.capturing = Some(Capture {
+            section,
+            field,
+            combos: Vec::new(),
+        });
+    }
+
+    /// One keypress while a shortcut capture is open. `Esc` cancels,
+    /// `Backspace` commits an *empty* binding — the shortcut is **disabled**
+    /// outright and no key fires it (an absent key, by contrast, would run
+    /// the registered default) — and `Enter` saves the captured combos.
+    /// Anything else is a candidate: grammar (`validate_combo`) and
+    /// conflicts against every *other* binding's effective combos are
+    /// checked the moment the key lands, so a rejected key never enters the
+    /// draft. Accepted keys keep the capture open, so pressing several
+    /// combos in a row adds alternatives.
+    fn handle_capture_key(
+        &mut self,
+        mut capture: Capture,
+        key: KeyEvent,
+    ) -> Option<SettingsEvent> {
+        match key.code {
+            KeyCode::Esc => return None, // cancelled: the capture stays dropped
+            KeyCode::Backspace => {
+                // The empty override is the disabled marker the keymap
+                // reads: the shortcut keeps no key at all.
+                return self.save(
+                    capture.section,
+                    capture.field,
+                    Some(SettingValue::Text(String::new())),
+                );
+            }
+            KeyCode::Enter => {
+                if capture.combos.is_empty() {
+                    // Nothing captured yet: bare `Enter` is not a combo of
+                    // its own, so it keeps the capture going.
+                    self.capturing = Some(capture);
+                    return None;
+                }
+                let text =
+                    cst_plugin_api::shortcuts::combo_list_string(&capture.combos);
+                return self.save(capture.section, capture.field, Some(SettingValue::Text(text)));
+            }
+            _ => {}
+        }
+        let Some(combo) = crate::tui::keymap::combo_from_event(&key) else {
+            // Key kinds the vocabulary does not name (media keys, keypad,
+            // …): ignored, the capture continues.
+            self.capturing = Some(capture);
+            return None;
+        };
+        if let Err(message) = cst_plugin_api::shortcuts::validate_combo(&combo) {
+            self.notice = Some((message, true));
+            self.capturing = Some(capture);
+            return None;
+        }
+        let spec_key = self
+            .sections
+            .get(capture.section)
+            .and_then(|model| model.fields.get(capture.field))
+            .map(|spec| spec.key);
+        let Some(full_id) = spec_key.and_then(|key| self.shortcut_full_id(key)) else {
+            self.capturing = Some(capture);
+            return None;
+        };
+        let keymap = match crate::core::keymap::Keymap::build(&self.shortcuts, &self.global.shortcuts)
+        {
+            Ok(keymap) => keymap,
+            Err(error) => {
+                // The document's stored shortcuts are broken (a hand edit
+                // raced the screen); refuse the candidate and say why.
+                self.notice = Some((format!("current shortcuts are invalid: {error}"), true));
+                self.capturing = Some(capture);
+                return None;
+            }
+        };
+        if let Some(other) = keymap.conflicts_with_other(&full_id, &combo) {
+            self.notice = Some((
+                format!(
+                    "`{}` is already bound by `{other}`",
+                    combo.canonical_string()
+                ),
+                true,
+            ));
+            self.capturing = Some(capture);
+            return None;
+        }
+        if !capture.combos.iter().any(|existing| existing.matches(&combo)) {
+            capture.combos.push(combo);
+        }
+        self.capturing = Some(capture);
+        None
     }
 
     /// Open the one-line editor on a text or number row, seeded with the
@@ -361,8 +533,10 @@ impl SettingsView {
             .flatten()
     }
 
-    /// Save the editor's text: empty removes the key (restoring the plugin's
-    /// default), anything else is parsed by the field's kind first.
+    /// Save the editor's text: empty removes the key (restoring the
+    /// plugin's default), anything else is parsed by the field's kind first.
+    /// (Shortcut rows never reach here — they capture keypresses through
+    /// [`Self::handle_capture_key`] instead.)
     fn commit_editor(
         &mut self,
         section: usize,
@@ -387,6 +561,15 @@ impl SettingsView {
         self.save(section, field, value)
     }
 
+    /// The registry entry a `shortcuts.*` settings key addresses, if any.
+    fn shortcut_full_id(&self, key: &str) -> Option<String> {
+        let full_id = key.strip_prefix("shortcuts.")?;
+        self.shortcuts
+            .iter()
+            .any(|entry| entry.full_id == full_id)
+            .then(|| full_id.to_string())
+    }
+
     /// Write one value and report it. A rejected write leaves the file as it
     /// was and shows the reason in the notice line.
     fn save(
@@ -406,7 +589,11 @@ impl SettingsView {
                 self.global = global;
                 self.reindex();
                 self.notice = Some((format!("saved {title}.{key}"), false));
-                Some(SettingsEvent::Saved { section, restart })
+                Some(SettingsEvent::Saved {
+                    section,
+                    restart,
+                    key,
+                })
             }
             Err(error) => {
                 self.notice = Some((format!("save failed: {error}"), true));
@@ -475,10 +662,20 @@ impl SettingsView {
                     .focusable
                     .iter()
                     .position(|pair| *pair == (index, field_index));
-                // While an editor is open it owns the highlight, so the
-                // pointer does not also mark whatever row the focus is on.
-                let is_focused = match &self.editing {
-                    Some(editor) => editor.section == index && editor.field == field_index,
+                // While an editor or a capture is open it owns the
+                // highlight, so the pointer does not also mark whatever row
+                // the focus is on.
+                let modal_row = self
+                    .editing
+                    .as_ref()
+                    .map(|editor| (editor.section, editor.field))
+                    .or_else(|| {
+                        self.capturing
+                            .as_ref()
+                            .map(|capture| (capture.section, capture.field))
+                    });
+                let is_focused = match modal_row {
+                    Some(pair) => pair == (index, field_index),
                     None => focus == Some(self.focus),
                 };
                 let row = self.field_row(index, field_index, spec, is_focused);
@@ -496,9 +693,14 @@ impl SettingsView {
             .editing
             .as_ref()
             .filter(|editor| editor.section == section && editor.field == field);
-        let value = match editing {
-            Some(editor) => editor.line.display(),
-            None => self.value_text(section, field, spec),
+        let capturing = self
+            .capturing
+            .as_ref()
+            .filter(|capture| capture.section == section && capture.field == field);
+        let value = match (editing, capturing) {
+            (Some(editor), _) => editor.line.display(),
+            (_, Some(capture)) => capture_display(capture),
+            _ => self.value_text(section, field, spec),
         };
         let value_style = match (spec.kind, focused) {
             (SettingKind::Boolean, _) => {
@@ -544,6 +746,11 @@ impl SettingsView {
             }
             SettingKind::Number | SettingKind::Text => {
                 match (stored, self.is_set(section, field)) {
+                    // The empty override is the disabled marker a Backspace
+                    // commit wrote: the shortcut fires on no key at all.
+                    (Some(text), true) if text.is_empty() && self.shortcut_full_id(spec.key).is_some() => {
+                        "(disabled)".to_string()
+                    }
                     (Some(text), true) => text,
                     (Some(text), false) => format!("{text} (default)"),
                     (None, _) => "(unset)".to_string(),
@@ -571,6 +778,9 @@ impl SettingsView {
     fn keys(&self) -> &'static str {
         if self.editing.is_some() {
             return "Enter save · Esc cancel";
+        }
+        if self.capturing.is_some() {
+            return "press combo · Enter save · Backspace clear · Esc cancel";
         }
         match self.focused_kind() {
             Some(SettingKind::Boolean) => "↑↓ select · Enter toggle · Esc close",
@@ -624,8 +834,9 @@ mod tests {
                 id: None,
                 description: "host settings",
                 owner: SettingOwner::Host,
-                fields: REAL_HOST_FIELDS,
+                fields: REAL_HOST_FIELDS.to_vec(),
             }],
+            Vec::new(),
         )
     }
 
@@ -652,7 +863,7 @@ mod tests {
                     id: None,
                     description: "host settings",
                     owner: SettingOwner::Host,
-                    fields: &HOST_FIELDS,
+                    fields: HOST_FIELDS.to_vec(),
                 },
                 Section {
                     // A plugin whose card title differs from its id: both
@@ -661,9 +872,10 @@ mod tests {
                     id: Some("tps"),
                     description: "throughput meter",
                     owner: SettingOwner::Plugin("tps"),
-                    fields: &TPS_FIELDS,
+                    fields: TPS_FIELDS.to_vec(),
                 },
             ],
+            Vec::new(),
         )
     }
 
@@ -733,7 +945,8 @@ mod tests {
             event,
             Some(SettingsEvent::Saved {
                 section: 1,
-                restart: false
+                restart: false,
+                key: "enabled"
             })
         );
         assert_eq!(
@@ -763,7 +976,8 @@ mod tests {
             view.handle_key(key(KeyCode::Enter)),
             Some(SettingsEvent::Saved {
                 section: 1,
-                restart: true
+                restart: true,
+                key: "window_ms"
             }),
             "the app needs the flag to know this one must not apply live"
         );
@@ -822,7 +1036,8 @@ mod tests {
             view.handle_key(key(KeyCode::Enter)),
             Some(SettingsEvent::Saved {
                 section: 1,
-                restart: true
+                restart: true,
+                key: "window_ms"
             })
         );
         assert_eq!(
@@ -847,7 +1062,8 @@ mod tests {
             view.handle_key(key(KeyCode::Enter)),
             Some(SettingsEvent::Saved {
                 section: 0,
-                restart: false
+                restart: false,
+                key: "status_bar.plugin_segments"
             })
         );
         assert!(!view.global().status_bar.plugin_segments);
@@ -874,7 +1090,8 @@ mod tests {
             view.handle_key(key(KeyCode::Enter)),
             Some(SettingsEvent::Saved {
                 section: 0,
-                restart: false
+                restart: false,
+                key: "status_bar.cache_rate"
             })
         );
         // The default is on, so the flip lands off — and `context` stays on
@@ -968,4 +1185,172 @@ mod tests {
             Some("12 34".to_string())
         );
     }
+
+    /// The registry's shortcut rows land on the host card after the declared
+    /// toggles, and their drafts validate before anything is written.
+    fn shortcut_view(name: &str, seed: &str) -> SettingsView {
+        let registry = crate::core::keymap::build_registry(&[]).expect("host registry");
+        let mut fields = crate::core::settings::HOST_SETTINGS.fields.to_vec();
+        fields.extend(registry.iter().map(crate::core::keymap::setting_field));
+        let path = temp_path(name);
+        std::fs::write(&path, seed).expect("seed");
+        let file = SettingsFile::load(&path).expect("load");
+        SettingsView::new(file, vec![Section {
+            title: "codest".to_string(),
+            id: None,
+            description: "host settings",
+            owner: SettingOwner::Host,
+            fields,
+        }], registry)
+    }
+
+    /// The rows after the four host toggles are the registry's shortcuts, in
+    /// registration order: thinking, tool_detail, …
+    fn focus_shortcut_row(view: &mut SettingsView, index: usize) {
+        for _ in 0..crate::core::settings::HOST_SETTINGS.fields.len() + index {
+            view.handle_key(key(KeyCode::Down));
+        }
+    }
+
+    #[test]
+    fn a_shortcut_row_stores_the_canonical_combo_list() {
+        let mut view = shortcut_view("shortcut-row", "");
+        focus_shortcut_row(&mut view, 0);
+        view.handle_key(key(KeyCode::Enter));
+        assert!(view.capturing.is_some(), "Enter opens the capture");
+        // Pressing Alt+Y captures the combo; Enter saves it.
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert_eq!(view.capturing.as_ref().map(|c| c.combos.len()), Some(1));
+        let event = view.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(event, Some(SettingsEvent::Saved { key, .. }) if key == "shortcuts.thinking"),
+            "{event:?}"
+        );
+        assert_eq!(
+            view.global().shortcuts.get("thinking").map(String::as_str),
+            Some("alt+y"),
+            "the captured combo landed in [shortcuts]"
+        );
+        assert!(view.capturing.is_none(), "Enter closes the capture");
+    }
+
+    #[test]
+    fn pressing_several_combos_adds_alternatives() {
+        let mut view = shortcut_view("shortcut-alternatives", "");
+        focus_shortcut_row(&mut view, 0);
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        // A repeat of a captured combo is a no-op, not a duplicate.
+        view.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(view.capturing.as_ref().map(|c| c.combos.len()), Some(2));
+        view.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            view.global().shortcuts.get("thinking").map(String::as_str),
+            Some("ctrl+t, alt+y"),
+            "both alternatives stored, canonical form"
+        );
+    }
+
+    #[test]
+    fn a_shortcut_row_refuses_reserved_and_conflicting_candidates() {
+        let mut view = shortcut_view("shortcut-bad", "");
+        focus_shortcut_row(&mut view, 0);
+        view.handle_key(key(KeyCode::Enter));
+        // Ctrl+C is the interrupt guard: refused the moment it lands, and
+        // the capture stays open.
+        view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(view.capturing.as_ref().map(|c| c.combos.len()), Some(0));
+        assert_eq!(
+            view.notice.as_ref().map(|(_, error)| *error),
+            Some(true),
+            "the notice explains the refusal"
+        );
+        // A combo another action already binds is refused the same way.
+        view.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert_eq!(view.capturing.as_ref().map(|c| c.combos.len()), Some(0));
+        assert!(view
+            .notice
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains("already bound by `tool_detail`")));
+        // A bare character would fire while typing: refused too.
+        view.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(view.capturing.as_ref().map(|c| c.combos.len()), Some(0));
+        // Esc cancels without touching the file.
+        assert_eq!(view.handle_key(key(KeyCode::Esc)), None);
+        assert!(view.capturing.is_none());
+        assert!(view.global().shortcuts.get("thinking").is_none());
+    }
+
+    #[test]
+    fn backspace_disables_the_shortcut() {
+        let mut view = shortcut_view(
+            "shortcut-disable",
+            "[shortcuts]\nthinking = \"alt+y\"\n",
+        );
+        focus_shortcut_row(&mut view, 0);
+        // Enter opens the capture (starting empty — the stored override is
+        // untouched until a key lands)…
+        view.handle_key(key(KeyCode::Enter));
+        assert!(view.capturing.is_some());
+        // …and Backspace commits an empty binding: the shortcut is disabled
+        // outright — no key fires it — which is distinct from removing the
+        // override (that would run the registered default again).
+        let event = view.handle_key(key(KeyCode::Backspace));
+        assert!(
+            matches!(event, Some(SettingsEvent::Saved { key, .. }) if key == "shortcuts.thinking"),
+            "{event:?}"
+        );
+        assert_eq!(
+            view.global().shortcuts.get("thinking").map(String::as_str),
+            Some(""),
+            "the empty override is the disabled marker"
+        );
+        assert!(view.capturing.is_none(), "Backspace closes the capture");
+        // The row says so in its value chip.
+        let frame = render_view(&mut view, 100, 20).join("\n");
+        assert!(frame.contains("(disabled)"), "{frame}");
+    }
+
+    #[test]
+    fn a_fixed_shortcut_row_never_opens_the_capture() {
+        static LOCKED: [cst_plugin_api::shortcuts::ShortcutSpec; 1] =
+            [cst_plugin_api::shortcuts::ShortcutSpec::new(
+                "locked", "Locked", "…", "ctrl+q", true,
+            )];
+        let registry =
+            crate::core::keymap::build_registry(&[("p", &LOCKED)]).expect("registry");
+        let fields: Vec<SettingField> =
+            registry.iter().map(crate::core::keymap::setting_field).collect();
+        let path = temp_path("shortcut-fixed");
+        std::fs::write(&path, "").expect("seed");
+        let file = SettingsFile::load(&path).expect("load");
+        let mut view = SettingsView::new(
+            file,
+            vec![Section {
+                title: "p".to_string(),
+                id: None,
+                description: "fixed",
+                owner: SettingOwner::Host,
+                fields,
+            }],
+            registry,
+        );
+        // The registry carries the host's own shortcuts first; the fixed
+        // `p:locked` row is the last one.
+        view.handle_key(key(KeyCode::End));
+        view.handle_key(key(KeyCode::Enter));
+        assert!(
+            view.editing.is_none() && view.capturing.is_none(),
+            "a fixed registration locks the binding"
+        );
+        assert_eq!(
+            view.notice.as_ref().map(|(_, error)| *error),
+            Some(true),
+            "the row says so"
+        );
+        // And the stored value is untouched.
+        assert_eq!(view.global().shortcuts.get("p:locked"), None);
+    }
 }
+

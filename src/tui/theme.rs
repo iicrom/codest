@@ -8,6 +8,10 @@ pub const USER: Color = Color::Cyan;
 pub const ASSISTANT: Color = Color::Green;
 pub const ERROR: Color = Color::LightRed;
 pub const WARNING: Color = Color::Yellow;
+/// Mouse-selection highlight. Applied as a solid background that preserves
+/// each span's foreground, so selected text stays readable and reads like a
+/// native terminal's selection on dark and light themes alike.
+pub const SELECTION_BG: Color = Color::Blue;
 /// Mid-gray for secondary structure (report group headings) — brighter than
 /// [`DIM`], quieter than the default foreground, so bold headings read as
 /// section markers without shouting.
