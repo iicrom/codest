@@ -110,6 +110,9 @@ pub enum PluginEventKind<'a> {
     ProfileSwitched { name: &'a str },
     /// The enabled-tool set for the active session is now `enabled`.
     ToolsSwitched { enabled: &'a [String] },
+    /// The active session's system-prompt appendix is now `appendix`
+    /// (`None` = cleared). Session state: not persisted across a restart.
+    SystemAppendixSwitched { appendix: Option<&'a str> },
     /// The worker has stopped. The last event a plugin sees.
     Shutdown,
 }
@@ -132,7 +135,8 @@ impl PluginEventKind<'_> {
             | Self::ModelSwitched { .. }
             | Self::EffortSwitched { .. }
             | Self::ProfileSwitched { .. }
-            | Self::ToolsSwitched { .. } => EventSubscription::SESSION,
+            | Self::ToolsSwitched { .. }
+            | Self::SystemAppendixSwitched { .. } => EventSubscription::SESSION,
             Self::TurnStarted
             | Self::AgentMessage { .. }
             | Self::TurnAborted { .. }

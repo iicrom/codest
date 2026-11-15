@@ -56,6 +56,13 @@ pub enum Op {
     /// are ignored (a replayed set may name tools this run never declared).
     /// Applied between turns, like `SwitchModel`.
     SetToolsEnabled { enabled: Vec<String> },
+    /// Set or clear one appendix appended to the active session's system
+    /// prompt for every request while it is set (`/plan`-style plugin mode
+    /// instructions). One global slot per session, applied between turns
+    /// like `SwitchModel`; session state only — not persisted to the
+    /// rollout, so a restored session starts without it. The confirmation
+    /// arrives as [`EventMsg::SystemAppendixSwitched`].
+    SetSystemPromptAppendix { appendix: Option<String> },
     /// Return the active conversation as [`EventMsg::ConversationSnapshot`]
     /// (the `/context` viewer's read path — the worker is the only owner of
     /// the transcript, so the front-end asks rather than mirrors it).
@@ -173,6 +180,11 @@ pub enum EventMsg {
     /// switch or creation, because the set is per session and the
     /// front-end's mirror needs to resync.
     ToolsSwitched { enabled: Vec<String> },
+    /// The active session's system-prompt appendix is now `appendix`
+    /// (`Op::SetSystemPromptAppendix`; `None` = cleared). Also emitted after
+    /// a session switch or creation, because the appendix is per session and
+    /// the front-end's mirror needs to resync.
+    SystemAppendixSwitched { appendix: Option<String> },
     /// The active conversation, as asked by `Op::InspectConversation` and
     /// re-sent as the confirmation of every context mutation
     /// (`DeleteMessages` / `DeleteToolCall` / `EditMessage` /

@@ -735,6 +735,11 @@ fn plugin_event_kind(msg: &crate::core::EventMsg) -> PluginEventKind<'_> {
         },
         EventMsg::ProfileSwitched { name } => PluginEventKind::ProfileSwitched { name },
         EventMsg::ToolsSwitched { enabled } => PluginEventKind::ToolsSwitched { enabled },
+        EventMsg::SystemAppendixSwitched { appendix } => {
+            PluginEventKind::SystemAppendixSwitched {
+                appendix: appendix.as_deref(),
+            }
+        }
         EventMsg::ShutdownComplete => PluginEventKind::Shutdown,
     }
 }

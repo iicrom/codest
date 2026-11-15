@@ -228,6 +228,13 @@ binary under a pseudo-terminal, verify the plugin id and commands appear,
 uninstall, verify the rebuilt binary no longer contains them, and check that
 `git status` is unchanged throughout.
 
+`cst-plan` is a command-plugin example in the same spirit: a sibling
+checkout (`../cst-plan` next to this repository) implementing `/plan` —
+tools narrowed to read-only, planning instructions added at system level via
+`SetSystemPromptAppendix`, and `/plan exit` restoring everything. It is the
+smallest end-to-end demo of the command, effect, and status-segment hooks
+without touching this repository.
+
 ## 7. Related docs
 
 - [plugins.md](plugins.md) — the plugin contract and built-in plugins

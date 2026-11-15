@@ -261,6 +261,20 @@ pub enum PluginEffect {
     /// Remove one status-bar segment by its full `plugin:key` id. Removing
     /// an absent key is a no-op.
     ClearStatus(String),
+    /// Replace the active session's enabled-tool set: the whole set, not a
+    /// delta, exactly like the front-end's `/tools` switch. Unknown names are
+    /// dropped by the core, an empty set is a legitimate chat-only session,
+    /// and the change lands between turns (it may jump ahead of an
+    /// already-queued turn). `PluginInfo::tools` and
+    /// [`PluginInfo::enabled_tools`] are how a plugin computes the set it
+    /// asks for.
+    SetToolsEnabled(Vec<String>),
+    /// Set or clear one appendix line block appended to the session's system
+    /// prompt for every request while it is set (`Some`) — the plugin-shaped
+    /// way to put instructions at system level, the way a mode toggle would.
+    /// `None` clears it. One global slot, last writer wins; the appendix is
+    /// session state and is not persisted across a restart.
+    SetSystemPromptAppendix(Option<String>),
 }
 
 /// A plugin-authored report (e.g. `/context`): a bold title over titled
@@ -524,6 +538,22 @@ impl<'a> PluginContext<'a> {
 
     pub fn continue_turn(&mut self) {
         self.effects.push(PluginEffect::ContinueTurn);
+    }
+
+    /// Queue [`PluginEffect::SetToolsEnabled`]: replace the active session's
+    /// enabled-tool set (the whole set, not a delta). Compute the set from
+    /// [`Self::tools`] and [`Self::enabled_tools`].
+    pub fn set_tools_enabled(&mut self, enabled: Vec<String>) {
+        self.effects.push(PluginEffect::SetToolsEnabled(enabled));
+    }
+
+    /// Queue [`PluginEffect::SetSystemPromptAppendix`]: append this text to
+    /// the session's system prompt for every request (`None` clears it).
+    pub fn set_system_prompt_appendix(&mut self, appendix: Option<impl Into<String>>) {
+        self.effects
+            .push(PluginEffect::SetSystemPromptAppendix(
+                appendix.map(Into::into),
+            ));
     }
 
     /// This plugin's stable id — useful for attributing diagnostics.

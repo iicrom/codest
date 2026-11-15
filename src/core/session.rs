@@ -396,6 +396,16 @@ impl AgentSession {
         self.submit(Op::SetToolsEnabled { enabled })
     }
 
+    /// Set or clear the active session's system-prompt appendix (plugin mode
+    /// instructions, `Op::SetSystemPromptAppendix`): appended to the system
+    /// prompt of every request while set, without touching the conversation
+    /// or the rollout. The result arrives as
+    /// [`EventMsg::SystemAppendixSwitched`]; ops are FIFO, so it never lands
+    /// mid-turn.
+    pub fn set_system_prompt_appendix(&self, appendix: Option<String>) -> String {
+        self.submit(Op::SetSystemPromptAppendix { appendix })
+    }
+
     /// Read the active conversation (`/context` viewer). The result arrives
     /// as [`EventMsg::ConversationSnapshot`] — system prompt first, then the
     /// transcript.
@@ -743,7 +753,26 @@ fn is_config_op(op: &Op) -> bool {
             | Op::SetReasoningEffort { .. }
             | Op::SwitchProfile { .. }
             | Op::SetToolsEnabled { .. }
+            | Op::SetSystemPromptAppendix { .. }
     )
+}
+
+/// The messages for one model request: the conversation's snapshot with the
+/// active session's system-prompt appendix appended to the system message.
+/// The appendix is session state (`Op::SetSystemPromptAppendix`), not part
+/// of the conversation — the transcript, the rollout, and the
+/// `ConversationSnapshot` read path never see it.
+fn request_messages(conversation: &Conversation, appendix: Option<&str>) -> Vec<Message> {
+    let mut messages = conversation.snapshot();
+    if let (Some(system), Some(appendix)) = (messages.first_mut(), appendix) {
+        if system.content.trim().is_empty() {
+            system.content = appendix.to_string();
+        } else {
+            system.content.push_str("\n\n");
+            system.content.push_str(appendix);
+        }
+    }
+    messages
 }
 
 async fn run_worker(
@@ -784,6 +813,11 @@ async fn run_worker(
     // model's `default_level`), the inner one is the level (`None` = an
     // explicit `off`, which must not be re-seeded).
     let mut session_efforts: Vec<Option<Option<String>>> = Vec::new();
+    // The system-prompt appendix each session runs with (plugin mode
+    // instructions, `Op::SetSystemPromptAppendix`). Per session, like the
+    // tool set; session state only — never persisted, so a restored session
+    // starts without it.
+    let mut session_appendix: Vec<Option<String>> = Vec::new();
 
     for loaded in &bootstrap.loaded {
         // The replay includes the `/context` checkpoint stack, so an undo
@@ -825,6 +859,7 @@ async fn run_worker(
         session_models.push(loaded.model.clone());
         session_tools.push(enabled);
         session_efforts.push(loaded.effort.clone());
+        session_appendix.push(None);
     }
 
     // Plain startup opens one fresh session on top of the restored ones; the
@@ -837,6 +872,7 @@ async fn run_worker(
         // A fresh session has chosen nothing yet: its effort seeds from the
         // startup preset (below) or the model's `default_level`.
         session_efforts.push(None);
+        session_appendix.push(None);
     }
 
     let mut rollouts = Rollouts {
@@ -888,6 +924,7 @@ async fn run_worker(
                 executor: executor.clone(),
                 declared: tools.clone(),
                 enabled: session_tools[current].clone(),
+                appendix: session_appendix[current].clone(),
                 max_tool_rounds,
                 tool_output_token_limit,
             };
@@ -971,7 +1008,7 @@ async fn run_worker(
                     continue;
                 };
                 let stream = client.stream_chat(
-                    sessions[current].snapshot(),
+                    request_messages(&sessions[current], session_appendix[current].as_deref()),
                     TurnOptions {
                         effort: effort.clone(),
                         tools: declared_tools(&tools, &session_tools[current]),
@@ -1044,7 +1081,7 @@ async fn run_worker(
                     continue;
                 };
                 let stream = client.stream_chat(
-                    sessions[current].snapshot(),
+                    request_messages(&sessions[current], session_appendix[current].as_deref()),
                     TurnOptions {
                         effort: effort.clone(),
                         tools: declared_tools(&tools, &session_tools[current]),
@@ -1089,6 +1126,7 @@ async fn run_worker(
                 // A new session has chosen no effort yet, so it seeds from
                 // the startup preset or its model's `default_level`.
                 session_efforts.push(None);
+                session_appendix.push(None);
                 // A fresh session starts with every tool enabled. The
                 // front-end's mirror still shows the previous session's set,
                 // so resync it only when that differs — sent before the
@@ -1099,6 +1137,14 @@ async fn run_worker(
                         EventMsg::ToolsSwitched {
                             enabled: session_tools[current].iter().cloned().collect(),
                         },
+                    ));
+                }
+                // The appendix is per session too, and a fresh one starts
+                // without it.
+                if session_appendix[previous].is_some() {
+                    let _ = tx.send(Event::new(
+                        submission.id.clone(),
+                        EventMsg::SystemAppendixSwitched { appendix: None },
                     ));
                 }
                 // The effort is per session too, so the footer must follow
@@ -1175,6 +1221,15 @@ async fn run_worker(
                             submission.id.clone(),
                             EventMsg::ToolsSwitched {
                                 enabled: session_tools[current].iter().cloned().collect(),
+                            },
+                        ));
+                    }
+                    // The appendix is per session too.
+                    if session_appendix[previous] != session_appendix[current] {
+                        let _ = tx.send(Event::new(
+                            submission.id.clone(),
+                            EventMsg::SystemAppendixSwitched {
+                                appendix: session_appendix[current].clone(),
                             },
                         ));
                     }
@@ -1331,6 +1386,16 @@ async fn run_worker(
                     EventMsg::ToolsSwitched { enabled },
                 ));
             }
+            Op::SetSystemPromptAppendix { appendix } => {
+                // Session state only, so the rollout never records it: a
+                // restored session starts without the appendix, consistent
+                // with the plugin state that set it being gone.
+                session_appendix[current] = appendix.clone();
+                let _ = tx.send(Event::new(
+                    submission.id,
+                    EventMsg::SystemAppendixSwitched { appendix },
+                ));
+            }
             Op::InspectConversation => {
                 let _ = tx.send(Event::new(
                     submission.id,
@@ -1474,6 +1539,9 @@ struct TurnContext {
     /// here means a hallucinated name (or a race with `/tools` mid-turn —
     /// the snapshot wins, ops are FIFO anyway).
     enabled: BTreeSet<String>,
+    /// The session's system-prompt appendix, appended to every request's
+    /// system message (`Op::SetSystemPromptAppendix`).
+    appendix: Option<String>,
     /// Optional runaway guard: the turn errors out once this many rounds have
     /// completed. `None` — the default — follows codex and leaves the loop
     /// unbounded, ending it only when the model stops calling tools, the user
@@ -1628,7 +1696,7 @@ async fn run_turn(
         claim_steers(turn, conversation, rollouts, current, tx, steer_rx);
         // The next round sees the tool results in the snapshot.
         turn.stream = deps.client.stream_chat(
-            conversation.snapshot(),
+            request_messages(conversation, deps.appendix.as_deref()),
             deps.options.clone(),
             turn.cancel.clone(),
         );
@@ -2567,6 +2635,51 @@ mod tests {
         )));
         let seen = seen.lock().expect("lock");
         assert!(seen[1][3].content.contains("disabled"));
+    }
+
+    /// The system-prompt appendix rides every request's system message while
+    /// set and vanishes once cleared — without ever touching the transcript
+    /// or the rollout. `/new` starts the next session without it.
+    #[tokio::test]
+    async fn system_prompt_appendix_rides_requests_until_cleared() {
+        let client = RecordingClient::new();
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn(Arc::new(client));
+
+        session.set_system_prompt_appendix(Some("[plan mode] read-only".to_string()));
+        session.submit_user_turn("first");
+        let events = collect_turn(&mut session).await;
+        assert!(events
+            .iter()
+            .any(|event| matches!(&event.msg, EventMsg::SystemAppendixSwitched { appendix: Some(text) } if text == "[plan mode] read-only")));
+
+        session.set_system_prompt_appendix(None);
+        session.submit_user_turn("second");
+        collect_turn(&mut session).await;
+
+        session.new_session();
+        session.submit_user_turn("third");
+        collect_turn(&mut session).await;
+
+        let seen = seen.lock().expect("lock");
+        assert_eq!(seen.len(), 3);
+        // The appendix is appended to the system prompt, not a new message.
+        assert_eq!(seen[0][0].role, Role::System);
+        assert!(seen[0][0]
+            .content
+            .starts_with("You are codest, a concise and helpful terminal assistant."));
+        assert!(seen[0][0].content.ends_with("\n\n[plan mode] read-only"));
+        assert!(seen[0].iter().skip(1).all(|m| m.role != Role::System));
+        // Cleared: the second request is back to the plain system prompt.
+        assert_eq!(
+            seen[1][0].content,
+            "You are codest, a concise and helpful terminal assistant. Answer in the user's language."
+        );
+        // A new session starts without it.
+        assert_eq!(
+            seen[2][0].content,
+            "You are codest, a concise and helpful terminal assistant. Answer in the user's language."
+        );
     }
 
     /// Blocks inside `execute` until released, announcing that it entered —

@@ -12,7 +12,7 @@ codest 的切分方式是：UI 从不直接与模型客户端对话。前端提�
 └──────────┘  Event (render)  └────────────────┘    chunks     └────────────────────┘
 ```
 
-总线本身（[`src/core/protocol.rs`](../../src/core/protocol.rs)）只定义数据：`Op` 是前端可以发出的命令词表，`Event` 把一个 `EventMsg` 与触发它的 submission id 包在一起，`Submission` 是排队的那个二元组。`Op::UserTurn`、`Op::ContinueTurn`、`Op::ClearConversation`、`Op::NewSession`、`Op::SwitchSession`、`Op::RenameSession`、`Op::SwitchModel`、`Op::SetReasoningEffort`、`Op::SwitchProfile`、`Op::SetToolsEnabled`、`Op::InspectConversation`、`Op::DeleteMessages` / `Op::EditMessage` / `Op::UndoContextEdit` 三件套、`Op::Interrupt`、`Op::Shutdown` 全部走同一条通道。回复侧同样是单一枚举：回合进展（`TurnStarted`、`AgentMessageDelta`、`AgentThinkingDelta`、`AgentMessage`、`AgentToolCallStarted`、`AgentToolCall`、`TurnUsage`、`TurnAborted`、`Error`、`TurnComplete`）、会话账务（`SessionStarted`、`SessionSwitched`、`SessionRenamed`、`ConversationCleared`）与配置回显（`ModelSwitched`、`ReasoningEffortSwitched`、`ProfileSwitched`、`ToolsSwitched`、`ConversationSnapshot`、`ShutdownComplete`）。
+总线本身（[`src/core/protocol.rs`](../../src/core/protocol.rs)）只定义数据：`Op` 是前端可以发出的命令词表，`Event` 把一个 `EventMsg` 与触发它的 submission id 包在一起，`Submission` 是排队的那个二元组。`Op::UserTurn`、`Op::ContinueTurn`、`Op::ClearConversation`、`Op::NewSession`、`Op::SwitchSession`、`Op::RenameSession`、`Op::SwitchModel`、`Op::SetReasoningEffort`、`Op::SwitchProfile`、`Op::SetToolsEnabled`、`Op::SetSystemPromptAppendix`、`Op::InspectConversation`、`Op::DeleteMessages` / `Op::EditMessage` / `Op::UndoContextEdit` 三件套、`Op::Interrupt`、`Op::Shutdown` 全部走同一条通道。回复侧同样是单一枚举：回合进展（`TurnStarted`、`AgentMessageDelta`、`AgentThinkingDelta`、`AgentMessage`、`AgentToolCallStarted`、`AgentToolCall`、`TurnUsage`、`TurnAborted`、`Error`、`TurnComplete`）、会话账务（`SessionStarted`、`SessionSwitched`、`SessionRenamed`、`ConversationCleared`）与配置回显（`ModelSwitched`、`ReasoningEffortSwitched`、`ProfileSwitched`、`ToolsSwitched`、`SystemAppendixSwitched`、`ConversationSnapshot`、`ShutdownComplete`）。
 
 ## 从 codex 提取了什么
 
@@ -60,6 +60,7 @@ codex 的 TUI 超过 10 万行，core 带着大量沙箱/工具/审批基础设�
 | 当前模型选择 | worker 的 `ModelBackend`（`Fixed` / `Pooled` / `Empty`） | `ModelSwitched`，以及启动路由 |
 | 推理等级 | worker，按运行 | `ReasoningEffortSwitched` |
 | 启用工具集 | worker，按会话 | `ToolsSwitched`，变更时发出、切换会话时重新同步 |
+| system prompt 附录 | worker，按会话 | `SystemAppendixSwitched`，变更时发出、切换会话时重新同步；会话期状态，不持久化 |
 | rollout 文件 | worker 的 `Rollouts`（每会话一个 writer 槽位） | 不可见；启动时回放 |
 | 渲染出的 transcript、滚动与折叠标志 | 前端，每会话一个视图 | worker 不可见 |
 | 进行中的模型流 | worker 唯一的 `ActiveTurn` | `AgentMessageDelta` / `AgentThinkingDelta` |

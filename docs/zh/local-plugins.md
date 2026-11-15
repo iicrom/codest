@@ -202,6 +202,11 @@ crate，它不需要宿主的任何东西。
 id 与命令出现、卸载、断言重建的二进制不再包含它，并核对全程 `git status`
 保持不变。
 
+`cst-plan` 是同一精神的命令插件示例：本仓库旁的兄弟 checkout（
+`../cst-plan`）实现 `/plan`——工具收窄到只读、经 `SetSystemPromptAppendix`
+在 system 级加入规划指示、`/plan exit` 全部还原。它是命令、effect、状态段
+钩子的最小端到端示范，且完全不触碰本仓库。
+
 ## 7. 相关文档
 
 - [plugins.md](../plugins.md) —— 插件契约与内置插件
