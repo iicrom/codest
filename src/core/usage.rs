@@ -81,6 +81,22 @@ fn is_dense_script(code_point: u32) -> bool {
     )
 }
 
+/// The fractional token estimate of one code point — the additive unit of
+/// [`estimate_tokens_fraction`]. Public so the tool-output truncation can
+/// walk to a token budget by character (see [`crate::core::truncate`]) and
+/// stay consistent with the estimates everywhere else: the sum over any
+/// fragment split is the same count, whatever the split.
+pub fn estimate_char_fraction(code_point: char) -> f64 {
+    let code_point = code_point as u32;
+    if code_point < 0x80 {
+        1.0 / CHARS_PER_TOKEN_ASCII
+    } else if is_dense_script(code_point) {
+        1.0 / CHARS_PER_TOKEN_CJK
+    } else {
+        1.0 / CHARS_PER_TOKEN_OTHER
+    }
+}
+
 /// The same script-weighted estimate as [`estimate_tokens`], without the
 /// per-call rounding: a fractional count that stays additive over fragments,
 /// so summing per-message estimates differs from rounding the whole at once
@@ -94,20 +110,7 @@ pub fn estimate_tokens_fraction(text: &str) -> f64 {
     if text.is_ascii() {
         return text.chars().count() as f64 / CHARS_PER_TOKEN_ASCII;
     }
-    let (mut ascii, mut dense, mut other) = (0u64, 0u64, 0u64);
-    for character in text.chars() {
-        let code_point = character as u32;
-        if code_point < 0x80 {
-            ascii += 1;
-        } else if is_dense_script(code_point) {
-            dense += 1;
-        } else {
-            other += 1;
-        }
-    }
-    ascii as f64 / CHARS_PER_TOKEN_ASCII
-        + dense as f64 / CHARS_PER_TOKEN_CJK
-        + other as f64 / CHARS_PER_TOKEN_OTHER
+    text.chars().map(estimate_char_fraction).sum()
 }
 
 /// Context-composition token estimate for model-visible text: a per-code-point

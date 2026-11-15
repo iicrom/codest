@@ -60,7 +60,7 @@ The picker renders one row per session — marker, 1-based number, the name (the
 | `assistant_message` | A completed assistant reply. |
 | `assistant_reasoning` | One thinking card (text plus the stream's duration); display-only. |
 | `assistant_tool_calls` | The whole round's tool calls, replayed as one assistant message with `tool_calls`. |
-| `tool_result` | One tool's output, replayed as a `role: "tool"` message answering its `tool_call_id`. |
+| `tool_result` | One tool's output, replayed as a `role: "tool"` message answering its `tool_call_id`. The file keeps the full payload; replay trims what enters the conversation to the run's tool-output budget (see below). |
 | `cleared` | A `/clear` within the session (system prompt retained). |
 | `renamed` | A `/rename`; the last one wins on replay. |
 | `model_switched` | A model switch; the last one wins on replay, so a resumed session starts on the model it last used. |
@@ -69,8 +69,10 @@ The picker renders one row per session — marker, 1-based number, the name (the
 | `profile_switched` | The active profile's name. |
 | `turn_usage` | Prompt/completion token counts of one completed turn, with the model that served it and — on providers that report it — the cached-prompt subset of the input (`cached`). |
 | `context_deleted` / `context_edited` / `context_restored` | Edits made in the `/context` viewer: indices plus the removed content (the delete's inverse), and the undo marker. |
+| `context_tool_call_deleted` | One tool call spliced out of an assistant message by the `/context` viewer's drill-down, with the result message answering it — and, when the last call emptied a content-less round, the assistant message itself. The payload is the delete's own inverse, like `context_deleted`. |
 
 - **Replay is faithful.** Rebuilding the conversation from the file reproduces it exactly — including collapsed-vs-expanded card state. Thinking records are display metadata: they are replayed as cards but never re-enter the model context.
+- **Tool outputs are trimmed twice, files never.** Like codex, the conversation the model sees carries each tool result within the run's budget (`config.toml`'s `tool_output_token_limit`, default 4000 estimated tokens, `0` disables): an oversized result enters as head + a `… N tokens truncated …` notice + tail, cut at record time and again on replay, so a restored session sees what a live one saw. The rollout file and the tool card's display keep the full output.
 - **Eager id, lazy file.** The id is assigned when the session starts (so the very first request already carries the session header), but the file is created lazily on the first user message. Empty sessions never create a file.
 - **Writes are best-effort.** A failed write never breaks the conversation; it is reported to stderr and the turn continues.
 - **A file whose name is not a uuid is not a session.** Listing skips it, including the pre-uuid hex-nanosecond names of older builds.

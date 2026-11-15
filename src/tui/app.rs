@@ -180,6 +180,7 @@ pub async fn run(
     default_effort: Option<String>,
     double_press_interrupt: bool,
     max_tool_rounds: Option<usize>,
+    tool_output_token_limit: usize,
     status_bar: StatusBarConfig,
     plugin_settings: Vec<(String, PluginSettings)>,
 ) -> Result<()> {
@@ -229,10 +230,12 @@ pub async fn run(
     // ~/.codest/sessions/<workspace-hash>/.
     let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let sessions_dir = rollout::workspace_sessions_dir(&workspace);
-    let loaded = rollout::load_workspace_sessions(&sessions_dir).unwrap_or_else(|error| {
-        eprintln!("codest: cannot load saved sessions: {error}");
-        Vec::new()
-    });
+    let loaded =
+        rollout::load_workspace_sessions_with_limit(&sessions_dir, tool_output_token_limit)
+            .unwrap_or_else(|error| {
+                eprintln!("codest: cannot load saved sessions: {error}");
+                Vec::new()
+            });
     let fresh = restore == RestoreMode::None;
 
     // A restored session remembers the model it last used: adopt it for this
@@ -287,6 +290,7 @@ pub async fn run(
             profile: profiles.active.clone(),
             initial_effort: initial_effort.clone(),
             max_tool_rounds,
+            tool_output_token_limit,
         },
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -3272,6 +3276,9 @@ impl App {
             Action::Close => self.context_view = None,
             Action::Delete { indices } => {
                 self.session.delete_messages(indices);
+            }
+            Action::DeleteToolCall { index, call_id } => {
+                self.session.delete_tool_call(index, call_id);
             }
             Action::Edit { index, content } => {
                 self.session.edit_message(index, content);
@@ -8147,6 +8154,39 @@ mod tests {
         assert_eq!(messages.len(), 2, "system + the surviving assistant");
         app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
         assert_eq!(app.context_view.as_ref().unwrap().entries_len(), Some(2));
+    }
+
+    /// The drill-down's per-call delete reaches the worker through the same
+    /// op bus: an unknown call id on this tool-less transcript is rejected,
+    /// and the rejection shows inside the viewer — the wiring works end to
+    /// end. (The happy path is covered by the session's own
+    /// `delete_tool_call_splices_one_call_and_undoes`.)
+    #[tokio::test]
+    async fn delete_tool_call_in_the_viewer_reaches_the_worker() {
+        let mut app = app_with_transcript();
+        app.composer.set_text("/context".to_string());
+        app.try_submit();
+        let snapshot = next_snapshot(&mut app).await;
+        app.handle_agent_event(crate::core::Event::new("sub-c", snapshot));
+
+        app.apply_context_action(crate::tui::context_view::ContextAction::DeleteToolCall {
+            index: 1,
+            call_id: "missing".to_string(),
+        });
+        loop {
+            let event = app.session.next_event().await.expect("worker event");
+            match event.msg {
+                EventMsg::Error { .. } => {
+                    app.handle_agent_event(crate::core::Event::new("sub-c", event.msg));
+                    break;
+                }
+                EventMsg::ConversationSnapshot { .. } => {
+                    panic!("an unknown call id must not confirm");
+                }
+                _ => {}
+            }
+        }
+        assert!(app.context_view.as_ref().unwrap().has_error());
     }
 
     #[tokio::test]

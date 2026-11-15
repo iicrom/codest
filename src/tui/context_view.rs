@@ -6,8 +6,10 @@
 //! same command opens [`ContextView`], a full-frame take-over in the spirit
 //! of reference TUIs' trajectory scenes: one row per context entry with a
 //! role badge and a preview, a fixed inspector showing the selected entry in
-//! full, and delete / edit / undo over the transcript. Insertion is reserved
-//! (the core already has the primitive) but not wired.
+//! full, and delete / edit / undo over the transcript. An assistant
+//! tool-calls round drills in with Enter: its calls become the list, and `d`
+//! splices one call — with the result answering it — out of the context.
+//! Insertion is reserved (the core already has the primitive) but not wired.
 //!
 //! The view never touches the transcript itself — the worker owns it. Every
 //! mutation is an op ([`crate::core::protocol::Op::DeleteMessages`],
@@ -194,6 +196,12 @@ pub enum ContextAction {
     Delete {
         indices: Vec<usize>,
     },
+    /// Splice one tool call (with its result) out of the transcript message
+    /// at `index` — the drill-down's per-call delete.
+    DeleteToolCall {
+        index: usize,
+        call_id: String,
+    },
     /// Replace the content of the transcript message at `index`.
     Edit {
         index: usize,
@@ -212,6 +220,9 @@ pub struct ContextView {
     selected: usize,
     /// A `d` press awaiting its `y/n`.
     confirm_delete: bool,
+    /// A tool round drilled into: the assistant entry's display index, and
+    /// which call the cursor sits on. `None` browses the message list.
+    drilled: Option<(usize, usize)>,
     /// The edit box for the selected entry, when editing.
     editing: Option<Composer>,
     error: Option<String>,
@@ -234,6 +245,18 @@ impl ContextView {
             // An edit box open across a refresh would now point at stale
             // text; close it — the snapshot is the newer truth.
             self.editing = None;
+        }
+        // The drill survives a refresh only while its entry is still a
+        // tool-calls round: deleting a round's last call (or the round
+        // itself) closes it honestly instead of pointing at nothing.
+        if let Some((entry, cursor)) = self.drilled {
+            let count = messages
+                .get(entry)
+                .filter(|message| message.role == Role::Assistant)
+                .and_then(|message| message.tool_calls.as_ref())
+                .map(|calls| calls.len())
+                .unwrap_or(0);
+            self.drilled = (count > 0).then(|| (entry, cursor.min(count - 1)));
         }
         self.confirm_delete = false;
         self.error = None;
@@ -277,6 +300,27 @@ impl ContextView {
     /// The transcript index (`selected - 1`; entry 0 is the system prompt).
     fn transcript_index(&self) -> Option<usize> {
         self.selected.checked_sub(1)
+    }
+
+    /// How many calls the drilled round currently carries.
+    fn round_call_count(&self, entry: usize) -> usize {
+        self.entries()
+            .and_then(|entries| entries.get(entry))
+            .and_then(|message| message.tool_calls.as_ref())
+            .map(|calls| calls.len())
+            .unwrap_or(0)
+    }
+
+    /// The per-call delete the confirmation would submit: the call under the
+    /// drill cursor, addressed by transcript index and call id.
+    fn drilled_delete_action(&self, entry: usize, cursor: usize) -> Option<ContextAction> {
+        let message = self.entries()?.get(entry)?;
+        let call = message.tool_calls.as_ref()?.get(cursor)?;
+        let index = entry.checked_sub(1)?;
+        Some(ContextAction::DeleteToolCall {
+            index,
+            call_id: call.id.clone(),
+        })
     }
 
     /// Handle a key while the viewer is open. Fully modal: every key is
@@ -324,20 +368,54 @@ impl ContextView {
             }
         }
 
-        // A `d` press waits for its confirmation; nothing else acts.
+        // A `d` press waits for its confirmation; nothing else acts. Drilled
+        // in, the confirmed delete is the cursor's call; on the message list,
+        // the selected entry with its cascade.
         if self.confirm_delete {
             self.confirm_delete = false;
             return match key.code {
-                KeyCode::Char('y') => {
-                    let indices = self
-                        .entries()
-                        .map(|entries| expand_delete_indices(entries, self.selected));
-                    indices
-                        .filter(|indices| !indices.is_empty())
-                        .map(|indices| ContextAction::Delete { indices })
-                }
+                KeyCode::Char('y') => match self.drilled {
+                    Some((entry, cursor)) => self.drilled_delete_action(entry, cursor),
+                    None => {
+                        let indices = self
+                            .entries()
+                            .map(|entries| expand_delete_indices(entries, self.selected));
+                        indices
+                            .filter(|indices| !indices.is_empty())
+                            .map(|indices| ContextAction::Delete { indices })
+                    }
+                },
                 _ => None,
             };
+        }
+
+        // Drilled into a tool round: the calls are the list. `d` arms a
+        // per-call delete, Esc/Left/Backspace climb back out, `q` still
+        // closes the whole viewer.
+        if let Some((entry, cursor)) = self.drilled {
+            let count = self.round_call_count(entry);
+            match key.code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => self.drilled = None,
+                KeyCode::Char('q') => return Some(ContextAction::Close),
+                KeyCode::Up => self.drilled = Some((entry, step_cursor(cursor, count, -1))),
+                KeyCode::Down => self.drilled = Some((entry, step_cursor(cursor, count, 1))),
+                KeyCode::PageUp => self.drilled = Some((entry, step_cursor(cursor, count, -11))),
+                KeyCode::PageDown => self.drilled = Some((entry, step_cursor(cursor, count, 11))),
+                KeyCode::Char('g') => self.drilled = Some((entry, 0)),
+                KeyCode::Char('G') => self.drilled = Some((entry, count.saturating_sub(1))),
+                KeyCode::Char('d') => {
+                    self.drilled = Some((entry, cursor));
+                    if count > 0 {
+                        self.confirm_delete = true;
+                    }
+                }
+                // The undo works right where the delete happened: the
+                // refreshed snapshot keeps the drill on the restored round.
+                KeyCode::Char('u') => return Some(ContextAction::Undo),
+                // Anything else keeps the drill exactly where it is.
+                _ => self.drilled = Some((entry, cursor)),
+            }
+            return None;
         }
 
         match key.code {
@@ -374,6 +452,20 @@ impl ContextView {
                 // leaves the state untouched.
                 if self.selected_entry().is_some_and(deletable) {
                     self.confirm_delete = true;
+                }
+                None
+            }
+            KeyCode::Enter => {
+                // A tool-calls round opens its per-call drill-down; plain
+                // entries have nothing inside to open.
+                if let Some(message) = self.selected_entry()
+                    && message.role == Role::Assistant
+                    && message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
+                {
+                    self.drilled = Some((self.selected, 0));
                 }
                 None
             }
@@ -418,19 +510,36 @@ impl ContextView {
         let document = self.doc(width);
         let count = self.entries().map(|entries| entries.len());
 
-        let crumb = match count {
-            Some(0) => "no entries".to_string(),
-            Some(count) => format!(
-                "{count} entr{} (system + transcript)",
-                if count == 1 { "y" } else { "ies" }
-            ),
-            None => "loading…".to_string(),
+        let crumb = match self.drilled {
+            Some((entry, _)) => {
+                let calls = self.round_call_count(entry);
+                format!(
+                    "transcript #{} · {} call{}",
+                    entry.saturating_sub(1),
+                    calls,
+                    plural(calls)
+                )
+            }
+            None => match count {
+                Some(0) => "no entries".to_string(),
+                Some(count) => format!(
+                    "{count} entr{} (system + transcript)",
+                    if count == 1 { "y" } else { "ies" }
+                ),
+                None => "loading…".to_string(),
+            },
         };
         let mut chrome = crate::tui::screen::Chrome::new("Context");
         chrome.crumb = Some(&crumb);
-        chrome.counter = count
-            .filter(|count| *count > 0)
-            .map(|count| (self.selected, count));
+        chrome.counter = match self.drilled {
+            Some((entry, cursor)) => {
+                let calls = self.round_call_count(entry);
+                (calls > 0).then_some((cursor, calls))
+            }
+            None => count
+                .filter(|count| *count > 0)
+                .map(|count| (self.selected, count)),
+        };
         // The inspector keeps roughly two fifths of the screen, bounded so a
         // tall terminal does not turn into one long panel and a short one
         // still shows the list.
@@ -447,7 +556,12 @@ impl ContextView {
         // arithmetic in one place.
         let panel =
             (chrome.panel_height > 0).then(|| self.inspector_panel(width, chrome.panel_height));
-        let focus = count.map(|_| self.selected);
+        // Focus is the entry index on the message list, the call cursor when
+        // drilled in.
+        let focus = match self.drilled {
+            Some((entry, cursor)) => (self.round_call_count(entry) > 0).then_some(cursor),
+            None => count.map(|_| self.selected),
+        };
         self.screen
             .render(frame, area, &document, focus, &chrome, panel);
         // The list may have shrunk under the wheel (a delete landed): keep
@@ -455,12 +569,18 @@ impl ContextView {
         self.screen.clamp(document.len());
     }
 
-    /// The entry list as the shared document: one focusable line per entry.
-    /// The text depends on the width, so it is rebuilt per frame.
+    /// The entry list as the shared document: one focusable line per entry —
+    /// or, drilled into a round, one focusable line per call.
     fn doc(&self, width: usize) -> Document {
         let Some(entries) = self.entries() else {
             return Document::new();
         };
+        if let Some((entry, cursor)) = self.drilled {
+            let calls = self.round_call_count(entry);
+            return Document::push_focused(
+                (0..calls).map(|position| call_line(entries, entry, position, position == cursor, width)),
+            );
+        }
         Document::push_focused(
             entries
                 .iter()
@@ -475,13 +595,20 @@ impl ContextView {
             return "Enter save · Ctrl+J newline · Esc cancel";
         }
         if self.confirm_delete {
-            return "delete? y/n";
+            return if self.drilled.is_some() {
+                "delete call + result? y/n"
+            } else {
+                "delete? y/n"
+            };
         }
-        "↑↓ move · d delete · e edit · u undo · Esc close"
+        if self.drilled.is_some() {
+            return "↑↓ call · d delete call · u undo · Esc back · q close";
+        }
+        "↑↓ move · Enter tool calls · d delete · e edit · u undo · Esc close"
     }
 
-    /// The inspector as lines: the edit box, or the selected entry in full
-    /// with an honest overflow marker.
+    /// The inspector as lines: the edit box, or the selected entry — or the
+    /// selected call, drilled in — in full with an honest overflow marker.
     fn inspector_panel(&self, width: usize, height: u16) -> crate::tui::screen::Panel<'static> {
         if let Some(composer) = self.editing.as_ref() {
             return editor_panel(composer, width, height);
@@ -491,6 +618,12 @@ impl ContextView {
 
     /// The selected entry in full, or nothing while there is none.
     fn inspector_lines(&self, width: usize, height: u16) -> Vec<Line<'static>> {
+        let Some(messages) = self.entries() else {
+            return Vec::new();
+        };
+        if let Some((entry, cursor)) = self.drilled {
+            return call_inspector_lines(messages, entry, cursor, width, height);
+        }
         let Some(message) = self.selected_entry() else {
             return Vec::new();
         };
@@ -509,17 +642,169 @@ impl ContextView {
             Style::default().fg(theme::SUBTLE),
         ))];
         lines.extend(message_lines(message, width));
-        let visible = (height as usize).max(1);
-        let overflow = lines.len().saturating_sub(visible);
-        lines.truncate(visible.saturating_sub(usize::from(overflow > 0)));
-        if overflow > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("… +{overflow} more lines"),
-                Style::default().fg(theme::DIM),
-            )));
-        }
-        lines
+        clamp_with_overflow(lines, height)
     }
+}
+
+/// Move the drill cursor one step within a round's calls, wrapping at both
+/// ends like the entry list; an empty round keeps the cursor at 0.
+fn step_cursor(current: usize, count: usize, delta: isize) -> usize {
+    match count {
+        0 => 0,
+        _ => crate::tui::screen::step_focus(current, count, delta).unwrap_or(0),
+    }
+}
+
+/// The result message answering a call within the round's contiguous
+/// `Role::Tool` block, when it is there.
+fn result_of<'a>(
+    entries: &'a [Message],
+    entry: usize,
+    call_id: &str,
+) -> Option<&'a Message> {
+    entries
+        .get(entry + 1..)?
+        .iter()
+        .take_while(|message| message.role == Role::Tool)
+        .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+}
+
+/// Trim inspector lines into the panel height, trading the last row for an
+/// honest "+N more" when they overflow.
+fn clamp_with_overflow(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
+    let visible = (height as usize).max(1);
+    let overflow = lines.len().saturating_sub(visible);
+    lines.truncate(visible.saturating_sub(usize::from(overflow > 0)));
+    if overflow > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("… +{overflow} more lines"),
+            Style::default().fg(theme::DIM),
+        )));
+    }
+    lines
+}
+
+/// One drilled-in call row: cursor marker, the call, and what its result
+/// weighs — the number a per-call delete frees.
+fn call_line(
+    entries: &[Message],
+    entry: usize,
+    position: usize,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let Some(call) = entries
+        .get(entry)
+        .and_then(|message| message.tool_calls.as_ref())
+        .and_then(|calls| calls.get(position))
+    else {
+        return Line::from(Span::raw(String::new()));
+    };
+    let cursor = if selected { "▸ " } else { "  " };
+    let arguments = call.arguments.trim();
+    let arguments = match arguments {
+        "" | "{}" => String::new(),
+        _ => format!(" {arguments}"),
+    };
+    let result_note = match result_of(entries, entry, &call.id) {
+        Some(result) => match result.content.chars().count() {
+            0 => " · result (empty)".to_string(),
+            chars => format!(" · result {chars} chars"),
+        },
+        None => " · result (missing)".to_string(),
+    };
+    let available = width.saturating_sub(cursor.len()).max(1);
+    let text = wrap_str(
+        &format!("⚙ {}{}{result_note}", call.name, arguments),
+        available,
+    )
+    .into_iter()
+    .next()
+    .unwrap_or_default();
+    Line::from(vec![
+        Span::styled(
+            cursor.to_string(),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(if selected {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        Span::styled(
+            text,
+            Style::default().fg(if selected { theme::ACCENT } else { theme::DIM }),
+        ),
+    ])
+}
+
+/// The drilled call in full: identity, the arguments, then the result it
+/// got — the content a delete would take out of the context.
+fn call_inspector_lines(
+    entries: &[Message],
+    entry: usize,
+    cursor: usize,
+    width: usize,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let Some(call) = entries
+        .get(entry)
+        .and_then(|message| message.tool_calls.as_ref())
+        .and_then(|calls| calls.get(cursor))
+    else {
+        return Vec::new();
+    };
+    let title = format!(
+        "─ ⚙ {} · {} · transcript #{}",
+        call.id,
+        call.name,
+        entry.saturating_sub(1),
+    );
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default().fg(theme::SUBTLE),
+    ))];
+    let arguments = call.arguments.trim();
+    let body = match arguments {
+        "" | "{}" => "(no arguments)".to_string(),
+        _ => arguments.to_string(),
+    };
+    for row in wrap_str(&body, width.max(1)) {
+        lines.push(Line::from(Span::styled(
+            row,
+            Style::default().fg(theme::ACCENT),
+        )));
+    }
+    match result_of(entries, entry, &call.id) {
+        Some(result) => {
+            lines.push(Line::from(Span::styled(
+                "─ result",
+                Style::default().fg(theme::SUBTLE),
+            )));
+            if result.content.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "(empty)",
+                    Style::default().fg(theme::DIM),
+                )));
+            } else {
+                for paragraph in result.content.split('\n') {
+                    if paragraph.is_empty() {
+                        lines.push(Line::raw(String::new()));
+                        continue;
+                    }
+                    for row in wrap_str(paragraph, width.max(1)) {
+                        lines.push(Line::raw(row));
+                    }
+                }
+            }
+        }
+        None => lines.push(Line::from(Span::styled(
+            "no result message",
+            Style::default().fg(theme::DIM),
+        ))),
+    }
+    clamp_with_overflow(lines, height)
 }
 
 /// Whether `d` may target this entry: user and assistant messages, including
@@ -948,6 +1233,150 @@ mod tests {
         view.handle_key(key(KeyCode::Char('d')));
         assert!(!view.confirm_delete);
         assert_eq!(view.handle_key(key(KeyCode::Char('y'))), None);
+    }
+
+    // -- the tool-round drill-down ------------------------------------------
+
+    fn multi_call_transcript() -> Vec<Message> {
+        vec![
+            Message::system("be brief"),
+            Message::assistant_tool_calls(vec![call("a", "ping"), call("b", "grep")]),
+            Message::tool_result("a", "pong"),
+            Message::tool_result("b", "TODO: fix it"),
+        ]
+    }
+
+    #[test]
+    fn enter_drills_into_a_tool_round_and_esc_climbs_back() {
+        let mut view = view_with(multi_call_transcript());
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        assert_eq!(view.drilled, Some((1, 0)));
+
+        // Plain entries have nothing to drill into.
+        let mut plain = view_with(transcript());
+        plain.handle_key(key(KeyCode::Down));
+        plain.handle_key(key(KeyCode::Enter));
+        assert_eq!(plain.drilled, None);
+
+        // Esc (and Left/Backspace) leave the round; the selection is kept.
+        assert_eq!(view.handle_key(key(KeyCode::Esc)), None);
+        assert_eq!(view.drilled, None);
+        assert_eq!(view.selected, 1);
+    }
+
+    #[test]
+    fn the_drill_moves_the_call_cursor_and_wraps() {
+        let mut view = view_with(multi_call_transcript());
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.drilled, Some((1, 1)));
+        view.handle_key(key(KeyCode::Down));
+        assert_eq!(view.drilled, Some((1, 0)), "wrapped to the first call");
+        view.handle_key(key(KeyCode::Up));
+        assert_eq!(view.drilled, Some((1, 1)), "wrapped to the last call");
+        view.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(view.drilled, Some((1, 1)));
+        view.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(view.drilled, Some((1, 0)));
+    }
+
+    #[test]
+    fn the_drill_delete_submits_one_call_with_its_result() {
+        let mut view = view_with(multi_call_transcript());
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down)); // the second call
+
+        // n backs out, like on the message list.
+        view.handle_key(key(KeyCode::Char('d')));
+        assert!(view.confirm_delete);
+        assert_eq!(view.handle_key(key(KeyCode::Char('n'))), None);
+
+        // y splices just this call out: transcript index 0, call `b`.
+        view.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(
+            view.handle_key(key(KeyCode::Char('y'))),
+            Some(ContextAction::DeleteToolCall {
+                index: 0,
+                call_id: "b".to_string()
+            })
+        );
+    }
+
+    /// The undo works from inside the drill too — the refreshed snapshot
+    /// keeps the drill on the restored round.
+    #[test]
+    fn the_drill_undo_submits_an_undo_action() {
+        let mut view = view_with(multi_call_transcript());
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            view.handle_key(key(KeyCode::Char('u'))),
+            Some(ContextAction::Undo)
+        );
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_drill_while_the_round_survives() {
+        let mut view = view_with(multi_call_transcript());
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down)); // cursor on the second call
+
+        // A refresh after one call went: the round is still there, the
+        // cursor clamps into it.
+        let after = vec![
+            Message::system("be brief"),
+            Message::assistant_tool_calls(vec![call("b", "grep")]),
+            Message::tool_result("b", "TODO: fix it"),
+        ];
+        view.apply_snapshot(after);
+        assert_eq!(view.drilled, Some((1, 0)));
+
+        // A round emptied entirely (or replaced by plain text) closes it.
+        let emptied = vec![
+            Message::system("be brief"),
+            Message::assistant("just text now"),
+        ];
+        view.apply_snapshot(emptied);
+        assert_eq!(view.drilled, None);
+    }
+
+    #[test]
+    fn drilled_rows_show_calls_results_and_hints() {
+        let mut view = view_with(multi_call_transcript());
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        let rows = render_rows(&mut view, 70, 14);
+        let rendered = rows.join("\n");
+        assert!(rendered.contains("transcript #0 · 2 calls"), "{rendered}");
+        assert!(rendered.contains("⚙ ping"), "{rendered}");
+        assert!(rendered.contains("result 4 chars"), "{rendered}");
+        assert!(rendered.contains("d delete call"), "{rendered}");
+
+        // The confirm hint names what a delete takes out.
+        view.handle_key(key(KeyCode::Char('d')));
+        let rows = render_rows(&mut view, 70, 14);
+        assert!(
+            rows.join("\n").contains("delete call + result? y/n"),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_drill_inspector_shows_arguments_and_the_result() {
+        let mut view = view_with(multi_call_transcript());
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Down)); // the grep call
+        let rows = render_rows(&mut view, 60, 14);
+        let rendered = rows.join("\n");
+        assert!(rendered.contains("⚙ b · grep"), "{rendered}");
+        assert!(rendered.contains("─ result"), "{rendered}");
+        assert!(rendered.contains("TODO: fix it"), "{rendered}");
     }
 
     #[test]

@@ -250,6 +250,7 @@ pub async fn run_with(
         global.default_effort.clone(),
         global.double_press_interrupt,
         global.max_tool_rounds,
+        global.tool_output_token_limit,
         global.status_bar,
         global
             .plugins

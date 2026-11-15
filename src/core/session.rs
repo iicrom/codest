@@ -420,6 +420,17 @@ impl AgentSession {
         })
     }
 
+    /// Splice one tool call (and its result message) out of the transcript
+    /// message at `index` (`/context` viewer's tool-round drill-down). The
+    /// result arrives as a [`EventMsg::ConversationSnapshot`] or an error
+    /// event.
+    pub fn delete_tool_call(&self, index: usize, call_id: impl Into<String>) -> String {
+        self.submit(Op::DeleteToolCall {
+            index,
+            call_id: call_id.into(),
+        })
+    }
+
     /// Undo the most recent `/context` delete or edit. The result arrives as
     /// a [`EventMsg::ConversationSnapshot`] or an error event.
     pub fn undo_context_edit(&self) -> String {
@@ -460,7 +471,6 @@ struct ActiveTurn {
 /// What the worker starts from: sessions restored from disk plus the rollout
 /// directory to persist into. `rollout_dir: None` runs fully in memory (used
 /// by tests); restore failures degrade to an empty list.
-#[derive(Default)]
 pub struct SessionBootstrap {
     /// Sessions restored from rollouts, oldest first.
     pub loaded: Vec<LoadedSession>,
@@ -494,6 +504,31 @@ pub struct SessionBootstrap {
     /// unbounded, matching codex: it ends when the model stops calling
     /// tools, the user interrupts, or the request fails.
     pub max_tool_rounds: Option<usize>,
+    /// The per-output tool result budget in estimated tokens
+    /// (`config.toml`'s `tool_output_token_limit`). A result that busts it
+    /// enters the conversation truncated — head, notice, tail — while the
+    /// rollout keeps the full output. `0` disables truncation.
+    pub tool_output_token_limit: usize,
+}
+
+impl Default for SessionBootstrap {
+    /// The truncation default is the policy constant, not `0`: a plain
+    /// spawn truncates exactly like a configured run.
+    fn default() -> Self {
+        Self {
+            loaded: Vec::new(),
+            rollout_dir: None,
+            cwd: String::new(),
+            fresh: false,
+            tools: Vec::new(),
+            executor: None,
+            profiles: SessionBootstrap::empty_profiles(),
+            profile: None,
+            initial_effort: None,
+            max_tool_rounds: None,
+            tool_output_token_limit: crate::core::truncate::DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT,
+        }
+    }
 }
 
 impl SessionBootstrap {
@@ -516,6 +551,7 @@ impl std::fmt::Debug for SessionBootstrap {
             .field("profile", &self.profile)
             .field("initial_effort", &self.initial_effort)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("tool_output_token_limit", &self.tool_output_token_limit)
             .finish()
     }
 }
@@ -727,6 +763,7 @@ async fn run_worker(
     let profiles = std::mem::take(&mut bootstrap.profiles);
     let startup_profile = bootstrap.profile.take();
     let max_tool_rounds = bootstrap.max_tool_rounds;
+    let tool_output_token_limit = bootstrap.tool_output_token_limit;
     let writer = bootstrap
         .rollout_dir
         .map(|dir| RolloutWriter::new(dir, bootstrap.cwd));
@@ -852,6 +889,7 @@ async fn run_worker(
                 declared: tools.clone(),
                 enabled: session_tools[current].clone(),
                 max_tool_rounds,
+                tool_output_token_limit,
             };
             run_turn(
                 &mut turn,
@@ -1356,6 +1394,43 @@ async fn run_worker(
                     }
                 }
             }
+            Op::DeleteToolCall { index, call_id } => {
+                let conversation = &mut sessions[current];
+                match conversation.remove_tool_call(index, &call_id) {
+                    Ok(removal) => {
+                        // The op is atomic — call and result go together — so
+                        // the shape holds by construction; a rejection here
+                        // would mean a bug, and is answered with why after an
+                        // undo, like `DeleteMessages`.
+                        if let Err(message) =
+                            Conversation::validate_tool_structure(conversation.messages())
+                        {
+                            conversation.undo_last_edit();
+                            let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
+                        } else {
+                            rollouts.append(
+                                current,
+                                RolloutItem::ContextToolCallDeleted {
+                                    index: removal.index,
+                                    call: removal.call,
+                                    position: removal.position,
+                                    results: removal.results,
+                                    assistant_removed: removal.assistant_removed,
+                                },
+                            );
+                            let _ = tx.send(Event::new(
+                                submission.id,
+                                EventMsg::ConversationSnapshot {
+                                    messages: conversation.snapshot(),
+                                },
+                            ));
+                        }
+                    }
+                    Err(message) => {
+                        let _ = tx.send(Event::new(submission.id, EventMsg::Error { message }));
+                    }
+                }
+            }
             Op::UndoContextEdit => {
                 let conversation = &mut sessions[current];
                 if conversation.undo_last_edit() {
@@ -1404,6 +1479,10 @@ struct TurnContext {
     /// unbounded, ending it only when the model stops calling tools, the user
     /// interrupts, or the request fails.
     max_tool_rounds: Option<usize>,
+    /// The per-output tool result budget in estimated tokens; a result that
+    /// busts it enters the conversation truncated (the rollout keeps the
+    /// full payload). `0` disables the cut.
+    tool_output_token_limit: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1726,7 +1805,14 @@ async fn execute_tool_call(
             duration_ms: started_at.elapsed().as_millis() as u64,
         },
     ));
-    conversation.push_message(Message::tool_result(&call.id, content.clone()));
+    // Two copies, like codex: the conversation gets the budget-trimmed
+    // result (head, notice, tail), while the rollout and the tool card's
+    // event above keep the full payload. Replays apply the same cut, so a
+    // restored session sees what a live one saw.
+    conversation.push_message(Message::tool_result(
+        &call.id,
+        crate::core::truncate::truncate_tool_output(&content, deps.tool_output_token_limit),
+    ));
     rollouts.append(
         current,
         RolloutItem::ToolResult {
@@ -4403,5 +4489,240 @@ mod tests {
 
         // The transcript is intact: the rejected delete rolled back.
         assert_eq!(snapshot_len(&mut session).await, 5);
+    }
+
+    /// A two-call round for the drill-down tests: user, assistant(c1, c2),
+    /// two results, assistant("done").
+    async fn transcript_of_a_two_call_round(dir: Option<&std::path::Path>) -> AgentSession {
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![
+                tool_call("c1", "ping"),
+                tool_call("c2", "ping"),
+            ])],
+            vec![StreamItem::Delta("done".to_string())],
+        ]);
+        let bootstrap = match dir {
+            Some(dir) => SessionBootstrap {
+                rollout_dir: Some(dir.to_path_buf()),
+                cwd: "/tmp/demo".to_string(),
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+            None => SessionBootstrap {
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+        };
+        let mut session =
+            AgentSession::spawn_with_bootstrap(Arc::new(client), "be brief", bootstrap);
+        session.submit_user_turn("hi");
+        collect_turn(&mut session).await;
+        session
+    }
+
+    /// The drill-down's per-call delete splices one call and its result out
+    /// of a two-call round, passes the shape validator, and the undo puts
+    /// the round back exactly.
+    #[tokio::test]
+    async fn delete_tool_call_splices_one_call_and_undoes() {
+        let mut session = transcript_of_a_two_call_round(None).await;
+        // Transcript: user, assistant(c1, c2), two results, assistant.
+        assert_eq!(snapshot_len(&mut session).await, 6, "system + 5 messages");
+
+        session.delete_tool_call(1, "c1");
+        let events = collect_until(&mut session, |msg| {
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        let EventMsg::ConversationSnapshot { messages } = &event.msg else {
+            panic!("expected a snapshot, got {:?}", event.msg);
+        };
+        assert_eq!(messages.len(), 5, "system + 4 messages");
+        let calls = messages[2].tool_calls.as_ref().expect("still some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c2");
+        assert_eq!(messages[3], Message::tool_result("c2", "pong {}"));
+        assert_eq!(messages[4].role, Role::Assistant);
+
+        // The undo rebuilds the whole round, calls and results in order.
+        session.undo_context_edit();
+        let events = collect_until(&mut session, |msg| {
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        let EventMsg::ConversationSnapshot { messages } = &event.msg else {
+            panic!("expected a snapshot, got {:?}", event.msg);
+        };
+        assert_eq!(messages.len(), 6);
+        let calls = messages[2].tool_calls.as_ref().expect("restored");
+        assert_eq!(
+            calls.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            vec!["c1", "c2"]
+        );
+        assert_eq!(messages[3], Message::tool_result("c1", "pong {}"));
+        assert_eq!(messages[4], Message::tool_result("c2", "pong {}"));
+    }
+
+    /// A tool-call delete survives a restart: the rollout marker replays the
+    /// splice and rebuilds the checkpoint, so the undo still works — and a
+    /// later undo marker restores the round whole.
+    #[tokio::test]
+    async fn delete_tool_call_replays_with_its_checkpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "codest-context-toolcall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let mut session = transcript_of_a_two_call_round(Some(&dir)).await;
+        session.delete_tool_call(1, "c1");
+        collect_until(&mut session, |msg| {
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
+        })
+        .await;
+        session.shutdown();
+        drop(session);
+
+        // The restored session replays the spliced transcript, checkpoint
+        // intact — and the checkpoint still reverses the splice exactly.
+        let mut paths = crate::core::rollout::list_workspace_sessions(&dir).expect("list");
+        let loaded = crate::core::rollout::load_session(&paths.remove(0)).expect("load");
+        assert_eq!(loaded.messages.len(), 4);
+        assert_eq!(loaded.undo.len(), 1);
+        let mut restored = Conversation::replayed(
+            "be brief",
+            loaded.messages.clone(),
+            loaded.undo.clone(),
+        );
+        assert!(restored.undo_last_edit());
+        assert_eq!(restored.len(), 5);
+        assert_eq!(
+            Conversation::validate_tool_structure(restored.messages()),
+            Ok(())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unknown call ids and non-round messages error out; the transcript is
+    /// untouched.
+    #[tokio::test]
+    async fn delete_tool_call_errors_for_an_unknown_call() {
+        let mut session = transcript_of_two().await;
+
+        session.delete_tool_call(0, "c1");
+        let events = collect_until(&mut session, |msg| {
+            matches!(
+                msg,
+                EventMsg::ConversationSnapshot { .. } | EventMsg::Error { .. }
+            )
+        })
+        .await;
+        let [event] = events.as_slice() else {
+            panic!("expected one reply, got {events:?}");
+        };
+        let EventMsg::Error { message } = &event.msg else {
+            panic!("expected an error, got {:?}", event.msg);
+        };
+        assert!(message.contains("no tool call"), "{message}");
+        assert_eq!(snapshot_len(&mut session).await, 3);
+    }
+
+    /// A tool that dumps a huge output: the conversation carries the
+    /// budget-trimmed shape, while the tool card's event and the rollout
+    /// file keep the full payload — and a replay applies the same cut.
+    #[tokio::test]
+    async fn tool_results_enter_the_conversation_truncated() {
+        struct HugeExecutor;
+        impl ToolExecutor for HugeExecutor {
+            fn execute(&self, _call: &ToolCall) -> Result<String, String> {
+                // 40k chars ≈ 10k estimated tokens, over the 4k default.
+                Ok("x".repeat(40_000))
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "codest-truncate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
+            vec![StreamItem::Delta("done".to_string())],
+        ]);
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(HugeExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+        session.submit_user_turn("hi");
+        let events = collect_turn(&mut session).await;
+
+        // The tool card showed the whole thing.
+        let full = events
+            .iter()
+            .find_map(|event| match &event.msg {
+                EventMsg::AgentToolCall {
+                    result,
+                    error: None,
+                    ..
+                } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("a tool card");
+        assert_eq!(full.len(), 40_000);
+
+        // The conversation got the head + notice + tail shape.
+        session.inspect_conversation();
+        let events = collect_until(&mut session, |msg| {
+            matches!(msg, EventMsg::ConversationSnapshot { .. })
+        })
+        .await;
+        let EventMsg::ConversationSnapshot { messages } = &events[0].msg else {
+            unreachable!("filtered above");
+        };
+        assert_eq!(messages[3].role, Role::Tool);
+        assert!(messages[3].content.contains("tokens truncated …"));
+        assert!(messages[3].content.len() < 40_000);
+
+        // The rollout file holds the full payload; replaying it applies the
+        // budget again, so the restored session sees the same shape.
+        session.shutdown();
+        drop(session);
+        let mut paths = crate::core::rollout::list_workspace_sessions(&dir).expect("list");
+        let path = paths.remove(0);
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains(&"x".repeat(1_000)), "the full payload is kept");
+        let loaded = crate::core::rollout::load_session(&path).expect("load");
+        assert!(loaded.messages[2].content.contains("tokens truncated …"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
