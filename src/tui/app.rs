@@ -130,6 +130,11 @@ const IDLE_HINTS_INLINE: &str = "Enter send · / commands · Ctrl+J newline · P
 /// Ctrl+O's "tool output expanded") stays visible. Long enough to read at a
 /// glance, gone before it can accumulate.
 const STATUS_TTL: Duration = Duration::from_millis(2_000);
+/// How long the first Esc/Ctrl+C press stays armed while a turn runs and
+/// [`App::double_press_interrupt`] is on — the same window as the idle
+/// Ctrl+C quit confirmation, and short enough that a stale gesture never
+/// interrupts a turn the user forgot about.
+const INTERRUPT_CONFIRM_WINDOW: Duration = Duration::from_millis(2_000);
 
 /// Frame budget: at most one screen render per interval. Everything an event
 /// burst mutates — streaming deltas, wheel notches, queued notices — lands in
@@ -172,6 +177,8 @@ pub async fn run(
     mode: TuiMode,
     restore: RestoreMode,
     profiles: ProfileStartup,
+    default_effort: Option<String>,
+    double_press_interrupt: bool,
     max_tool_rounds: Option<usize>,
     status_bar: StatusBarConfig,
     plugin_settings: Vec<(String, PluginSettings)>,
@@ -239,7 +246,9 @@ pub async fn run(
     // Three states, mirroring the worker: `None` means "seed from the active
     // model's `default_level`", `Some(None)` is an explicit `off`, and
     // `Some(Some(level))` is that level. A restored session's own recorded
-    // choice wins; failing that (or on a fresh start) the profile preset.
+    // choice wins; failing that the profile preset, then the `config.toml`
+    // `default_effort` (Ctrl+S in `/model` writes it), and only when both are
+    // unset does the model's `default_level` seed it.
     let initial_effort: Option<Option<String>> = if fresh {
         profiles
             .active
@@ -247,6 +256,7 @@ pub async fn run(
             .and_then(|name| profiles.set.get(name))
             .and_then(|active| active.effort.as_deref())
             .map(reasoning::normalize_effort)
+            .or_else(|| default_effort.as_deref().map(reasoning::normalize_effort))
     } else {
         loaded
             .last()
@@ -313,6 +323,7 @@ pub async fn run(
         status_bar,
         plugin_settings,
     );
+    app.double_press_interrupt = double_press_interrupt;
     // The tool set is per session, and the worker restores the adopted
     // session's set silently (no op ran, so no event comes back). Mirror it:
     // a saved set names only what that session left enabled, and names this
@@ -697,6 +708,16 @@ struct App {
     prompt_index: Option<usize>,
     draft: String,
     last_ctrl_c: Option<Instant>,
+    /// While a turn runs, the moment Esc or Ctrl+C was last pressed with the
+    /// interrupt confirm on: the first press only arms the gesture, and a
+    /// second press inside [`INTERRUPT_CONFIRM_WINDOW`] completes it. Esc and
+    /// Ctrl+C share the timestamp, so either key finishes what the other
+    /// started. Cleared with the turn.
+    last_interrupt_press: Option<Instant>,
+    /// Whether interrupting a running turn needs a double-press of Esc or
+    /// Ctrl+C (`config.toml` `double_press_interrupt`, `/settings` toggle).
+    /// Idle-time Ctrl+C quit confirmation is separate and always on.
+    double_press_interrupt: bool,
     /// Inline mode: current pane rectangle (always pinned to the bottom row).
     inline_top: u16,
     inline_height: u16,
@@ -731,6 +752,18 @@ struct ModelMenuItem {
     selection: Selection,
     /// Declared or discovered context window, shown in the picker row.
     context_window: Option<u64>,
+    /// The reasoning levels this model accepts (`Tab` cycles them in the
+    /// picker): its declared `reasoning` list with `default_level` folded in,
+    /// else the shared defaults.
+    effort_levels: Vec<String>,
+    /// The model's own `default_level`, the preview shown for a model that is
+    /// not the active one and has no draft yet.
+    default_level: Option<String>,
+    /// The effort `Tab` picked for this row and Enter will apply, as an
+    /// `Option<Option<String>>`: outer `None` is "untouched", `Some(None)` is
+    /// a drafted `off`, `Some(Some(level))` is a drafted level. Dies with the
+    /// picker — Esc never applies a draft.
+    draft: Option<Option<String>>,
     current: bool,
 }
 
@@ -911,6 +944,8 @@ impl App {
             prompt_index: None,
             draft: String::new(),
             last_ctrl_c: None,
+            last_interrupt_press: None,
+            double_press_interrupt: true,
             inline_top,
             inline_height,
             inline_rows,
@@ -1606,6 +1641,14 @@ impl App {
                 KeyCode::Up => return self.move_model_selection(-1),
                 KeyCode::Down => return self.move_model_selection(1),
                 KeyCode::Enter if !ctrl && !alt && !shift => return self.confirm_model_switch(),
+                // Tab cycles the highlighted model's effort as a draft —
+                // Shift+Tab walks back — and Enter applies it with the
+                // switch. Nothing is sent while browsing.
+                KeyCode::Tab => return self.cycle_model_effort(1),
+                KeyCode::BackTab => return self.cycle_model_effort(-1),
+                // Save the highlighted model and its shown effort as the
+                // startup default (`config.toml`).
+                KeyCode::Char('s') if ctrl => return self.save_default_model(),
                 KeyCode::Char('r') if !ctrl && !alt && !shift => return self.refresh_model(),
                 KeyCode::Esc => {
                     self.model_menu = None;
@@ -1760,7 +1803,9 @@ impl App {
 
     fn on_ctrl_c(&mut self) {
         if self.busy {
-            self.session.interrupt();
+            if self.confirm_interrupt() {
+                self.session.interrupt();
+            }
             self.last_ctrl_c = None;
             return;
         }
@@ -1786,9 +1831,32 @@ impl App {
             self.command_menu_dismissed = true;
             return;
         }
-        if self.busy {
+        if self.busy && self.confirm_interrupt() {
             self.session.interrupt();
         }
+    }
+
+    /// The busy Esc/Ctrl+C gate while [`Self::double_press_interrupt`] is on:
+    /// the first press only arms the gesture and flashes a footer hint, and a
+    /// second press inside [`INTERRUPT_CONFIRM_WINDOW`] reports the
+    /// interrupt. Esc and Ctrl+C share the armed timestamp, so either key
+    /// finishes what the other started. With the toggle off this is an
+    /// immediate yes, matching the old single-press behavior.
+    fn confirm_interrupt(&mut self) -> bool {
+        if !self.double_press_interrupt {
+            return true;
+        }
+        let now = Instant::now();
+        if self
+            .last_interrupt_press
+            .is_some_and(|previous| now.duration_since(previous) < INTERRUPT_CONFIRM_WINDOW)
+        {
+            self.last_interrupt_press = None;
+            return true;
+        }
+        self.last_interrupt_press = Some(now);
+        self.flash("Esc/Ctrl+C again to interrupt");
+        false
     }
 
     fn on_enter(&mut self) {
@@ -2210,13 +2278,16 @@ impl App {
         }
         let items: Vec<ModelMenuItem> = selections
             .into_iter()
-            .map(|selection| ModelMenuItem {
-                current: selection.as_str() == self.model_label,
-                context_window: self
-                    .pool
-                    .model_info(&selection)
-                    .and_then(|model| model.context_window),
-                selection,
+            .map(|selection| {
+                let info = self.pool.model_info(&selection);
+                ModelMenuItem {
+                    current: selection.as_str() == self.model_label,
+                    context_window: info.as_ref().and_then(|model| model.context_window),
+                    effort_levels: effort_levels_for(info.as_ref()),
+                    default_level: info.as_ref().and_then(|model| model.default_level.clone()),
+                    draft: None,
+                    selection,
+                }
             })
             .collect();
         let selected = items.iter().position(|item| item.current).unwrap_or(0);
@@ -2236,9 +2307,137 @@ impl App {
         };
     }
 
+    /// `Tab`/Shift+Tab in the picker: cycle the highlighted model's effort
+    /// through its levels plus `off`, as a draft that Enter applies together
+    /// with the switch (nothing is sent while browsing). The start position
+    /// is the effort the row already shows — the draft, else the active
+    /// effort for the current model or the model's own `default_level`.
+    fn cycle_model_effort(&mut self, delta: isize) {
+        // Read phase: derive the cycle and the shown position without a
+        // mutable borrow, then re-borrow to store the draft.
+        let Some(menu) = self.model_menu.as_ref() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
+        let entries = model_effort_entries(item);
+        let len = entries.len();
+        let shown = item
+            .draft
+            .clone()
+            .unwrap_or_else(|| self.model_effort_preview(item));
+        let position = match shown.as_deref() {
+            Some(shown) => entries
+                .iter()
+                .position(|entry| {
+                    entry
+                        .as_deref()
+                        .is_some_and(|level| level.eq_ignore_ascii_case(shown))
+                })
+                // An effort carried over from another model starts over at
+                // the first level.
+                .unwrap_or(0),
+            // The active model without an effort sits on `off`; a model with
+            // no `default_level` has no opinion, so start at the first level.
+            None if item.current => len - 1,
+            None => 0,
+        };
+        let next = entries[((position as isize + delta).rem_euclid(len as isize)) as usize].clone();
+        if let Some(item) = self
+            .model_menu
+            .as_mut()
+            .and_then(|menu| menu.items.get_mut(menu.selected))
+        {
+            item.draft = Some(next);
+            self.needs_redraw = true;
+        }
+    }
+
+    /// The effort a picker row shows before any draft: the active effort for
+    /// the current model (`None` = `off`), the model's own `default_level`
+    /// otherwise — what switching to that model right now would give you.
+    fn model_effort_preview(&self, item: &ModelMenuItem) -> Option<String> {
+        if item.current {
+            self.effort.clone()
+        } else {
+            item.default_level.clone()
+        }
+    }
+
+    /// Ctrl+S in the picker: write the highlighted model and its shown
+    /// effort to `config.toml` as the startup default (`default` and
+    /// `default_effort`). Only fresh sessions read them — a restored one
+    /// restores its own state — so the running session is untouched.
+    fn save_default_model(&mut self) {
+        let Some(menu) = self.model_menu.as_ref() else {
+            return;
+        };
+        let Some(item) = menu.items.get(menu.selected) else {
+            return;
+        };
+        let selection = item.selection.as_str().to_string();
+        let current = item.current;
+        let shown = item
+            .draft
+            .clone()
+            .unwrap_or_else(|| self.model_effort_preview(item));
+        let effort_value = match &shown {
+            // A concrete level, including the active effort of the current
+            // model.
+            Some(level) => Some(crate::core::settings::SettingValue::Text(level.clone())),
+            // The active model without an effort sends no field; `off`
+            // records that choice explicitly.
+            None if current => Some(crate::core::settings::SettingValue::Text(
+                reasoning::EFFORT_OFF.to_string(),
+            )),
+            // A model without its own default has no opinion: drop the key
+            // so the next startup seeds from the model after all.
+            None => None,
+        };
+        let mut file = match crate::core::settings::SettingsFile::load(&self.settings_path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.view_mut()
+                    .history
+                    .push(HistoryCell::Error(format!("cannot open {error}")));
+                return;
+            }
+        };
+        let saved = file
+            .write(
+                crate::core::settings::SettingOwner::Host,
+                "default",
+                Some(crate::core::settings::SettingValue::Text(selection.clone())),
+            )
+            .and_then(|_| {
+                file.write(
+                    crate::core::settings::SettingOwner::Host,
+                    "default_effort",
+                    effort_value,
+                )
+            });
+        let effort_label = match (&shown, current) {
+            (Some(level), _) => level.clone(),
+            (None, true) => reasoning::EFFORT_OFF.to_string(),
+            (None, false) => "model default".to_string(),
+        };
+        let view = self.view_mut();
+        match saved {
+            Ok(_) => view.history.push(HistoryCell::Notice(format!(
+                "saved default: {selection} · effort {effort_label}"
+            ))),
+            Err(error) => view
+                .history
+                .push(HistoryCell::Error(format!("cannot save default: {error}"))),
+        }
+    }
+
     /// Confirm the picker: switching to the already-active model just closes
     /// the menu. The label updates optimistically; the core's `ModelSwitched`
-    /// event confirms (a failure arrives as an error cell).
+    /// event confirms (a failure arrives as an error cell). A drafted effort
+    /// rides along: Enter applies it after the switch, and Enter on the
+    /// already-active model with a draft applies just the effort.
     fn confirm_model_switch(&mut self) {
         let Some(menu) = self.model_menu.take() else {
             return;
@@ -2247,7 +2446,11 @@ impl App {
             return;
         };
         let selection = item.selection.as_str();
+        let draft = item.draft.clone();
         if selection == self.model_label {
+            if let Some(effort) = draft {
+                self.apply_effort(effort);
+            }
             return;
         }
         self.model_label = selection.to_string();
@@ -2264,6 +2467,9 @@ impl App {
         let view = self.view_mut();
         view.history.push(HistoryCell::Notice(notice));
         self.session.switch_model(selection);
+        if let Some(effort) = draft {
+            self.apply_effort(effort);
+        }
     }
 
     /// `r` in the picker: re-run models discovery for the selected item's
@@ -2704,23 +2910,7 @@ impl App {
             .route
             .as_ref()
             .and_then(|route| self.pool.model_info(route));
-        let mut levels = match info.as_ref().and_then(|model| model.reasoning.as_deref()) {
-            Some(levels) if !levels.is_empty() => levels.to_vec(),
-            _ => reasoning::DEFAULT_EFFORT_LEVELS
-                .iter()
-                .map(|level| (*level).to_string())
-                .collect(),
-        };
-        if let Some(default) = info
-            .as_ref()
-            .and_then(|model| model.default_level.as_deref())
-            && !levels
-                .iter()
-                .any(|level| level.eq_ignore_ascii_case(default))
-        {
-            levels.push(default.to_string());
-        }
-        levels
+        effort_levels_for(info.as_ref())
     }
 
     /// The active model's declared context window (providers.toml or the
@@ -3061,10 +3251,12 @@ impl App {
         }
     }
 
-    /// Adopt a freshly written `config.toml`: the footer table and the
-    /// per-plugin pockets that every hook receives.
+    /// Adopt a freshly written `config.toml`: the footer table, the
+    /// interrupt-confirm toggle, and the per-plugin pockets that every hook
+    /// receives.
     fn apply_global_config(&mut self, global: &crate::core::config::GlobalConfig) {
         self.status_bar = global.status_bar.clone();
+        self.double_press_interrupt = global.double_press_interrupt;
         self.plugin_settings = global
             .plugins
             .iter()
@@ -3585,6 +3777,7 @@ impl App {
                 // drop it, so the blocked `ask` reads "UI not available"
                 // and the ignored tool call unwinds.
                 self.prompt_dialog = None;
+                self.last_interrupt_press = None;
                 self.settle_running_tool("interrupted");
                 self.finalize_live();
                 self.view_mut().history.push(HistoryCell::Interrupted);
@@ -3615,6 +3808,7 @@ impl App {
                 let output = self.plugins.turn_complete(&message, self.plugin_info());
                 self.busy = false;
                 self.last_ctrl_c = None;
+                self.last_interrupt_press = None;
                 self.apply_output(output);
             }
             EventMsg::SteerClaimed { text } => {
@@ -3930,7 +4124,8 @@ impl App {
             return wizard_rows(wizard).min(MAX_COMMAND_MENU_ROWS);
         }
         if let Some(menu) = self.model_menu.as_ref() {
-            menu.items.len().min(MAX_COMMAND_MENU_ROWS)
+            // The model rows plus the selected one's effort strip.
+            (menu.items.len() + 1).min(MAX_COMMAND_MENU_ROWS)
         } else if let Some(menu) = self.effort_menu.as_ref() {
             menu.items.len().min(MAX_COMMAND_MENU_ROWS)
         } else if let Some(menu) = self.tools_menu.as_ref() {
@@ -3998,10 +4193,25 @@ impl App {
             return provider_menu_lines(wizard, &self.composer.text());
         }
         if let Some(menu) = self.model_menu.as_ref() {
-            let window = command_menu_window(menu.items.len(), menu.selected, height);
-            return window
+            // The strip row always shows: the model rows' window shrinks by
+            // one so the highlighted model's effort stays visible under it.
+            let window =
+                command_menu_window(menu.items.len(), menu.selected, height.saturating_sub(1));
+            let mut lines: Vec<Line<'static>> = window
                 .map(|index| model_menu_line(index + 1, &menu.items[index], index == menu.selected))
                 .collect();
+            if let Some(item) = menu.items.get(menu.selected) {
+                let shown = item
+                    .draft
+                    .clone()
+                    .unwrap_or_else(|| self.model_effort_preview(item));
+                lines.push(model_effort_strip_line(
+                    item,
+                    shown.as_deref(),
+                    item.current,
+                ));
+            }
+            return lines;
         }
         if let Some(menu) = self.effort_menu.as_ref() {
             let window = command_menu_window(menu.items.len(), menu.selected, height);
@@ -4292,8 +4502,22 @@ impl App {
         }
 
         let spinner = chat::SPINNER[self.tick % chat::SPINNER.len()];
+        // With the interrupt confirm on, the state names the gesture: a bare
+        // "Esc interrupt" would promise what the first press doesn't do.
+        let interrupt_label = if self.double_press_interrupt {
+            "Esc×2 interrupt"
+        } else {
+            "Esc interrupt"
+        };
+        // The busy hint carries the same label as the state segment: both
+        // must tell the truth about how many presses an interrupt takes.
+        let busy_hint = if self.double_press_interrupt {
+            "Enter queue · Alt+Enter steer · Esc×2 interrupt"
+        } else {
+            "Enter queue · Alt+Enter steer · Esc interrupt"
+        };
         let state = if self.busy {
-            format!("{spinner} working · Esc interrupt")
+            format!("{spinner} working · {interrupt_label}")
         } else {
             "ready".to_string()
         };
@@ -4310,7 +4534,7 @@ impl App {
                 } else if self.session_menu.is_some() {
                     "↑↓ select · Enter switch · Esc close"
                 } else if self.model_menu.is_some() {
-                    "↑↓ select · Enter switch · r refresh · Esc close"
+                    "↑↓ select · Tab effort · Enter switch · Ctrl+S default · r refresh · Esc close"
                 } else if self.effort_menu.is_some() {
                     "↑↓ select · Enter switch · Esc close"
                 } else if self.command_menu_open() {
@@ -4318,7 +4542,7 @@ impl App {
                 } else if self.show_ctrl_c_hint() {
                     "Ctrl+C again to quit"
                 } else if self.busy {
-                    "Enter queue · Alt+Enter steer · Esc interrupt"
+                    busy_hint
                 } else if self.mode == TuiMode::Fullscreen {
                     IDLE_HINTS_FULLSCREEN
                 } else {
@@ -4849,6 +5073,40 @@ fn session_menu_line(
     Line::from(spans)
 }
 
+/// The effort levels one model accepts: its declared `reasoning` list when
+/// present, else the shared defaults — with the model's own `default_level`
+/// always selectable even when the list omits it. Shared by `/effort` and the
+/// `/model` picker's `Tab` cycling.
+fn effort_levels_for(info: Option<&crate::core::config::ModelInfo>) -> Vec<String> {
+    let mut levels = match info.and_then(|model| model.reasoning.as_deref()) {
+        Some(levels) if !levels.is_empty() => levels.to_vec(),
+        _ => reasoning::DEFAULT_EFFORT_LEVELS
+            .iter()
+            .map(|level| (*level).to_string())
+            .collect(),
+    };
+    if let Some(default) = info.and_then(|model| model.default_level.as_deref())
+        && !levels
+            .iter()
+            .any(|level| level.eq_ignore_ascii_case(default))
+    {
+        levels.push(default.to_string());
+    }
+    levels
+}
+
+/// The `/model` picker's `Tab` cycle for one row: the model's levels as
+/// `Some`, with the `off` entry `/effort` offers as the tail (`None`).
+fn model_effort_entries(item: &ModelMenuItem) -> Vec<Option<String>> {
+    let mut entries: Vec<Option<String>> = item
+        .effort_levels
+        .iter()
+        .map(|level| Some(level.clone()))
+        .collect();
+    entries.push(None);
+    entries
+}
+
 /// One row of the `/model` picker: marker, 1-based number, the
 /// `provider/model` selection, its context window when known, and a marker
 /// on the active model.
@@ -4892,6 +5150,68 @@ fn model_menu_line(number: usize, item: &ModelMenuItem, selected: bool) -> Line<
         ));
     }
     Line::from(spans)
+}
+
+/// The effort strip under the `/model` rows: the highlighted model's levels
+/// plus `off`, with the shown effort bracketed — what Enter would set. The
+/// shown effort is the row's draft, else the active effort (current model)
+/// or the model's own `default_level`; a level the model does not declare
+/// (carried over from another model by an earlier `/effort`) still renders,
+/// in front, and a model without any default shows a neutral `default`.
+fn model_effort_strip_line(
+    item: &ModelMenuItem,
+    shown: Option<&str>,
+    current: bool,
+) -> Line<'static> {
+    let dim = Style::default().fg(theme::DIM);
+    let mut spans = vec![Span::styled("  effort ", dim), Span::styled("‹ ", dim)];
+    let mut first = true;
+    let declared = shown.is_some_and(|shown| {
+        item.effort_levels
+            .iter()
+            .any(|level| level.eq_ignore_ascii_case(shown))
+    });
+    if let Some(shown) = shown
+        && !declared
+    {
+        push_effort_entry(&mut spans, shown, true, first);
+        first = false;
+    }
+    for level in &item.effort_levels {
+        let active = shown.is_some_and(|shown| shown.eq_ignore_ascii_case(level));
+        push_effort_entry(&mut spans, level, active, first);
+        first = false;
+    }
+    // The `off` tail is what the active model without an effort shows; a
+    // model with neither a default nor a draft shows the neutral marker.
+    let off_active = shown.is_none() && current;
+    push_effort_entry(&mut spans, reasoning::EFFORT_OFF, off_active, first);
+    if shown.is_none() && !current {
+        push_effort_entry(&mut spans, "default", true, false);
+    }
+    spans.push(Span::styled(" ›", dim));
+    Line::from(spans)
+}
+
+/// One entry of an effort strip or picker row: ` · ` separated, the shown
+/// level bracketed and accented.
+fn push_effort_entry(spans: &mut Vec<Span<'static>>, label: &str, active: bool, first: bool) {
+    if !first {
+        spans.push(Span::styled(" · ", Style::default().fg(theme::DIM)));
+    }
+    if active {
+        spans.push(Span::styled(
+            format!("[{label}]"),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(theme::DIM),
+        ));
+    }
 }
 
 /// One row of the `/effort` picker: marker, 1-based number, the level (or the
@@ -6621,7 +6941,7 @@ mod tests {
 
         // Wide enough that the footer's always-on context segment does not
         // squeeze the menu's hint out of the render.
-        let lines = render_lines(&mut app, 100, 20);
+        let lines = render_lines(&mut app, 130, 20);
         let rendered = lines.join("\n");
         assert!(rendered.contains("▸ 2 · test/two"), "{rendered}");
         assert!(rendered.contains("test/one"), "{rendered}");
@@ -7195,6 +7515,227 @@ mod tests {
         assert!(rendered.contains("▸ 5 · off"), "{rendered}");
         assert!(rendered.contains("4 · high · current"), "{rendered}");
         assert!(rendered.contains("Enter switch"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn model_menu_tab_cycles_effort_as_a_draft_and_enter_applies_it() {
+        let mut app = test_app();
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+
+        // The test models declare no levels, so the cycle is the shared
+        // defaults plus `off`; the active model has no effort yet, so Tab
+        // starts from `off` and wraps to the first level.
+        let menu = app.model_menu.as_ref().expect("picker open");
+        assert!(menu.items[0].current);
+        assert_eq!(
+            menu.items[0].effort_levels,
+            ["minimal", "low", "medium", "high"]
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_menu.as_ref().unwrap().items[0].draft,
+            Some(Some("minimal".to_string()))
+        );
+        for expected in ["low", "medium", "high"] {
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(
+                app.model_menu.as_ref().unwrap().items[0].draft,
+                Some(Some(expected.to_string()))
+            );
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_menu.as_ref().unwrap().items[0].draft,
+            Some(None),
+            "`off` is the cycle's tail"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_menu.as_ref().unwrap().items[0].draft,
+            Some(Some("minimal".to_string())),
+            "the cycle wraps past `off`"
+        );
+
+        // Shift+Tab walks back to `off`, and Tab forward wraps to the first
+        // level again.
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.model_menu.as_ref().unwrap().items[0].draft, Some(None));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_menu.as_ref().unwrap().items[0].draft,
+            Some(Some("minimal".to_string()))
+        );
+
+        // Enter on the already-active model applies just the drafted effort.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.model_menu.is_none());
+        assert_eq!(app.effort.as_deref(), Some("minimal"));
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("reasoning effort set to minimal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn model_menu_enter_applies_the_draft_with_the_switch() {
+        let mut app = test_app();
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+
+        // A model that is not active has no recorded effort and the test
+        // models declare no default level, so Tab starts at the first level.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_menu.as_ref().unwrap().items[1].draft,
+            Some(Some("low".to_string()))
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.model_menu.is_none());
+        assert_eq!(app.model_label, "test/two");
+        assert_eq!(app.effort.as_deref(), Some("low"));
+
+        // Esc discards the draft: nothing was applied for the untouched row.
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.model_menu.is_none());
+        assert_eq!(app.effort.as_deref(), Some("low"));
+        assert_eq!(app.model_label, "test/two");
+    }
+
+    #[tokio::test]
+    async fn model_menu_ctrl_s_saves_the_default_model_and_effort() {
+        let path = std::env::temp_dir().join(format!(
+            "codest-app-model-default-{}-{:x}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut app = test_app();
+        app.settings_path = path.clone();
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+
+        // The active model without an effort: the default effort is `off`.
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let global = crate::core::config::load_global(&path).expect("parse");
+        assert_eq!(global.default.as_deref(), Some("test/one"));
+        assert_eq!(global.default_effort.as_deref(), Some("off"));
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text == "saved default: test/one · effort off")
+        );
+
+        // A drafted effort is what gets saved.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let global = crate::core::config::load_global(&path).expect("parse");
+        assert_eq!(global.default_effort.as_deref(), Some("minimal"));
+
+        // A non-current model without its own default drops the key, so the
+        // next startup seeds from the model after all.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let global = crate::core::config::load_global(&path).expect("parse");
+        assert_eq!(global.default.as_deref(), Some("test/two"));
+        assert_eq!(global.default_effort, None);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Notice(text)) if text.contains("effort model default"))
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn model_menu_renders_an_effort_strip_and_the_new_hints() {
+        let mut app = test_app();
+        app.composer.set_text("/model".to_string());
+        app.try_submit();
+
+        // The active model without an effort brackets `off`.
+        let rendered = render_lines(&mut app, 110, 20).join("\n");
+        assert!(rendered.contains("[off]"), "{rendered}");
+        assert!(rendered.contains("minimal · low"), "{rendered}");
+
+        // Tab drafts a level; the strip brackets it and the footer names
+        // both new keys.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let rendered = render_lines(&mut app, 110, 20).join("\n");
+        assert!(rendered.contains("[minimal]"), "{rendered}");
+        assert!(rendered.contains("Tab effort"), "{rendered}");
+        assert!(rendered.contains("Ctrl+S default"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn double_press_interrupt_requires_two_escapes_while_busy() {
+        let mut app = test_app();
+        app.busy = true;
+        app.double_press_interrupt = true;
+
+        // The first Esc only arms the gesture: the press is recorded and the
+        // footer flash names it — the single-press path does neither.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.last_interrupt_press.is_some());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("again to interrupt"))
+        );
+
+        // The second Esc inside the window completes the gesture: the
+        // timestamp clears and `session.interrupt()` runs right after (a
+        // no-op with no turn installed, like every idle cancel).
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.last_interrupt_press.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_interrupt_gestures_expire_and_ctrl_c_shares_the_gesture() {
+        let mut app = test_app();
+        app.busy = true;
+        app.double_press_interrupt = true;
+
+        // A gesture older than the window re-arms instead of completing.
+        app.last_interrupt_press = Some(Instant::now() - INTERRUPT_CONFIRM_WINDOW);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.last_interrupt_press.is_some());
+
+        // Ctrl+C finishes what Esc armed: one shared timestamp.
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.last_interrupt_press.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupt_confirm_off_interrupts_on_the_first_press() {
+        let mut app = test_app();
+        app.busy = true;
+        app.double_press_interrupt = false;
+
+        // No gesture state, no flash: the press goes straight to the
+        // interrupt path, as it always has.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.last_interrupt_press.is_none(), "no gesture state");
+        assert!(app.status.is_none());
+
+        // The footer tells the truth about the gesture: a single press.
+        let footer = render_lines(&mut app, 130, 20)
+            .last()
+            .expect("footer")
+            .clone();
+        assert!(footer.contains("Esc interrupt"), "{footer}");
+        assert!(!footer.contains("Esc×2"), "{footer}");
+
+        app.double_press_interrupt = true;
+        let footer = render_lines(&mut app, 130, 20)
+            .last()
+            .expect("footer")
+            .clone();
+        assert!(footer.contains("Esc×2 interrupt"), "{footer}");
     }
 
     #[tokio::test]

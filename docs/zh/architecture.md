@@ -47,7 +47,7 @@ codex 的 TUI 超过 10 万行，core 带着大量沙箱/工具/审批基础设�
 
 **4. 定型。** `finalize_complete` 把本轮的推理与助手文本写入 rollout，把文本推进会话，发出 `AgentMessage`，再发 `TurnUsage` 与 `TurnComplete`。前端只在事件流上渲染；它不直接读会话状态，唯一的例外是 `Op::InspectConversation`，回答是一个 `ConversationSnapshot`。
 
-**取消。** 每个回合创建一个 `CancellationToken` 并交给客户端共享。前端的 `Esc` 路径调用 `InterruptHandle::interrupt`，取消正在进行的回合的 token；worker 的 `select!` 偏向取消分支，因此立刻定型：模型要求但结果永远没到的工具调用会用一条显式的 `interrupted` 工具结果封口（保证下一个请求的线协议合法），已流出的助手文本被提交，回合以 `TurnAborted` 加 `TurnComplete` 结束。已经跑在阻塞线程池上的工具停不下来——它的结果被丢弃。`Op::Interrupt` 也在总线上，但 TUI 直接走句柄，取消因此不必排在它要取消的那个回合后面。同一个 `InterruptHandle` 在每回合开始时装配、在每条定型路径上清空，空闲时的 `Esc` 因此是 no-op，而不是一次游走的取消。
+**取消。** 每个回合创建一个 `CancellationToken` 并交给客户端共享。前端的 `Esc` 路径调用 `InterruptHandle::interrupt`，取消正在进行的回合的 token；worker 的 `select!` 偏向取消分支，因此立刻定型：模型要求但结果永远没到的工具调用会用一条显式的 `interrupted` 工具结果封口（保证下一个请求的线协议合法），已流出的助手文本被提交，回合以 `TurnAborted` 加 `TurnComplete` 结束。已经跑在阻塞线程池上的工具停不下来——它的结果被丢弃。`Op::Interrupt` 也在总线上，但 TUI 直接走句柄，取消因此不必排在它要取消的那个回合后面。同一个 `InterruptHandle` 在每回合开始时装配、在每条定型路径上清空，空闲时的 `Esc` 因此是 no-op，而不是一次游走的取消。TUI 自身也可以给按键加闸（`config.toml` 的 `double_press_interrupt`，默认开启）：回合进行中，第一次 `Esc`/`Ctrl+C` 只闪一条提示，两秒内再按一次才走同一条路径——worker 侧察觉不到差别。
 
 ## 状态归属
 
@@ -78,7 +78,7 @@ codex 的 TUI 超过 10 万行，core 带着大量沙箱/工具/审批基础设�
 
 ## 启动装配
 
-`src/cli.rs` 是装配点，运行在任何 worker 存在之前。它加载 `profiles.toml`（保留 `--profile` 预设）、按该 profile 的工具过滤器构建 `PluginHost`、加载 `config.toml` 的全局默认值，再从 `providers.toml` 构建 `ModelPool`（没有该文件时用 flag 与环境变量合成单端点）。随后解析启动选择——`--provider`/`--model`，否则激活 profile 的 `default`，否则 `config.toml` 的 `default`，否则第一个实例的第一个模型——并先验证它能构建出客户端，端点坏掉在启动时就失败，而不是等到第一回合。最后把 `--continue` / `--resume` 映射成 `RestoreMode`，全部交给 `tui::run`。
+`src/cli.rs` 是装配点，运行在任何 worker 存在之前。它加载 `profiles.toml`（保留 `--profile` 预设）、按该 profile 的工具过滤器构建 `PluginHost`、加载 `config.toml` 的全局默认值，再从 `providers.toml` 构建 `ModelPool`（没有该文件时用 flag 与环境变量合成单端点）。随后解析启动选择——`--provider`/`--model`，否则激活 profile 的 `default`，否则 `config.toml` 的 `default`，否则第一个实例的第一个模型——并先验证它能构建出客户端，端点坏掉在启动时就失败，而不是等到第一回合。最后把 `--continue` / `--resume` 映射成 `RestoreMode`，全部交给 `tui::run`；`tui::run` 沿对应的链条播种初始 effort：恢复会话自己记录的选择，否则激活 profile 的 `effort`，否则 `config.toml` 的 `default_effort`，最后是模型的 `default_level`。
 
 加新设置时有两个细节。profile 的**装配期**值（工具过滤器、提示词追加）在这里应用一次；它的**会话期**值（选择、effort）则装配进 worker，之后仍可通过 op 改变。另外 `ModelBackend` 有三种形态——`Fixed` 供测试与简单宿主、`Pooled` 为多 provider 运行时、`Empty` 是"什么都没配"的起点，此时回合以指引作答，直到 `/model` 切换把它迁移走。
 

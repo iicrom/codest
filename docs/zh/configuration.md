@@ -29,11 +29,13 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 
 ## `config.toml`
 
-全局文件有两个顶层键加两张表：
+全局文件有若干顶层键加两张表：
 
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `default` | string | — | 初始模型选择，`"provider/model"`。 |
+| `default_effort` | string | — | 新会话的初始推理 effort（含 `off`）。由 `/model` 菜单的 `Ctrl+S` 写入。 |
+| `double_press_interrupt` | boolean | `true` | 回合进行中，`Esc`/`Ctrl+C` 需连按两次才中断；第一次按下只显示提示。 |
 | `max_tool_rounds` | integer | 缺省 | 每个用户回合「模型 → 工具 → 模型」轮数的可选上限。 |
 | `[status_bar]` | table | 分段开启 | 页脚：`plugin_segments` 总开关与插件分段的 `order` 显示优先级，外加宿主上下文读数的 `context` / `cache_rate` 开关。 |
 | `[plugins."<id>"]` | table | — | 插件私有的配置口袋；宿主不解释任何键。 |
@@ -41,6 +43,8 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 ```toml
 # ~/.codest/config.toml
 default = "openai/gpt-4o-mini"
+default_effort = "high"               # /model 里 Ctrl+S 同时写入这两个键
+# double_press_interrupt = true
 # max_tool_rounds = 64
 
 [status_bar]
@@ -55,6 +59,8 @@ enabled = true                        # 启动即开启计量（默认关闭）
 
 `default` 是启动选择链的第三环：`--provider`/`--model` > 激活 profile 的 `default` > `config.toml` 的 `default` > 第一个实例的第一个模型。它以 `"provider/model"` 指名某个实例的某个模型，在第一个 `/` 处解析，因此模型 id 本身可以带 `/`。
 
+`default_effort` 位于 effort 链的对应一环：恢复的会话沿用自己记录的 effort；否则激活 profile 的 `effort` 优先，其次 `default_effort`，最后才由模型的 `default_level` 播种。`/model` 菜单的 `Ctrl+S` 会把它与 `default` 一起写入。
+
 **`[status_bar]`** 控制页脚的可选部分。`plugin_segments` 是插件一侧的总开关；`order` 以显示优先级列出完整分段键（`plugin:key`）；未列出的分段保持注册顺序，当前没有东西在显示的键会被忽略，所以过期条目没有代价。窄终端上优先级最低的分段先丢弃。宿主自己的上下文读数有两个开关：`context`（`used/window (n%)` 分段本体；关闭后只剩模型 · effort · 状态骨架）和 `cache_rate`（其中的 `cache 80%` 部分，仅在后端上报缓存 prompt token 时出现）。两者默认开启，可在 `/settings` 中实时修改。
 
 **`[plugins."<id>"]`** 是按插件的配置口袋——整张表原样交给插件
@@ -65,7 +71,8 @@ enabled = true                        # 启动即开启计量（默认关闭）
 ### `/settings`
 
 `/settings` 就是编辑这个文件的界面：一张卡放宿主自己的选项（目前是
-`[status_bar] plugin_segments`），每个声明了设置的插件各一张卡，每行显示已存
+`[status_bar] plugin_segments`、`[status_bar] context`、`[status_bar] cache_rate`
+与 `double_press_interrupt`），每个声明了设置的插件各一张卡，每行显示已存
 的值或默认值。`↑`/`↓` 走行，`Enter` 翻转开关 / 推进列表 / 打开单行编辑器，
 `←`/`→` 前后步进列表（与开关），`Esc` 关闭；`/settings tps` 打开时直接聚焦该
 卡。

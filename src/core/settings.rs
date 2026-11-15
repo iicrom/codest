@@ -50,7 +50,7 @@ pub static SETTINGS_COMMANDS: &[CommandSpec] = &[SETTINGS_COMMAND];
 
 /// The host's own settings section — what `/settings` shows besides the
 /// plugins. Keys are dotted paths in `config.toml`.
-static HOST_FIELDS: [SettingField; 3] = [
+static HOST_FIELDS: [SettingField; 4] = [
     SettingField::toggle(
         "status_bar.plugin_segments",
         "Plugin status segments",
@@ -70,6 +70,13 @@ static HOST_FIELDS: [SettingField; 3] = [
         "Cache hit rate",
         "The context segment's `cache 80%` part, when the backend reports \
          cached prompt tokens.",
+        true,
+    ),
+    SettingField::toggle(
+        "double_press_interrupt",
+        "Confirm interrupt",
+        "While a turn runs, Esc and Ctrl+C must be pressed twice to \
+         interrupt it; the first press only shows a hint.",
         true,
     ),
 ];

@@ -29,11 +29,13 @@ Only `config.toml`, `providers.toml`, and `profiles.toml` are meant to be hand-e
 
 ## `config.toml`
 
-The global file holds two top-level keys plus two tables:
+The global file holds top-level keys plus two tables:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `default` | string | — | Initial model selection, `"provider/model"`. |
+| `default_effort` | string | — | Initial reasoning effort for fresh sessions (`off` included). Set by `Ctrl+S` in the `/model` menu. |
+| `double_press_interrupt` | boolean | `true` | While a turn runs, `Esc`/`Ctrl+C` must be pressed twice to interrupt; the first press only shows a hint. |
 | `max_tool_rounds` | integer | absent | Optional cap on model → tool → model rounds per user turn. |
 | `[status_bar]` | table | segments on | The footer: `plugin_segments` master switch and `order` display priority for plugin segments, plus the `context` / `cache_rate` toggles for the host's context readout. |
 | `[plugins."<id>"]` | table | — | A plugin's private settings pocket; the host interprets no key. |
@@ -41,6 +43,8 @@ The global file holds two top-level keys plus two tables:
 ```toml
 # ~/.codest/config.toml
 default = "openai/gpt-4o-mini"
+default_effort = "high"               # Ctrl+S in /model writes both keys
+# double_press_interrupt = true
 # max_tool_rounds = 64
 
 [status_bar]
@@ -55,13 +59,15 @@ enabled = true                        # start with the meter on (default off)
 
 `default` is the third step of the startup selection chain: `--provider`/`--model` > active profile's `default` > `config.toml` `default` > first model of first instance. It names one model of one instance as `"provider/model"`, parsed at the first slash, so model ids may themselves contain `/`.
 
+`default_effort` sits at the matching step of the effort chain: a restored session restores its own recorded effort, else the active profile's `effort` wins, else `default_effort`, and only then does the model's `default_level` seed it. `Ctrl+S` in the `/model` menu writes it together with `default`.
+
 **`[status_bar]`** controls the footer's optional pieces. `plugin_segments` is the plugin side's master switch, and `order` lists full segment keys (`plugin:key`) in display priority; unlisted segments keep their registration order, and keys nothing currently displays are ignored, so a stale entry costs nothing. On a narrow terminal the lowest-priority segments drop first. The host's own context readout has two toggles of its own: `context` (the `used/window (n%)` segment; off leaves the model · effort · state skeleton) and `cache_rate` (the `cache 80%` part inside it, shown only while the backend reports cached prompt tokens). Both default to on and are editable live in `/settings`.
 
 **`[plugins."<id>"]`** is the per-plugin settings pocket — the whole table is handed to the plugin verbatim ([plugins.md](plugins.md), section 6); a plugin reads it through `PluginContext::plugin_settings()`. A table naming an unknown plugin id is a **startup error** (a silent no-op would hide a typo), so remove the table when you uninstall a plugin.
 
 ### `/settings`
 
-`/settings` is the screen that edits this file: one card for the host's own options (`[status_bar] plugin_segments` today) and one card per plugin that declared settings, each row showing the stored value or the default. `↑`/`↓` walk the rows, `Enter` flips a switch / advances a list / opens a one-line editor, `←`/`→` step a list (and a switch) backwards/forwards, `Esc` closes; `/settings tps` opens with that card focused.
+`/settings` is the screen that edits this file: one card for the host's own options (`[status_bar] plugin_segments`, `[status_bar] context`, `[status_bar] cache_rate`, and `double_press_interrupt` today) and one card per plugin that declared settings, each row showing the stored value or the default. `↑`/`↓` walk the rows, `Enter` flips a switch / advances a list / opens a one-line editor, `←`/`→` step a list (and a switch) backwards/forwards, `Esc` closes; `/settings tps` opens with that card focused.
 
 ```text
  Settings › tps                                            1/2

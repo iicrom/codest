@@ -18,7 +18,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | `/rename <name>` | — | 重命名当前会话（默认名取第一句用户输入）。 |
 | `/sessions` | `/resume` | 打开会话列表，切换并继续以前的会话。 |
 | `/continue` | — | 不追加用户消息、直接续跑当前会话——崩溃/中断后的恢复入口。 |
-| `/model` | — | 打开模型菜单，切换 provider/model（`r` 重新发现）。 |
+| `/model` | — | 打开模型菜单，切换 provider/model（`r` 重新发现）。`Tab`/`Shift+Tab` 循环高亮模型的推理 effort（随切换一并生效）；`Ctrl+S` 把高亮的模型和 effort 保存为启动默认。 |
 | `/provider` | — | 打开 provider 向导：新增 OpenAI 兼容端点、登录插件 provider、查看已配置列表。 |
 | `/profile [name]` | — | 显示可用 profile 列表，或切换到某个 profile（工具与提示词只在启动时生效）。 |
 | `/effort [level]` | — | 查看或设置推理等级（默认 `minimal`/`low`/`medium`/`high`，`off` 清除），以 `reasoning_effort` 下发。 |
@@ -80,7 +80,7 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | 按键 | 行为 |
 | --- | --- |
 | `Enter` | 发送；候选可见时执行选中的指令。 |
-| `Tab` | 补全选中的指令。 |
+| `Tab` | 补全选中的指令；`/model` 菜单中循环高亮模型的 effort（`Shift+Tab` 反向）。 |
 | `Ctrl+J` / `Alt+Enter` / `Shift+Enter` | 插入换行。 |
 | `↑` / `↓` | 选择候选；多行移动光标；单行浏览输入历史。 |
 | `Ctrl+P` / `Ctrl+N` | 浏览输入历史。 |
@@ -91,10 +91,11 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | 滚轮（fullscreen） | 滚动 transcript（每格 3 行，`Alt`+滚轮 15 行）。 |
 | `PageUp` / `PageDown` | 滚动 transcript（fullscreen）；inline 下交给终端。 |
 | `Ctrl+End` | 跳到最新一行并恢复跟随（fullscreen）；inline 下等同 `End`。 |
-| `Esc` | 关闭候选；生成中则中断当前回合。 |
+| `Esc` | 关闭候选；生成中则中断当前回合——中断确认开启（`double_press_interrupt`）时需连按两次。 |
 | `Ctrl+T` | 展开/折叠 thinking 卡片。 |
 | `Ctrl+O` | 展开/折叠工具输出（折叠时显示前 3 行预览）。 |
-| `Ctrl+C` | 生成中中断；清空输入；空输入时连按两次退出。 |
+| `Ctrl+S` | `/model` 菜单中，把高亮的模型和 effort 保存为启动默认。 |
+| `Ctrl+C` | 生成中中断（中断确认开启时需连按两次）；清空输入；空输入时连按两次退出。 |
 | `Ctrl+D` | 空输入时退出。 |
 
 ### 说明
@@ -102,7 +103,8 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 - **fullscreen 与 inline 的差异。** `PageUp`/`PageDown` 只在 `fullscreen` 归应用处理——它持有 alternate screen。`inline` 下 scrollback 归终端所有，因此这两个键直接交给终端。`Ctrl+End` 同理：fullscreen 下把视口跳回最新一行并恢复跟随模式，inline 下仍是普通的移动到输入末尾。
 - **`Ctrl+T` 就是 `/thinking`。** 两者都切换 thinking 卡片定型后是否展开；卡片本身始终被记录。
 - **`Ctrl+O` 折叠工具输出。** 卡片正文显示前 3 行，其余折叠为 `… +N lines (ctrl+o to expand)`；`Ctrl+O` 作用于 transcript 中全部工具卡片。
-- **`Ctrl+C` 有三种状态。** 生成中中断当前回合；输入框有文本时清空输入；空输入时必须快速连按两次才退出。
+- **`Ctrl+C` 有三种状态。** 生成中中断当前回合——中断确认开启时（`/settings` 的 *Confirm interrupt*，即 `config.toml` 的 `double_press_interrupt`，默认开启），第一次按下只显示提示，两秒内再按一次才中断，Esc 同理；输入框有文本时清空输入；空输入时必须快速连按两次才退出。
+- **`/model` 菜单自带 effort 条。** 模型列表下方展示高亮模型的档位加 `off`，方括号标出 Enter 将生效的值：已起草的档位、当前模型的生效 effort、或该模型自身的默认档。`Tab`/`Shift+Tab` 循环起草，`Enter` 将模型与 effort 一并应用（浏览过程不发送任何请求）；`Ctrl+S` 把当前组合写入 `config.toml` 的 `default` 与 `default_effort`，新会话由此启动（profile 的 `effort` 仍优先于它）。
 - **`Ctrl+D`** 只在空输入时退出——有文本时不做任何事。
 
 ## 相关文档

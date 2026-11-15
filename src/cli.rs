@@ -247,6 +247,8 @@ pub async fn run_with(
             set: profiles.clone(),
             active: active.map(|(name, _)| name.to_string()),
         },
+        global.default_effort.clone(),
+        global.double_press_interrupt,
         global.max_tool_rounds,
         global.status_bar,
         global
