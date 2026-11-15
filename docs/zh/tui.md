@@ -8,7 +8,7 @@ codest 有两种占用终端的方式。`fullscreen` 把整个屏幕交给应用
 
 | 模式 | 行为 |
 | --- | --- |
-| `fullscreen`（默认） | 进入 alternate screen，应用持有整屏；transcript 用 `PgUp`/`PgDn` 或滚轮滚动。开启鼠标上报，滚轮每格 3 行（`Alt`+滚轮 15 行）；按住 `Shift` 拖拽使用终端原生选区。 |
+| `fullscreen`（默认） | 进入 alternate screen，应用持有整屏；transcript 用 `PgUp`/`PgDn` 或滚轮滚动。开启鼠标上报，滚轮每格 3 行（`Alt`+滚轮 15 行）；应用自管文字选中——在 transcript 上拖拽即选中，松开即复制。按住 `Shift` 拖拽则使用终端原生选区。 |
 | `inline` | 不进 alternate screen；已定型的 transcript 行写入终端自身 scrollback；底部只保留输入框与状态行。不开启鼠标上报，选区与复制保持终端原生行为。 |
 
 两种模式的差别只有一条契约：`fullscreen` 下应用重绘视口，随时可以改任何内容；`inline` 下已经进入 scrollback 的行脱离了应用的控制，无法再修改。正因如此，`inline` 只写入渲染器认为已经定型的行（见[流式提交规则](#流式提交规则)）。
@@ -23,6 +23,8 @@ CST_TUI_MODE=inline codest
 ### 滚动
 
 `fullscreen` 下 transcript 位于应用自管的滚动视口：滚轮每格 3 行，`Alt`+滚轮 15 行，`PgUp`/`PgDn` 每次 5 行。应用重绘视口，所以 transcript 可以长于屏幕、上下都能浏览。向上滚动会脱离尾部跟随，`Ctrl+End` 跳回最新一行并重新跟随。
+
+**文字选中与复制。** 在 transcript 上按下并拖拽即可选中——实色高亮、保留前景色；双击选中所在词，三击选中整行；松开鼠标即把高亮文本复制到剪贴板。复制链路与参考 TUI 一致：优先原生工具（macOS `pbcopy`，Linux `wl-copy`/`xclip`/`xsel`；SSH 下跳过），其次 `tmux load-buffer -w`，最后向 stdout 写 OSC 52 序列（tmux 内用 passthrough 包装）。footer 闪现汇报结果——`copied 128 chars`，非默认路径注明路由。选区存于绝对行坐标，滚轮滚动时高亮跟随文本；除滚动键外的任何按键都会清除它，`Esc` 亦然。`Shift`+拖拽绕过这一切，把手势交给终端原生选区。
 
 `inline` 下应用不做任何滚动：`PgUp`/`PgDn` 直接交给终端，由终端滚动自己的 scrollback。回合进行中，inline 面板在底部最多保留四行仍在流式生长的尾部，高度固定——因此逐行增长的块不会把自己已经画好的开头滚进 scrollback、事后又重复输出一次。块定型后，这些行才真正晋升进 scrollback。
 

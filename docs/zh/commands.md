@@ -89,11 +89,13 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 | `Ctrl+W` / `Alt+Backspace` | 删除前一个词。 |
 | `Ctrl+U` / `Ctrl+K` | 删除到行首 / 行尾。 |
 | 滚轮（fullscreen） | 滚动 transcript（每格 3 行，`Alt`+滚轮 15 行）。 |
+| 鼠标拖选（fullscreen） | 选中 transcript 文字，松开即复制到剪贴板（双击选词、三击选行，`Esc` 清除）。 |
 | `PageUp` / `PageDown` | 滚动 transcript（fullscreen）；inline 下交给终端。 |
 | `Ctrl+End` | 跳到最新一行并恢复跟随（fullscreen）；inline 下等同 `End`。 |
-| `Esc` | 关闭候选；生成中则中断当前回合——中断确认开启（`double_press_interrupt`）时需连按两次。 |
+| `Esc` | 关闭候选；清除选区；生成中则中断当前回合——中断确认开启（`double_press_interrupt`）时需连按两次。 |
 | `Ctrl+T` | 展开/折叠 thinking 卡片。 |
 | `Ctrl+O` | 展开/折叠工具输出（折叠时显示前 3 行预览）。 |
+| `Ctrl+G` | 切换 tps 流量计（`tps:meter`，由插件注册）。 |
 | `Ctrl+S` | `/model` 菜单中，把高亮的模型和 effort 保存为启动默认。 |
 | `Ctrl+C` | 生成中中断（中断确认开启时需连按两次）；清空输入；空输入时连按两次退出。 |
 | `Ctrl+D` | 空输入时退出。 |
@@ -106,6 +108,8 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 - **`Ctrl+C` 有三种状态。** 生成中中断当前回合——中断确认开启时（`/settings` 的 *Confirm interrupt*，即 `config.toml` 的 `double_press_interrupt`，默认开启），第一次按下只显示提示，两秒内再按一次才中断，Esc 同理；输入框有文本时清空输入；空输入时必须快速连按两次才退出。
 - **`/model` 菜单自带 effort 条。** 模型列表下方展示高亮模型的档位加 `off`，方括号标出 Enter 将生效的值：已起草的档位、当前模型的生效 effort、或该模型自身的默认档。`Tab`/`Shift+Tab` 循环起草，`Enter` 将模型与 effort 一并应用（浏览过程不发送任何请求）；`Ctrl+S` 把当前组合写入 `config.toml` 的 `default` 与 `default_effort`，新会话由此启动（profile 的 `effort` 仍优先于它）。
 - **`Ctrl+D`** 只在空输入时退出——有文本时不做任何事。
+- **鼠标文字选中（fullscreen）。** 在 transcript 上按住拖拽即可选中——实色高亮、保留前景色；双击选中所在词，三击选中整行；松开鼠标立即把选中文本复制到剪贴板——优先原生工具（macOS `pbcopy`，Linux `wl-copy`/`xclip`/`xsel`），其次 `tmux load-buffer -w`，最后向终端写 OSC 52 序列。footer 闪现提示说明结果——`copied 128 chars`，非默认路径会注明（`(osc52)`）。选区保存在绝对行坐标上，滚轮滚动时高亮跟随文本；除滚动键外的任何按键（含 `Esc`）都会清除选区。inline 模式不上报鼠标，选中/复制由终端原生行为负责。
+- **可改绑快捷键。** 上表中的 8 个宿主动作（`Ctrl+T`、`Ctrl+O`、`PageUp`/`PageDown`、`Ctrl+End`、`Ctrl+P`/`Ctrl+N`、`Ctrl+D`）与每个插件注册的快捷键，都列在 `/settings` 的专属 **Shortcuts** 卡上（`/settings shortcuts` 直接聚焦），与选项卡分开；改绑采用按键捕获：`Enter` 进入捕获后按下组合即绑定（`Enter` 前继续按可添加备选），`Backspace` **彻底禁用**该快捷键（任何键都不触发），`Esc` 取消；保留键（中断守卫、输入框编辑键、补全）与其他绑定的组合在按下的瞬间就会被拒绝。底层是 `config.toml` 的 `[shortcuts]` 表——见 [configuration.md](configuration.md)。中断守卫、输入框按键与补全本身不可改绑。
 
 ## 相关文档
 

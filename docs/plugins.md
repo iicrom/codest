@@ -499,6 +499,50 @@ reference: one toggle, saved to `[plugins.tps] enabled`, applied in place so
 the meter turns on without a restart. Its `/tps` command stays a run-only
 shortcut for the same switch.
 
+### Shortcuts
+
+A plugin can register keyboard shortcuts alongside its settings: returning
+specs from `Plugin::shortcuts()` puts one row on the dedicated **Shortcuts**
+card in `/settings` — apart from the options cards, and labeled with this
+plugin's id (`Toggle tps meter (tps)`) so it stays distinguishable — per
+shortcut (rebindable like the host's own, unless registered with
+`Plugin::on_shortcut` with the spec's own id. The host scopes each id to
+`plugin:id` — the same convention as status segments — and validates the
+default combos at startup: a malformed combo, a reserved key (the interrupt
+guard, the composer's editing keys, completion), a duplicate id, or a combo
+another registration already claims fails the build.
+
+```rust
+use cst_plugin_api::shortcuts::ShortcutSpec;
+
+static SHORTCUTS: [ShortcutSpec; 1] = [ShortcutSpec::new(
+    "meter",
+    "Toggle tps meter",
+    "Flip the tokens-per-second status meter, like /tps.",
+    "ctrl+g",
+    false, // `true` locks the binding against rebinding
+)];
+
+fn shortcuts(&self) -> &'static [ShortcutSpec] {
+    &SHORTCUTS
+}
+
+fn on_shortcut(&self, id: &str, ctx: &mut PluginContext<'_>) -> Result<(), PluginError> {
+    if id == "meter" {
+        self.toggle(ctx); // effects via ctx, like any hook
+        return Ok(());
+    }
+    Err(PluginError::new(format!("unhandled shortcut `{id}`")))
+}
+```
+
+Dispatch happens in plain chat state only — the full-frame screens, menus,
+and dialogs own the keyboard first — and the handler returns effects through
+`PluginContext` exactly like every other hook. Users rebind the combo under
+`[shortcuts] "tps:meter"` in `config.toml`, or on the generated Shortcuts
+row, where pressing the new combo captures it directly (`Backspace` disables
+the shortcut outright — no key fires it).
+
 **A monitoring plugin, end to end:** subscribe to `EventSubscription::ALL`,
 treat `SNAPSHOT` events as the authoritative transcript, forward batched
 deltas best-effort from a spawned WebSocket server, and use

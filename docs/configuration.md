@@ -29,7 +29,7 @@ Only `config.toml`, `providers.toml`, and `profiles.toml` are meant to be hand-e
 
 ## `config.toml`
 
-The global file holds top-level keys plus two tables:
+The global file holds top-level keys plus three tables:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -39,6 +39,7 @@ The global file holds top-level keys plus two tables:
 | `max_tool_rounds` | integer | absent | Optional cap on model → tool → model rounds per user turn. |
 | `tool_output_token_limit` | integer | `4000` | Per-output tool result budget, in estimated tokens: an oversized result enters the conversation as head + a truncation notice + tail; the rollout file and the tool card keep the full output. `0` disables the cut. |
 | `[status_bar]` | table | segments on | The footer: `plugin_segments` master switch and `order` display priority for plugin segments, plus the `context` / `cache_rate` toggles for the host's context readout. |
+| `[shortcuts]` | table | — | Keyboard shortcut overrides; see the section below. |
 | `[plugins."<id>"]` | table | — | A plugin's private settings pocket; the host interprets no key. |
 
 ```toml
@@ -52,6 +53,12 @@ default_effort = "high"               # Ctrl+S in /model writes both keys
 [status_bar]
 plugin_segments = true                # plugin segments in the footer (default on)
 order = ["tps:rate", "tps:spark"]     # display priority, left to right
+
+[shortcuts]                           # rebind registered shortcuts (all optional)
+thinking = "ctrl+t, alt+t"            # alternatives are comma-separated
+tool_detail = "ctrl+o"
+page_up = ""                          # empty value = disable outright
+"tps:meter" = "ctrl+g"                # a plugin's shortcut is scoped plugin:id
 
 [plugins.tps]                         # the built-in tps meter's pocket
 enabled = true                        # start with the meter on (default off)
@@ -67,17 +74,24 @@ enabled = true                        # start with the meter on (default off)
 
 **`[status_bar]`** controls the footer's optional pieces. `plugin_segments` is the plugin side's master switch, and `order` lists full segment keys (`plugin:key`) in display priority; unlisted segments keep their registration order, and keys nothing currently displays are ignored, so a stale entry costs nothing. On a narrow terminal the lowest-priority segments drop first. The host's own context readout has two toggles of its own: `context` (the `used/window (n%)` segment; off leaves the model · effort · state skeleton) and `cache_rate` (the `cache 80%` part inside it, shown only while the backend reports cached prompt tokens). Both default to on and are editable live in `/settings`.
 
+**`[shortcuts]`** rebinds keyboard shortcuts. Each key names a registered shortcut — the host's own ids are bare (`thinking`, `tool_detail`, `page_up`, `page_down`, `jump_bottom`, `history_prev`, `history_next`, `quit`) and a plugin's are scoped `plugin:id` (`tps:meter`) — and the value is a comma-separated combo list (`"ctrl+t, alt+t"`); an **empty** value (`thinking = ""`) disables the shortcut outright — no key fires it — while an absent key runs the registered default. A character key must carry `ctrl` or `alt`, `Esc`, `Enter`, `Tab`, and the composer's editing keys are reserved and refused, and a combo another shortcut already binds is an error. A shortcut registered with a lock (`fixed`) cannot be rebound at all. Validation is strict, like the rest of this file: an unknown id, a malformed combo, or a collision fails startup with the offending key named. The same edits are available — and pre-validated — on the dedicated **Shortcuts** card in `/settings`, which carries one row per registered shortcut, host actions and plugin registrations alike (a plugin's row is labeled with its owner, `Toggle tps meter (tps)`); a plugin that registers a shortcut is rebinding-ready with no extra work. Rebinding is by capture, not typing: `Enter` on a row arms it, the next keypress becomes the combo, and further presses before `Enter` add alternatives; a rejected key (reserved, a bare character, already bound) never enters the capture, and `Esc` cancels. `Backspace` commits an **empty** binding, which **disables** the shortcut outright — no key fires it, and the row reads `(disabled)` — distinct from removing the `[shortcuts]` key by hand, which runs the registered default again. To return to the default binding, capture the default combo.
+
 **`[plugins."<id>"]`** is the per-plugin settings pocket — the whole table is handed to the plugin verbatim ([plugins.md](plugins.md), section 6); a plugin reads it through `PluginContext::plugin_settings()`. A table naming an unknown plugin id is a **startup error** (a silent no-op would hide a typo), so remove the table when you uninstall a plugin.
 
 ### `/settings`
 
-`/settings` is the screen that edits this file: one card for the host's own options (`[status_bar] plugin_segments`, `[status_bar] context`, `[status_bar] cache_rate`, and `double_press_interrupt` today) and one card per plugin that declared settings, each row showing the stored value or the default. `↑`/`↓` walk the rows, `Enter` flips a switch / advances a list / opens a one-line editor, `←`/`→` step a list (and a switch) backwards/forwards, `Esc` closes; `/settings tps` opens with that card focused.
+/settings is the screen that edits this file: one card for the host's own options (`[status_bar] plugin_segments`, `[status_bar] context`, `[status_bar] cache_rate`, `double_press_interrupt`, and every registered keyboard shortcut — host actions first) and one card per plugin that declared settings or registered shortcuts, each row showing the stored value or the default. `↑`/`↓` walk the rows, `Enter` flips a switch / advances a list / opens a one-line editor (a Shortcuts row captures the pressed combo instead), `←`/`→` step a list (and a switch) backwards/forwards, `Esc` closes; `/settings tps` opens with that card focused.
 
 ```text
- Settings › tps                                            1/2
- codest  ·  tps
+ Settings › tps                                            1/3
+ codest  ·  Shortcuts  ·  tps
 ╭─ codest ─ host settings ─────────────────────────────────╮
 │ ❯ Plugin segments                                  [x]   │
+╰──────────────────────────────────────────────────────────╯
+╭─ Shortcuts ─ keyboard shortcuts ─────────────────────────╮
+│   Thinking cards                              ctrl+t     │
+│   … (one row per registered shortcut)                     │
+│   Toggle tps meter (tps)                      ctrl+g     │
 ╰──────────────────────────────────────────────────────────╯
 ╭─ tps ─ throughput meter ─────────────────────────────────╮
 │   Tokens-per-second meter                          [x]   │
@@ -90,7 +104,7 @@ Every edit is written immediately — there is no unsaved-draft state — and a 
 * **Comments and hand formatting are lost on the first save.** The file becomes machine-managed from then on, exactly like a `/provider` wizard write.
 * **Clearing a text row removes the key**, restoring the plugin's default; toggling a switch writes `true`/`false` explicitly. Most edits apply to the running session immediately (the plugin is told through `Plugin::on_settings_changed`); a row declared startup-only carries a `⟲` marker (the help bar adds `restart to apply`) and persists without applying — the host skips the hook for it.
 
-`/tps` remains the keyboard shortcut for the same meter: it flips this run only and never rewrites the file. `/settings` is where the choice is recorded.
+`/tps` remains a keyboard path for the same meter, as is its registered `tps:meter` shortcut: both flip this run only and never rewrite the file. `/settings` is where the choice is recorded.
 
 ## Provider instances
 

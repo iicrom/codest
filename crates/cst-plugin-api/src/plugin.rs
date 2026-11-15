@@ -167,6 +167,29 @@ pub trait Plugin: Sync {
     ) {
     }
 
+    /// The shortcuts this plugin registers. Each spec becomes one row in
+    /// `/settings` (on the plugin's own card) and one entry in the host's
+    /// keymap, so a user can rebind it without the plugin knowing; a spec
+    /// with `fixed` set renders read-only instead. The host scopes each id
+    /// to `plugin:id` — the same convention as status segments — and
+    /// validates the default combos at startup, rejecting a plugin whose
+    /// spec collides with the host's keys or another plugin's binding.
+    fn shortcuts(&self) -> &'static [crate::shortcuts::ShortcutSpec] {
+        &[]
+    }
+
+    /// Handle one triggered shortcut this plugin declared via
+    /// [`Plugin::shortcuts`]. `id` is the spec's own id (unscoped). The host
+    /// dispatches only in plain chat state — the full-frame screens, menus,
+    /// and dialogs own the keyboard first — so a handler can assume the
+    /// transcript is visible. An `Err` becomes a visible error effect.
+    fn on_shortcut(&self, _id: &str, _ctx: &mut PluginContext<'_>) -> Result<(), PluginError> {
+        Err(PluginError::new(format!(
+            "plugin `{}` registered no shortcut handler",
+            self.id()
+        )))
+    }
+
     /// Which event categories this plugin wants on [`Plugin::on_event`].
     ///
     /// The default subscribes to nothing: the host filters before dispatching,

@@ -31,9 +31,12 @@
 //! starts it on. `/settings` edits that same key: the row writes
 //! `[plugins.tps] enabled` through the host, the file is the record, and
 //! [`Plugin::on_settings_changed`] flips the meter in place — no restart, and
-//! the choice survives the next run. `/tps` stays the keyboard shortcut for
-//! the same switch; it only changes this run (the file is not rewritten from
-//! a slash command).
+//! the choice survives the next run. `/tps` stays a keyboard path for the
+//! same switch (it only changes this run — the file is not rewritten from a
+//! slash command), and so does the registered `Ctrl+G` shortcut: this plugin
+//! is also the reference for [`Plugin::shortcuts`] registration. The row
+//! shows up on this card in `/settings` automatically and is rebindable
+//! there like the host's own keys.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -41,6 +44,7 @@ use std::time::Instant;
 
 use cst_plugin_api::settings::SettingField;
 use cst_plugin_api::settings::SettingsSection;
+use cst_plugin_api::shortcuts::ShortcutSpec;
 
 use crate::plugins::ArgsPolicy;
 use crate::plugins::CommandSpec;
@@ -99,6 +103,20 @@ static SETTINGS_FIELDS: [SettingField; 1] = [SettingField::toggle(
 
 static SETTINGS_SECTION: SettingsSection =
     SettingsSection::new("tps", "throughput meter", &SETTINGS_FIELDS);
+
+/// The keyboard shortcut this plugin registers: the host scopes it to
+/// `tps:meter`, `/settings` renders one rebindable row for it on this card,
+/// and a keypress that matches dispatches to
+/// [`Plugin::on_shortcut`] with the bare id. `Ctrl+G` is deliberately far
+/// from the composer's `Ctrl+A/E/U/K/W` editing keys, which the host
+/// reserves.
+static SHORTCUTS: [ShortcutSpec; 1] = [ShortcutSpec::new(
+    "meter",
+    "Toggle tps meter",
+    "Flip the tokens-per-second status meter, like /tps.",
+    "ctrl+g",
+    false,
+)];
 
 /// One turn's metering: decode time from closed steps, the streamed-text
 /// estimate, and the backend's real output once it arrives.
@@ -251,6 +269,21 @@ impl Plugin for Tps {
         Some(SETTINGS_SECTION)
     }
 
+    fn shortcuts(&self) -> &'static [ShortcutSpec] {
+        &SHORTCUTS
+    }
+
+    fn on_shortcut(&self, id: &str, ctx: &mut PluginContext<'_>) -> Result<(), PluginError> {
+        if id == SHORTCUTS[0].id {
+            self.toggle_meter(ctx);
+            return Ok(());
+        }
+        Err(PluginError::new(format!(
+            "plugin `{}` does not handle shortcut `{id}`",
+            self.id()
+        )))
+    }
+
     fn on_settings_changed(
         &self,
         settings: Option<&crate::plugins::PluginSettings>,
@@ -384,6 +417,15 @@ impl Plugin for Tps {
         _invocation: &Invocation,
         ctx: &mut PluginContext<'_>,
     ) -> Result<(), PluginError> {
+        self.toggle_meter(ctx);
+        Ok(())
+    }
+}
+
+impl Tps {
+    /// The toggle `/tps` and the registered shortcut share: this run only —
+    /// the persisted switch goes through [`Plugin::on_settings_changed`].
+    fn toggle_meter(&self, ctx: &mut PluginContext<'_>) {
         let mut state = self.state.lock().expect("tps state");
         state.enabled = !state.enabled;
         if state.enabled {
@@ -397,7 +439,6 @@ impl Plugin for Tps {
             ctx.clear_status("rate");
             ctx.clear_status("spark");
         }
-        Ok(())
     }
 }
 

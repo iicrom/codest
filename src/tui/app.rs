@@ -30,6 +30,7 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use crossterm::execute;
@@ -74,6 +75,7 @@ use crate::core::NO_MODEL_SELECTED;
 use crate::core::Selection;
 use crate::core::SessionBootstrap;
 use crate::core::ToolSpec;
+use cst_plugin_api::settings::SettingField;
 use crate::core::config::StatusBarConfig;
 use crate::core::context_percent;
 use crate::core::format_cache_rate;
@@ -117,15 +119,27 @@ const MAX_COMMAND_MENU_ROWS: usize = 6;
 const MAX_PENDING_ROWS: usize = 2;
 const WHEEL_LINES: usize = 3;
 const ALT_WHEEL_LINES: usize = 15;
-/// The idle footer's key hints, most useful first. A narrow terminal drops
-/// whole items from the tail — a hint clipped to `Ctrl+J newlin` reads as
-/// damage, a shorter list of complete hints reads as intent. `Ctrl+T` and
-/// `Ctrl+O` are not listed: the cards themselves name their expand key.
+/// How quickly a second click on the same cell upgrades the gesture: two
+/// clicks select the word under them, three the whole line.
+const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
+/// How far (in display columns) a second click may land from the first and
+/// still count as a repeat.
+const MULTI_CLICK_DISTANCE: usize = 1;
+/// The idle footer's hint template, most useful first. A narrow terminal
+/// drops whole items from the tail — a hint clipped to `Ctrl+J newlin` reads
+/// as damage, a shorter list of complete hints reads as intent. `Ctrl+T` and
+/// `Ctrl+O` are not listed: the cards themselves name their expand key. The
+/// jump-to-latest combo is spliced in from the keymap, so a rebind through
+/// `/settings` updates the hint on the next frame.
 const IDLE_HINTS_FULLSCREEN: &str =
-    "Enter send · / commands · Ctrl+J newline · Ctrl+End latest · wheel scroll";
+    "Enter send · / commands · Ctrl+J newline · {jump} latest · wheel scroll";
 /// Inline mode owns no viewport, so it lists the terminal's paging instead of
 /// the app's jump-to-newest.
 const IDLE_HINTS_INLINE: &str = "Enter send · / commands · Ctrl+J newline · PgUp/PgDn scrollback";
+/// The dedicated `/settings` card that carries every registered shortcut.
+/// `/settings shortcuts` focuses it by this title, case-insensitively.
+const SHORTCUTS_CARD_TITLE: &str = "Shortcuts";
+const SHORTCUTS_CARD_DESCRIPTION: &str = "keyboard shortcuts (host actions and plugin registrations)";
 /// How long an ephemeral footer message (Ctrl+T's "thinking expanded",
 /// Ctrl+O's "tool output expanded") stays visible. Long enough to read at a
 /// glance, gone before it can accumulate.
@@ -167,7 +181,9 @@ pub struct ProfileStartup {
 /// transcript notices. `max_tool_rounds` is `config.toml`'s optional cap on a
 /// turn's tool rounds; `None` leaves the loop unbounded. `status_bar` is the
 /// footer's `[status_bar]` table; `plugin_settings` the per-plugin
-/// `[plugins."<id>"]` pockets, already validated to name existing plugins.
+/// `[plugins."<id>"]` pockets, already validated to name existing plugins;
+/// `shortcuts` the `[shortcuts]` override table, validated against the
+/// shortcut registry before the first frame.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     plugins: Arc<PluginHost>,
@@ -183,6 +199,7 @@ pub async fn run(
     tool_output_token_limit: usize,
     status_bar: StatusBarConfig,
     plugin_settings: Vec<(String, PluginSettings)>,
+    shortcuts: std::collections::BTreeMap<String, String>,
 ) -> Result<()> {
     // A settings pocket naming an unknown plugin id would silently configure
     // nothing — the same discipline as a typo anywhere else in these files.
@@ -307,6 +324,13 @@ pub async fn run(
         .map(Selection::as_str)
         .unwrap_or_else(|| "no model".to_string());
     let (views, active_view) = build_views(&model_label, mode, &loaded, fresh);
+    // The shortcut registry was validated at host build time; the
+    // `[shortcuts]` overrides are checked here, so a hand-edited bad value
+    // fails at startup with the offending id named rather than leaving the
+    // user pressing a key that does nothing.
+    let shortcut_registry = plugins.shortcut_registry().to_vec();
+    let keymap = crate::core::keymap::Keymap::build(&shortcut_registry, &shortcuts)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let mut app = App::new(
         session,
         pool,
@@ -326,6 +350,8 @@ pub async fn run(
         initial_effort,
         status_bar,
         plugin_settings,
+        shortcut_registry,
+        keymap,
     );
     app.double_press_interrupt = double_press_interrupt;
     // The tool set is per session, and the worker restores the adopted
@@ -727,6 +753,116 @@ struct App {
     inline_height: u16,
     inline_rows: u16,
     inline_columns: u16,
+    /// Mouse text selection over the transcript (fullscreen mode). Lives in
+    /// absolute transcript rows, so it survives scrolling pinned to its text;
+    /// any key press except the scroll keys clears it.
+    selection: Option<crate::tui::selection::SelectionState>,
+    /// The last left-button press, for multi-click detection (word, line).
+    mouse_press: Option<MousePress>,
+    /// Where the transcript stood when it was last rendered: the viewport
+    /// rectangle, the absolute scroll top, and the content height. Mouse
+    /// events are terminal-absolute, so turning a click into a transcript
+    /// row needs exactly this.
+    chat_geometry: Option<ChatGeometry>,
+    /// The transcript layout of the last rendered frame, kept so hit-testing
+    /// and text extraction read the same rows the user saw.
+    last_layout: Option<TranscriptLayout>,
+    /// The shortcut registry: the host's own actions plus every plugin's
+    /// declarations, validated once at host build time.
+    shortcut_registry: Vec<crate::core::keymap::ShortcutEntry>,
+    /// The runtime keymap: registry + the `[shortcuts]` overrides. Rebuilt
+    /// whenever `/settings` saves, so the very next keypress matches.
+    keymap: crate::core::keymap::Keymap,
+    /// The `/settings` rows the registry generated, paired with the owner
+    /// plugin id (`None` = the host card). Built once here; `open_settings`
+    /// reuses them on every open.
+    shortcut_fields: Vec<(Option<&'static str>, SettingField)>,
+    /// The idle footer's hints, with the current jump-to-latest combo
+    /// spliced in. Rebuilt with the keymap.
+    idle_hints: String,
+    /// Where `on_mouse_up` sends selected text: the clipboard chain in
+    /// production. A plain fn pointer so tests can substitute a stub and
+    /// keep their hands off the real system clipboard.
+    copy_text: fn(&str) -> crate::tui::clipboard::CopyPath,
+}
+
+/// A left-button press, for upgrading a click into a double- or
+/// triple-click.
+struct MousePress {
+    at: Instant,
+    row: usize,
+    col: usize,
+    count: u8,
+}
+
+/// Where the transcript viewport stood at the last render.
+struct ChatGeometry {
+    area: Rect,
+    /// The absolute transcript row shown at the viewport's top.
+    scroll: usize,
+    /// The absolute row just past the last rendered row.
+    total: usize,
+}
+
+/// The transcript's row layout at one render width: where each history cell
+/// starts and how many rows it takes, plus the still-mutating live tail.
+/// `render_chat` lays rows out with it; mouse hit-testing and text
+/// extraction read the same numbers, so the rows a user selects are the rows
+/// they saw.
+struct TranscriptLayout {
+    starts: Vec<usize>,
+    counts: Vec<usize>,
+    /// The absolute row past the last history cell (and its separator).
+    history_end: usize,
+    /// The live tail's rows, in display order (running tool, thinking,
+    /// assistant text). Each is `None` when that part is absent.
+    parts: [Option<Vec<Line<'static>>>; 3],
+    /// The absolute row past everything.
+    total: usize,
+    width: usize,
+    /// Where the last report cell starts, for the park-on-report scroll.
+    last_report_start: Option<usize>,
+}
+
+impl TranscriptLayout {
+    /// The rendered line at an absolute row, or `None` for the blank
+    /// separator rows (and anything past the end).
+    fn row_line(&self, view: &mut SessionView, display: chat::CardDisplay, row: usize) -> Option<Line<'static>> {
+        if row == 0 || row >= self.total {
+            // Row 0 is the leading blank line.
+            return None;
+        }
+        // A history cell's rows, or the blank separator after it.
+        for index in 0..self.starts.len() {
+            let start = self.starts[index];
+            let count = self.counts[index];
+            if row < start + count {
+                if row < start {
+                    return None;
+                }
+                return view
+                    .cell_lines(index, self.width, &display)
+                    .get(row - start)
+                    .cloned();
+            }
+            // The separator sits at the cell's end whenever a cell or live
+            // text follows — the same condition render_chat uses.
+            let separator = index + 1 < self.starts.len() || self.parts[2].is_some();
+            if row == start + count && separator {
+                return None;
+            }
+        }
+        // The live tail, in part order.
+        let mut part_start = self.history_end;
+        for part in &self.parts {
+            let Some(lines) = part else { continue };
+            if row < part_start + lines.len() {
+                return lines.get(row - part_start).cloned();
+            }
+            part_start += lines.len();
+        }
+        None
+    }
 }
 
 /// State of the open `/model` picker.
@@ -834,6 +970,16 @@ fn status_tone_style(tone: StatusTone) -> Style {
     }
 }
 
+/// The idle footer's hints, with the current jump-to-latest combo spliced
+/// in — a rebind through `/settings` updates the hint with the keymap.
+fn idle_hints(keymap: &crate::core::keymap::Keymap, mode: TuiMode) -> String {
+    match mode {
+        TuiMode::Fullscreen => IDLE_HINTS_FULLSCREEN
+            .replace("{jump}", &keymap.primary_display("jump_bottom")),
+        TuiMode::Inline => IDLE_HINTS_INLINE.to_string(),
+    }
+}
+
 impl App {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -855,6 +1001,8 @@ impl App {
         initial_effort: Option<Option<String>>,
         status_bar: StatusBarConfig,
         plugin_settings: Vec<(String, PluginSettings)>,
+        shortcut_registry: Vec<crate::core::keymap::ShortcutEntry>,
+        keymap: crate::core::keymap::Keymap,
     ) -> Self {
         let (inline_columns, inline_rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let inline_height = inline_pane_height(inline_rows, 1, 0, 0);
@@ -887,6 +1035,16 @@ impl App {
         let enabled_tools: std::collections::BTreeSet<String> =
             tools.iter().map(|spec| spec.name.to_string()).collect();
         let enabled_tools_vec: Vec<String> = enabled_tools.iter().cloned().collect();
+        // The shortcut rows `/settings` shows, built once from the registry
+        // (`core::keymap::setting_field` leaks their static strings once per
+        // run) so repeated `/settings` opens never rebuild them.
+        let shortcut_fields_store = {
+            let fields: Vec<(Option<&'static str>, SettingField)> = shortcut_registry
+                .iter()
+                .map(|entry| (entry.owner, crate::core::keymap::setting_field(entry)))
+                .collect();
+            (shortcut_registry, fields)
+        };
         let mut app = Self {
             session,
             plugins,
@@ -954,7 +1112,17 @@ impl App {
             inline_height,
             inline_rows,
             inline_columns,
+            selection: None,
+            mouse_press: None,
+            chat_geometry: None,
+            last_layout: None,
+            shortcut_registry: shortcut_fields_store.0,
+            shortcut_fields: shortcut_fields_store.1,
+            idle_hints: String::new(),
+            keymap,
+            copy_text: crate::tui::clipboard::copy,
         };
+        app.idle_hints = idle_hints(&app.keymap, mode);
         app.refresh_request_facts();
         app
     }
@@ -1465,7 +1633,7 @@ impl App {
         let delta = match mouse.kind {
             MouseEventKind::ScrollUp => -1,
             MouseEventKind::ScrollDown => 1,
-            _ => return,
+            _ => return self.handle_mouse_gesture(mouse),
         };
         // A full-frame screen replaces the transcript, so a wheel notch
         // scrolls that screen's own list. The selection does not move: the
@@ -1491,11 +1659,216 @@ impl App {
         }
     }
 
+    /// The non-wheel mouse events: left-button press/drag/release over the
+    /// transcript viewport drive text selection ([`Self::selection`]). The
+    /// full-frame screens cover the transcript, so gestures on them are
+    /// dropped rather than hit-tested against a stale geometry.
+    fn handle_mouse_gesture(&mut self, mouse: MouseEvent) {
+        // The full-frame screens and the floating report window cover the
+        // transcript: gestures are dropped rather than hit-tested against a
+        // transcript the user cannot see.
+        if self.settings_view.is_some()
+            || self.context_view.is_some()
+            || self.report_popup.is_some()
+        {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.on_mouse_down(mouse),
+            MouseEventKind::Drag(MouseButton::Left) => self.on_mouse_drag(mouse),
+            MouseEventKind::Up(MouseButton::Left) => self.on_mouse_up(),
+            // Right/middle buttons, hover motion, and drags of other
+            // buttons: nothing selection-related.
+            _ => {}
+        }
+    }
+
+    /// The transcript row a terminal point addresses, if the point is over
+    /// the viewport and the content that was rendered.
+    fn transcript_row(&self, mouse: &MouseEvent) -> Option<(usize, usize)> {
+        let geometry = self.chat_geometry.as_ref()?;
+        let row = usize::from(mouse.row).checked_sub(usize::from(geometry.area.y))?;
+        let col = usize::from(mouse.column).checked_sub(usize::from(geometry.area.x))?;
+        if mouse.row >= geometry.area.y + geometry.area.height {
+            return None;
+        }
+        let abs_row = geometry.scroll + row;
+        (abs_row < geometry.total).then_some((abs_row, col))
+    }
+
+    /// A left press: anchor a character selection, or upgrade to a word or
+    /// line selection on a quick repeat over the same cell.
+    fn on_mouse_down(&mut self, mouse: MouseEvent) {
+        let Some((abs_row, col)) = self.transcript_row(&mouse) else {
+            // A click outside the transcript (composer, footer, menu strip)
+            // clears a stale selection instead of starting one.
+            if self.selection.take().is_some() {
+                self.needs_redraw = true;
+            }
+            return;
+        };
+        let now = Instant::now();
+        let count = match self.mouse_press.as_ref() {
+            Some(press)
+                if press.count < 3
+                    && now.duration_since(press.at) < MULTI_CLICK_WINDOW
+                    && press.row == abs_row
+                    && press.col.abs_diff(col) <= MULTI_CLICK_DISTANCE =>
+            {
+                press.count + 1
+            }
+            _ => 1,
+        };
+        self.mouse_press = Some(MousePress {
+            at: now,
+            row: abs_row,
+            col,
+            count,
+        });
+        let point = crate::tui::selection::Point { col, row: abs_row };
+        self.selection = Some(match count {
+            2 => {
+                let text = self.row_text(abs_row).unwrap_or_default();
+                crate::tui::selection::SelectionState::word_selection(point, &text)
+            }
+            3 => crate::tui::selection::SelectionState::line_selection(point),
+            _ => crate::tui::selection::SelectionState::new(
+                point,
+                crate::tui::selection::SelectionKind::Chars,
+            ),
+        });
+        self.needs_redraw = true;
+    }
+
+    /// A left drag: move the selection's focus. A gesture that started
+    /// outside the transcript (the press was swallowed) starts here instead,
+    /// like a terminal that only sees the drag.
+    fn on_mouse_drag(&mut self, mouse: MouseEvent) {
+        let Some((abs_row, col)) = self.transcript_row(&mouse) else {
+            return;
+        };
+        if self.selection.is_none() {
+            self.selection = Some(crate::tui::selection::SelectionState::new(
+                crate::tui::selection::Point { col, row: abs_row },
+                crate::tui::selection::SelectionKind::Chars,
+            ));
+        }
+        // The word-snap text is fetched before the selection is borrowed
+        // mutably (the layout walk needs the view too).
+        let row_text = match self.selection.map(|s| s.kind) {
+            Some(crate::tui::selection::SelectionKind::Word) => {
+                self.row_text(abs_row).unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        let Some(selection) = self.selection.as_mut() else {
+            return;
+        };
+        selection.update(
+            crate::tui::selection::Point { col, row: abs_row },
+            &row_text,
+        );
+        self.needs_redraw = true;
+    }
+
+    /// A left release: a bare click (nothing highlighted) clears; a real
+    /// selection copies itself, like the reference TUI's copy-on-select, and
+    /// reports the route the text took in a footer flash. The press record
+    /// stays: the next press reads it to detect a double or triple click.
+    fn on_mouse_up(&mut self) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        if selection.is_empty() {
+            self.selection = None;
+            self.needs_redraw = true;
+            return;
+        }
+        let text = self.selected_text();
+        if text.is_empty() {
+            // The drag covered only columns past the text: nothing to copy.
+            self.selection = None;
+            self.needs_redraw = true;
+            return;
+        }
+        let copied = text.chars().count();
+        let path = (self.copy_text)(&text);
+        self.flash(format!("copied {copied} chars{}", path.suffix()));
+        self.needs_redraw = true;
+    }
+
+    /// The plain text of one absolute transcript row, as rendered at the
+    /// last frame's width.
+    fn row_text(&mut self, row: usize) -> Option<String> {
+        let layout = self.last_layout.take()?;
+        let display = chat::CardDisplay {
+            thinking: self.show_thinking,
+            tool_detail: self.show_tool_detail,
+        };
+        let line = layout.row_line(self.view_mut(), display, row);
+        self.last_layout = Some(layout);
+        let line = line?;
+        Some(crate::tui::selection::slice_line(&line, 0, usize::MAX))
+    }
+
+    /// The selected text: walk the same layout the last render used, slice
+    /// each covered row, and join one output line per screen row. (Wrapped
+    /// rows stay separate lines — the wrap happens per cell line, and the
+    /// layout does not carry logical-line boundaries.)
+    fn selected_text(&mut self) -> String {
+        let Some(selection) = self.selection else {
+            return String::new();
+        };
+        let Some((start, end)) = selection.range() else {
+            return String::new();
+        };
+        let display = chat::CardDisplay {
+            thinking: self.show_thinking,
+            tool_detail: self.show_tool_detail,
+        };
+        // Taken out and put back: the walk fills the view's render cache for
+        // the rows it touches.
+        let Some(layout) = self.last_layout.take() else {
+            return String::new();
+        };
+        let view = self.view_mut();
+        let last = end.row.min(layout.total.saturating_sub(1));
+        let mut rows = Vec::new();
+        for row in start.row..=last {
+            let (from, to) = if start.row == end.row {
+                (start.col, end.col)
+            } else if row == start.row {
+                (start.col, usize::MAX)
+            } else if row == end.row {
+                (0, end.col)
+            } else {
+                (0, usize::MAX)
+            };
+            let text = match layout.row_line(view, display, row) {
+                Some(line) => crate::tui::selection::slice_line(&line, from, to),
+                None => String::new(),
+            };
+            rows.push(text);
+        }
+        self.last_layout = Some(layout);
+        rows.join("\n")
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         let before = self.composer.text();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        // Any key press clears the mouse selection, except the pure scroll
+        // keys: the selection lives in absolute transcript rows, so paging
+        // keeps it pinned to its text instead of discarding it. Esc clears
+        // here too, before its own work below.
+        let scroll_key =
+            matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) || key.code == KeyCode::End && ctrl;
+        if !scroll_key && self.selection.take().is_some() {
+            self.needs_redraw = true;
+        }
 
         // A pending question is an active tool call, so the dialog owns the
         // whole keyboard until it is answered or declined — stricter than
@@ -1691,48 +2064,35 @@ impl App {
             }
         }
 
+        // Plugin shortcuts fire here, in plain chat state: the screens and
+        // menus above own the keyboard first, and typing falls through
+        // below. Registry validation proved the bindings disjoint, so a
+        // plugin combo can never collide with a host action's.
+        let combo = crate::tui::keymap::combo_from_event(&key);
+        if let Some(full_id) = combo
+            .as_ref()
+            .and_then(|combo| self.keymap.match_plugin(combo))
+        {
+            let output = self.plugins.shortcut_triggered(&full_id, self.plugin_info());
+            self.apply_output(output);
+            return;
+        }
+        // The host's own rebindable actions next; a match consumes the key,
+        // everything else falls through to the structural match below.
+        if let Some(combo) = combo.as_ref()
+            && self.handle_host_shortcuts(combo)
+        {
+            return;
+        }
+
         match key.code {
             KeyCode::Char('c') if ctrl => self.on_ctrl_c(),
-            // Thinking and tool cards fold independently. Ctrl+T is the
-            // thinking switch (`/thinking` does the same, from the command
-            // line); Ctrl+O stays the tool-output switch. Keeping them apart
-            // means a reader can follow the reasoning without dumping a wall
-            // of command output over it, or vice versa.
-            //
-            // Both report in the footer rather than the transcript: they are
-            // view switches, and a stream notice for one would outlive the
-            // keystroke in scrollback and in the restored session.
-            KeyCode::Char('t') if ctrl => {
-                self.show_thinking = !self.show_thinking;
-                let notice = if self.show_thinking {
-                    "thinking expanded"
-                } else {
-                    "thinking folded"
-                };
-                self.flash(notice);
-            }
-            KeyCode::Char('o') if ctrl => {
-                self.show_tool_detail = !self.show_tool_detail;
-                let notice = if self.show_tool_detail {
-                    "tool output expanded"
-                } else {
-                    "tool output folded"
-                };
-                self.flash(notice);
-            }
-            KeyCode::Char('d') if ctrl => {
-                if self.composer.is_empty() {
-                    self.quit = true;
-                }
-            }
             KeyCode::Char('j') if ctrl => self.composer.insert_char('\n'),
             KeyCode::Char('a') if ctrl => self.composer.home(),
             KeyCode::Char('e') if ctrl => self.composer.end(),
             KeyCode::Char('u') if ctrl => self.composer.kill_to_start(),
             KeyCode::Char('k') if ctrl => self.composer.kill_to_end(),
             KeyCode::Char('w') if ctrl => self.composer.delete_word_backward(),
-            KeyCode::Char('p') if ctrl => self.history_prev(),
-            KeyCode::Char('n') if ctrl => self.history_next(),
             KeyCode::Char(c) if !ctrl && !alt => self.composer.insert_char(c),
             KeyCode::Enter if ctrl || shift => self.composer.insert_char('\n'),
             // Alt+Enter delivers now: submit when idle, steer into the
@@ -1754,19 +2114,8 @@ impl App {
             KeyCode::Up => self.on_up(),
             KeyCode::Down => self.on_down(),
             KeyCode::Home => self.composer.home(),
-            // Jump back to the newest line and re-arm follow mode, so the
-            // transcript sticks to the bottom again: after browsing up
-            // through a long session, wheel notches are a poor way home.
-            // Inline mode has no viewport to jump — the terminal owns the
-            // transcript above the pane — so the key stays a cursor move.
-            KeyCode::End if ctrl && self.mode == TuiMode::Fullscreen => self.scroll_to_bottom(),
             KeyCode::End => self.composer.end(),
             KeyCode::Esc => self.on_escape(),
-            // Inline mode leaves paging to the terminal's native scrollback,
-            // and has no viewport to jump: the newest line is already at the
-            // bottom, because the terminal owns the transcript above it.
-            KeyCode::PageUp if self.mode == TuiMode::Fullscreen => self.scroll_up(5),
-            KeyCode::PageDown if self.mode == TuiMode::Fullscreen => self.scroll_down(5),
             _ => {}
         }
 
@@ -1776,6 +2125,74 @@ impl App {
             self.command_selection = 0;
             self.command_menu_dismissed = false;
         }
+    }
+
+    /// Resolve one keypress against the host's own rebindable actions
+    /// (`true` = the key was consumed). Each action keeps the conditions it
+    /// always had — the paging keys do nothing in inline mode, quit fires
+    /// only on an empty composer — and the flash feedback the old hardcoded
+    /// arms showed; only the key lookups go through the keymap now, so a
+    /// rebind in `/settings` takes effect here.
+    fn handle_host_shortcuts(&mut self, combo: &cst_plugin_api::shortcuts::KeyCombo) -> bool {
+        // Thinking and tool cards fold independently (`/thinking` does the
+        // same from the command line). Both report in the footer rather than
+        // the transcript: they are view switches, and a stream notice for one
+        // would outlive the keystroke in scrollback and in the restored
+        // session.
+        if self.keymap.matches("thinking", combo) {
+            self.show_thinking = !self.show_thinking;
+            let notice = if self.show_thinking {
+                "thinking expanded"
+            } else {
+                "thinking folded"
+            };
+            self.flash(notice);
+            return true;
+        }
+        if self.keymap.matches("tool_detail", combo) {
+            self.show_tool_detail = !self.show_tool_detail;
+            let notice = if self.show_tool_detail {
+                "tool output expanded"
+            } else {
+                "tool output folded"
+            };
+            self.flash(notice);
+            return true;
+        }
+        if self.keymap.matches("quit", combo) {
+            if self.composer.is_empty() {
+                self.quit = true;
+            }
+            return true;
+        }
+        if self.keymap.matches("history_prev", combo) {
+            self.history_prev();
+            return true;
+        }
+        if self.keymap.matches("history_next", combo) {
+            self.history_next();
+            return true;
+        }
+        // Inline mode leaves paging to the terminal's native scrollback and
+        // has no viewport to jump — the newest line is already at the
+        // bottom — so the scroll keys are not consumed there and fall
+        // through: `End` keeps its composer-cursor meaning.
+        if self.keymap.matches("page_up", combo) && self.mode == TuiMode::Fullscreen {
+            self.scroll_up(5);
+            return true;
+        }
+        if self.keymap.matches("page_down", combo) && self.mode == TuiMode::Fullscreen {
+            self.scroll_down(5);
+            return true;
+        }
+        // Jump back to the newest line and re-arm follow mode, so the
+        // transcript sticks to the bottom again: after browsing up through a
+        // long session, wheel notches are a poor way home.
+        if self.keymap.matches("jump_bottom", combo) && self.mode == TuiMode::Fullscreen {
+            self.scroll_to_bottom();
+            return true;
+        }
+        false
     }
 
     fn on_tick(&mut self) {
@@ -3196,8 +3613,20 @@ impl App {
             id: None,
             description: HOST_SETTINGS.description,
             owner: crate::core::settings::SettingOwner::Host,
-            fields: HOST_SETTINGS.fields,
+            fields: HOST_SETTINGS.fields.to_vec(),
         }];
+        // The shortcuts keep their own card, apart from the options: one row
+        // per registered shortcut, host actions and plugin registrations
+        // alike. The owner is still the host — the keys are dotted root
+        // paths into `[shortcuts]` — and `/settings shortcuts` focuses the
+        // card by its title.
+        sections.push(crate::tui::settings_view::Section {
+            title: SHORTCUTS_CARD_TITLE.to_string(),
+            id: None,
+            description: SHORTCUTS_CARD_DESCRIPTION,
+            owner: crate::core::settings::SettingOwner::Host,
+            fields: self.shortcut_settings_fields(),
+        });
         for (id, section) in self.plugins.settings_sections() {
             sections.push(crate::tui::settings_view::Section {
                 // The plugin names its own card; the id is kept alongside so
@@ -3206,10 +3635,14 @@ impl App {
                 id: Some(id),
                 description: section.description,
                 owner: crate::core::settings::SettingOwner::Plugin(id),
-                fields: section.fields,
+                fields: section.fields.to_vec(),
             });
         }
-        let mut view = crate::tui::settings_view::SettingsView::new(file, sections);
+        let mut view = crate::tui::settings_view::SettingsView::new(
+            file,
+            sections,
+            self.shortcut_registry.clone(),
+        );
         let name = args.trim();
         if !name.is_empty() && !view.focus_section(name) {
             let titles = view.section_titles().join(", ");
@@ -3217,6 +3650,16 @@ impl App {
         }
         self.command_menu_dismissed = true;
         self.settings_view = Some(view);
+    }
+
+    /// The Shortcuts card's rows: one per registered shortcut, in registry
+    /// order (host actions first, then each plugin's). Kept apart from the
+    /// options cards so rebinding never mixes with ordinary settings.
+    fn shortcut_settings_fields(&self) -> Vec<SettingField> {
+        self.shortcut_fields
+            .iter()
+            .map(|(_, field)| *field)
+            .collect()
     }
 
     /// Carry out one `/settings` screen event. A save is already on disk; the
@@ -3230,7 +3673,11 @@ impl App {
         use crate::tui::settings_view::SettingsEvent;
         match event {
             SettingsEvent::Close => self.settings_view = None,
-            SettingsEvent::Saved { section, restart } => {
+            SettingsEvent::Saved {
+                section,
+                restart,
+                key,
+            } => {
                 let Some(view) = self.settings_view.as_ref() else {
                     return;
                 };
@@ -3243,6 +3690,13 @@ impl App {
                     return;
                 }
                 self.apply_global_config(&global);
+                // A shortcut row always lands in the host `[shortcuts]`
+                // table — even on a plugin's card — so the keymap has
+                // already adopted it above and the plugin's settings hook
+                // (which reads its own pocket) has nothing to see.
+                if key.starts_with("shortcuts.") {
+                    return;
+                }
                 let SettingOwner::Plugin(id) = owner.unwrap_or(SettingOwner::Host) else {
                     return;
                 };
@@ -3256,8 +3710,9 @@ impl App {
     }
 
     /// Adopt a freshly written `config.toml`: the footer table, the
-    /// interrupt-confirm toggle, and the per-plugin pockets that every hook
-    /// receives.
+    /// interrupt-confirm toggle, the per-plugin pockets that every hook
+    /// receives, and the rebuilt keymap — the very next keypress matches the
+    /// new `[shortcuts]` bindings.
     fn apply_global_config(&mut self, global: &crate::core::config::GlobalConfig) {
         self.status_bar = global.status_bar.clone();
         self.double_press_interrupt = global.double_press_interrupt;
@@ -3266,6 +3721,16 @@ impl App {
             .iter()
             .map(|(id, settings)| (id.clone(), settings.clone()))
             .collect();
+        match crate::core::keymap::Keymap::build(&self.shortcut_registry, &global.shortcuts) {
+            Ok(keymap) => {
+                self.keymap = keymap;
+                self.idle_hints = idle_hints(&self.keymap, self.mode);
+            }
+            // The settings screen validates shortcut drafts before writing,
+            // so refusing here means a hand edit raced the save. The current
+            // bindings stay in force and the flash names the problem.
+            Err(error) => self.flash(format!("shortcuts not applied: {error}")),
+        }
     }
 
     /// Carry out one viewer action: every mutation is an op away — the
@@ -4271,12 +4736,11 @@ impl App {
         frame.render_widget(Paragraph::new(Text::from(lines.to_vec())), area);
     }
 
-    fn render_chat(&mut self, frame: &mut Frame, area: Rect, width: usize) {
-        if area.height == 0 {
-            self.view_mut().max_scroll = 0;
-            return;
-        }
-
+    /// Lay the transcript out at one width: per-cell starts/counts, the live
+    /// tail's rows, the totals. `render_chat` renders from this; mouse
+    /// hit-testing and text extraction read the same numbers afterwards, so
+    /// a selection always covers the rows the user saw.
+    fn build_layout(&mut self, width: usize) -> TranscriptLayout {
         let display = chat::CardDisplay {
             thinking: self.show_thinking,
             tool_detail: self.show_tool_detail,
@@ -4297,8 +4761,7 @@ impl App {
         for index in 0..view.history.len() {
             if matches!(view.history[index], HistoryCell::Report(_)) {
                 // Where the last report cell starts, for the park-on-report
-                // scroll below (the row count is only known here, at this
-                // width).
+                // scroll (the row count is only known here, at this width).
                 last_report_start = Some(abs);
             }
             starts.push(abs);
@@ -4350,38 +4813,63 @@ impl App {
             + running_part.as_ref().map_or(0, Vec::len)
             + thinking_part.as_ref().map_or(0, Vec::len)
             + live_part.as_ref().map_or(0, Vec::len);
+        TranscriptLayout {
+            starts,
+            counts,
+            history_end,
+            parts: [running_part, thinking_part, live_part],
+            total,
+            width,
+            last_report_start,
+        }
+    }
 
+    fn render_chat(&mut self, frame: &mut Frame, area: Rect, width: usize) {
+        if area.height == 0 {
+            self.view_mut().max_scroll = 0;
+            return;
+        }
+
+        let layout = self.build_layout(width);
         let height = area.height as usize;
-        view.max_scroll = total.saturating_sub(height);
+        {
+            let view = self.view_mut();
+            view.max_scroll = layout.total.saturating_sub(height);
 
-        if view.park_on_last_report {
-            // A report was just appended: show its first line. Doing it here
-            // (not in the effect handler) is what makes the row count and the
-            // viewport height available.
-            view.park_on_last_report = false;
-            if let Some(start) = last_report_start {
-                view.follow = false;
-                view.scroll = start.min(view.max_scroll);
+            if view.park_on_last_report {
+                // A report was just appended: show its first line. Doing it
+                // here (not in the effect handler) is what makes the row
+                // count and the viewport height available.
+                view.park_on_last_report = false;
+                if let Some(start) = layout.last_report_start {
+                    view.follow = false;
+                    view.scroll = start.min(view.max_scroll);
+                }
+            } else if view.follow {
+                view.scroll = view.max_scroll;
+            } else {
+                view.scroll = view.scroll.min(view.max_scroll);
             }
-        } else if view.follow {
-            view.scroll = view.max_scroll;
-        } else {
-            view.scroll = view.scroll.min(view.max_scroll);
         }
 
         // Materialize only the viewport slice: cells outside the window
         // contribute their cached rows to the layout math but are never
         // cloned into a frame.
-        let start = view.scroll.min(total);
-        let end = (start + height).min(total);
+        let start = self.view().scroll.min(layout.total);
+        let end = (start + height).min(layout.total);
         let mut visible: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(start));
 
         if start == 0 && end > 0 {
             visible.push(Line::from(""));
         }
-        for index in 0..view.history.len() {
-            let cell_start = starts[index];
-            let count = counts[index];
+        let display = chat::CardDisplay {
+            thinking: self.show_thinking,
+            tool_detail: self.show_tool_detail,
+        };
+        let view = self.view_mut();
+        for index in 0..layout.starts.len() {
+            let cell_start = layout.starts[index];
+            let count = layout.counts[index];
             if cell_start < end && start < cell_start + count {
                 // Visible cell: upgrade its cached render to the highlighted
                 // one. Off-screen cells stay plain — tokenizing a card's
@@ -4396,16 +4884,13 @@ impl App {
             }
             // The separator row sits exactly at the cell's end, whenever a
             // cell or live text follows it.
-            let sep = index + 1 < view.history.len() || view.live.is_some();
+            let sep = index + 1 < layout.starts.len() || layout.parts[2].is_some();
             if sep && start <= cell_start + count && cell_start + count < end {
                 visible.push(Line::from(""));
             }
         }
-        let mut part_start = history_end;
-        for part in [running_part, thinking_part, live_part]
-            .into_iter()
-            .flatten()
-        {
+        let mut part_start = layout.history_end;
+        for part in layout.parts.iter().flatten() {
             let part_end = part_start + part.len();
             if part_start < end && start < part_end {
                 let from = start.saturating_sub(part_start).min(part.len());
@@ -4414,8 +4899,21 @@ impl App {
             }
             part_start = part_end;
         }
+        // The selection overlay restyles the covered rows after
+        // materialization, so what is highlighted is exactly what
+        // `selected_text` will copy. The selection is pinned to absolute
+        // rows, so it follows its text through the scroll above.
+        if let Some(selection) = self.selection {
+            crate::tui::selection::apply_overlay(&mut visible, start, &selection);
+        }
 
         frame.render_widget(Paragraph::new(Text::from(visible)), area);
+        self.chat_geometry = Some(ChatGeometry {
+            area,
+            scroll: start,
+            total: layout.total,
+        });
+        self.last_layout = Some(layout);
     }
 
     fn render_composer(
@@ -4551,7 +5049,7 @@ impl App {
                 } else if self.busy {
                     busy_hint
                 } else if self.mode == TuiMode::Fullscreen {
-                    IDLE_HINTS_FULLSCREEN
+                    &self.idle_hints
                 } else {
                     IDLE_HINTS_INLINE
                 }
@@ -5439,6 +5937,24 @@ mod tests {
         Arc::new(ModelPool::new(registry))
     }
 
+    /// A keymap over the host's own shortcuts, for tests that build an `App`
+    /// without going through `run`.
+    fn test_shortcut_registry() -> Vec<crate::core::keymap::ShortcutEntry> {
+        // The shipped host's registry: the host's own actions plus whatever
+        // the built-in plugins registered (tps:meter among them).
+        let specs: Vec<(&'static str, &'static [cst_plugin_api::shortcuts::ShortcutSpec])> =
+            crate::plugins::BUILTIN_PLUGINS
+                .iter()
+                .map(|plugin| (plugin.id(), plugin.shortcuts()))
+                .collect();
+        crate::core::keymap::build_registry(&specs).expect("shipped registry")
+    }
+
+    fn test_keymap() -> crate::core::keymap::Keymap {
+        crate::core::keymap::Keymap::build(&test_shortcut_registry(), &Default::default())
+            .expect("keymap")
+    }
+
     fn test_app() -> App {
         let pool = test_pool();
         let session = AgentSession::spawn_with_pool(
@@ -5470,6 +5986,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -5505,6 +6023,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -5543,6 +6063,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -5597,6 +6119,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -5654,6 +6178,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -5710,6 +6236,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -5787,6 +6315,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -5824,6 +6354,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         )
     }
 
@@ -6454,23 +6986,33 @@ mod tests {
         });
         assert!(app.settings_view.is_some(), "the screen owns the frame");
 
-        // The card for the host and for every plugin that declared settings;
-        // `tps` is the built-in with one.
+        // The card for the host, the dedicated Shortcuts card, and one for
+        // every plugin that declared settings; `tps` is the built-in with
+        // one. The shortcuts never mix into the options cards.
         let rendered = render_lines(&mut app, 100, 26).join("\n");
         assert!(rendered.contains("Settings"), "{rendered}");
         assert!(
             rendered.contains(cst_plugin_api::settings::HOST_NAMESPACE),
             "the host card is titled by the reserved namespace: {rendered}"
         );
-        assert!(rendered.contains("tps"), "{rendered}");
+        assert!(rendered.contains("Shortcuts"), "{rendered}");
+        assert!(rendered.contains("keyboard shortcuts"), "{rendered}");
+        assert!(rendered.contains("Thinking cards"), "{rendered}");
+        assert!(rendered.contains("ctrl+t (default)"), "{rendered}");
+        assert!(
+            rendered.contains("Toggle tps meter (tps)"),
+            "a plugin shortcut carries its owner: {rendered}"
+        );
         assert!(rendered.contains("Tokens-per-second meter"), "{rendered}");
 
         // The plugin's own card title wins over its id, so the screen says
         // what the plugin called the section.
         assert!(rendered.contains("throughput meter"), "{rendered}");
 
-        // Move to the tps card's first row (the toggle) and flip it.
-        let host_rows = HOST_SETTINGS.fields.len();
+        // Move to the tps card's first row (the toggle) and flip it. The
+        // host card keeps only its toggles now; the shortcuts sit on their
+        // own card between it and the plugin cards, so the walk crosses both.
+        let host_rows = HOST_SETTINGS.fields.len() + app.shortcut_settings_fields().len();
         for _ in 0..host_rows {
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
@@ -6499,6 +7041,35 @@ mod tests {
         // it: the assertion above flipped it on.
         crate::plugins::builtin::TPS.reset_for_test();
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn settings_shortcuts_card_focuses_by_name() {
+        let path = std::env::temp_dir().join(format!(
+            "codest-app-settings-shortcuts-{}-{:x}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut app = test_app();
+        app.settings_path = path.clone();
+
+        app.open_settings("shortcuts");
+        assert!(app.settings_view.is_some());
+        // The crumb names the focused card: the Shortcuts card, not the
+        // host's, and its first row is the registry's first shortcut.
+        let rendered = render_lines(&mut app, 100, 26).join("\n");
+        assert!(rendered.contains("Settings › Shortcuts"), "{rendered}");
+        assert!(
+            rendered.contains("❯ Thinking cards"),
+            "the first shortcut row is focused: {rendered}"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.settings_view.is_none());
+        std::fs::remove_file(&path).ok();
+        crate::plugins::builtin::TPS.reset_for_test();
     }
 
     #[tokio::test]
@@ -9077,6 +9648,8 @@ mod tests {
             None,
             StatusBarConfig::default(),
             Vec::new(),
+            test_shortcut_registry(),
+            test_keymap(),
         );
         app.provider_wizard = Some(crate::tui::provider_wizard::Wizard {
             step: crate::tui::provider_wizard::Step::AddConfirm,
@@ -9105,5 +9678,184 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::remove_var("CODEST_HOME") };
+    }
+
+    /// A copy stub for selection tests: records nothing, returns the native
+    /// path, and never touches the real system clipboard.
+    fn stub_copy(_: &str) -> crate::tui::clipboard::CopyPath {
+        crate::tui::clipboard::CopyPath::Native
+    }
+
+    #[tokio::test]
+    async fn mouse_drag_selects_and_release_copies() {
+        let mut app = test_app();
+        app.copy_text = stub_copy;
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("hello transcript world".to_string()));
+        // One frame so the geometry and the layout describe what is on
+        // screen; the user cell renders near the top of the viewport.
+        let lines = render_lines(&mut app, 60, 12);
+        let (y, x) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(y, line)| Some((y, line.find("transcript")?)))
+            .expect("the text renders");
+
+        // Press, drag across the word, release: the flash says what was
+        // copied.
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x as u16,
+            row: y as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(press);
+        assert!(app.selection.is_some(), "a press anchors a selection");
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: (x + 10) as u16,
+            row: y as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(drag);
+        let release = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: (x + 10) as u16,
+            row: y as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(release);
+        let (text, _) = app.status.expect("the release flashed");
+        assert_eq!(text, "copied 10 chars", "the word `transcript`");
+        assert!(app.selection.is_some(), "the selection survives for a re-copy");
+        // Reset the shared static's state this test never touched.
+        crate::plugins::builtin::TPS.reset_for_test();
+    }
+
+    #[tokio::test]
+    async fn a_bare_click_does_not_select_and_a_key_clears_the_highlight() {
+        let mut app = test_app();
+        app.copy_text = stub_copy;
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("hello transcript world".to_string()));
+        let lines = render_lines(&mut app, 60, 12);
+        let (y, x) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(y, line)| Some((y, line.find("transcript")?)))
+            .expect("the text renders");
+        let at = |kind, column, row| MouseEvent {
+            kind,
+            column: column as u16,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        use MouseEventKind as K;
+
+        // Press and release on one cell: no highlight, no copy.
+        app.handle_mouse(at(K::Down(MouseButton::Left), x, y));
+        app.handle_mouse(at(K::Up(MouseButton::Left), x, y));
+        assert!(app.selection.is_none(), "a bare click clears");
+        assert!(app.status.is_none(), "and copies nothing");
+
+        // A real selection survives wheel scrolling (it is pinned to its
+        // rows) but any key press — Esc here — clears it.
+        app.handle_mouse(at(K::Down(MouseButton::Left), x, y));
+        app.handle_mouse(at(K::Drag(MouseButton::Left), x + 4, y));
+        assert!(app.selection.is_some());
+        app.handle_mouse(at(K::ScrollUp, 0, 0));
+        assert!(app.selection.is_some(), "wheel keeps the selection");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selection.is_none(), "a key press clears it");
+        crate::plugins::builtin::TPS.reset_for_test();
+    }
+
+    #[tokio::test]
+    async fn a_double_click_selects_the_word_under_it() {
+        let mut app = test_app();
+        app.copy_text = stub_copy;
+        app.view_mut()
+            .history
+            .push(HistoryCell::User("hello transcript world".to_string()));
+        let lines = render_lines(&mut app, 60, 12);
+        let (y, x) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(y, line)| Some((y, line.find("transcript")?)))
+            .expect("the text renders");
+        let at = |kind, column, row| MouseEvent {
+            kind,
+            column: column as u16,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        use MouseEventKind as K;
+
+        // Two quick clicks over the same cell: the word selection is
+        // complete without any drag, and releasing copies exactly the word —
+        // however many columns the cell's marker indents it by.
+        app.handle_mouse(at(K::Down(MouseButton::Left), x + 2, y));
+        app.handle_mouse(at(K::Up(MouseButton::Left), x + 2, y));
+        app.handle_mouse(at(K::Down(MouseButton::Left), x + 2, y));
+        let selection = app.selection.expect("the double click selects");
+        assert_eq!(selection.kind, crate::tui::selection::SelectionKind::Word);
+        app.handle_mouse(at(K::Up(MouseButton::Left), x + 2, y));
+        let (text, _) = app.status.expect("the release flashed");
+        assert_eq!(text, "copied 10 chars", "the word `transcript`");
+        crate::plugins::builtin::TPS.reset_for_test();
+    }
+
+    #[tokio::test]
+    async fn a_rebound_shortcut_fires_through_the_keymap() {
+        let mut app = test_app();
+        // `[shortcuts] thinking = "alt+y"`: the file's form of a `/settings`
+        // rebind, applied the same way a save applies it.
+        let mut global = crate::core::config::GlobalConfig::default();
+        global
+            .shortcuts
+            .insert("thinking".to_string(), "alt+y".to_string());
+        app.apply_global_config(&global);
+        assert!(!app.show_thinking);
+
+        // The old combo is gone; the new one toggles and reports in the
+        // footer.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(!app.show_thinking, "ctrl+t no longer matches");
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert!(app.show_thinking, "alt+y is the thinking switch now");
+        let (text, _) = app.status.expect("the toggle flashed");
+        assert_eq!(text, "thinking expanded");
+        // And the idle hint follows the rebind.
+        assert!(app.idle_hints.contains("Ctrl+End latest"), "jump_bottom kept its default");
+        crate::plugins::builtin::TPS.reset_for_test();
+    }
+
+    #[tokio::test]
+    async fn a_plugin_shortcut_dispatches_to_its_plugin() {
+        let mut app = test_app();
+        // The shipped tps plugin registers `tps:meter` at `ctrl+g`; the row
+        // shows up on its card and the key fires its handler.
+        assert!(
+            app.keymap
+                .registry()
+                .iter()
+                .any(|entry| entry.full_id == "tps:meter"),
+            "the plugin's registration joined the registry"
+        );
+        assert!(!crate::plugins::builtin::TPS.is_enabled());
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(
+            crate::plugins::builtin::TPS.is_enabled(),
+            "ctrl+g toggled the meter through on_shortcut"
+        );
+        // The notice reached the transcript like any plugin effect.
+        let text = match &app.view().history.last() {
+            Some(HistoryCell::Notice(text)) => text.clone(),
+            other => panic!("expected a notice cell, got {other:?}"),
+        };
+        assert!(text.contains("tps meter on"), "{text}");
+        crate::plugins::builtin::TPS.reset_for_test();
     }
 }

@@ -8,7 +8,7 @@ codest has two ways to occupy a terminal. `fullscreen` gives the app the whole s
 
 | Mode | Behavior |
 | --- | --- |
-| `fullscreen` (default) | Alternate screen; the app owns the display; transcript scrolls with `PgUp`/`PgDn` or the mouse wheel. Mouse reporting is on, at 3 lines per wheel notch (`Alt`+wheel = 15); hold `Shift` and drag to use the terminal's native selection. |
+| `fullscreen` (default) | Alternate screen; the app owns the display; transcript scrolls with `PgUp`/`PgDn` or the mouse wheel. Mouse reporting is on, at 3 lines per wheel notch (`Alt`+wheel = 15), and the app owns text selection — drag over the transcript to select, release to copy. Hold `Shift` and drag for the terminal's native selection instead. |
 | `inline` | No alternate screen; settled transcript lines are written to the terminal's own scrollback; only the input box and status line remain at the bottom. No mouse reporting, so selection and copy stay native. |
 
 The two differ in one contract: in `fullscreen` the app repaints a viewport, so it can redraw anything at any time; in `inline` a line that has reached the scrollback is gone from the app's reach and cannot be revised. That is why `inline` writes only lines the renderer considers final (see [Streaming commit rule](#streaming-commit-rule)).
@@ -23,6 +23,8 @@ CST_TUI_MODE=inline codest
 ### Scrolling
 
 In `fullscreen` the transcript lives in an application-scrolled viewport: the mouse wheel moves 3 lines per notch, `Alt`+wheel moves 15, and `PgUp`/`PgDn` move 5 lines per press. Because the app repaints the viewport, the transcript can be longer than the screen and still be browsed in both directions. Scrolling up detaches the viewport from the tail; `Ctrl+End` jumps back to the newest line and re-attaches it.
+
+**Text selection and copy.** Pressing and dragging over the transcript selects text — solid highlight, foreground preserved; a double click selects the word under it, a triple click the whole line — and releasing copies the highlighted text to the clipboard. The copy chain is the same one reference TUIs use: a native utility first (`pbcopy` on macOS, `wl-copy`/`xclip`/`xsel` on Linux; skipped over SSH), then `tmux load-buffer -w`, then the OSC 52 sequence written to stdout, tmux-passthrough-wrapped when inside tmux. The footer flash reports what happened — `copied 128 chars`, with the route named when it is not the obvious one. The selection lives in absolute transcript rows, so wheel scrolling keeps it pinned to its text instead of losing it; any key press except the scroll keys clears it, `Esc` among them. `Shift`+drag bypasses all of this and hands the gesture to the terminal's native selection.
 
 In `inline` the app never scrolls anything: `PgUp`/`PgDn` are handed straight to the terminal, which scrolls its own scrollback. While a turn runs, the inline pane keeps at most four rows of the still-streaming tail pinned to the bottom — a fixed height, so a block growing row by row cannot scroll its own already-drawn head into the scrollback and later duplicate it. Once the block settles, its lines are promoted into the scrollback for real.
 

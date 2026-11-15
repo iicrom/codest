@@ -27,6 +27,7 @@ pub mod context;
 pub mod context_store;
 pub mod conversation;
 pub mod echo_model;
+pub mod keymap;
 pub mod model;
 pub mod openai_compat;
 pub mod protocol;
