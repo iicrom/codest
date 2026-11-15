@@ -60,7 +60,7 @@
 | `assistant_message` | 完成的助手回复。 |
 | `assistant_reasoning` | 一张 thinking 卡片（正文加流式时长）；纯显示元数据。 |
 | `assistant_tool_calls` | 整轮的工具调用，回放为一条带 `tool_calls` 的助手消息。 |
-| `tool_result` | 单个工具的输出，回放为回答对应 `tool_call_id` 的 `role: "tool"` 消息。 |
+| `tool_result` | 单个工具的输出，回放为回答对应 `tool_call_id` 的 `role: "tool"` 消息。文件保留完整原文；回放时按当前运行的工具输出预算裁剪后进入会话（见下）。 |
 | `cleared` | 会话内的 `/clear`（保留系统提示词）。 |
 | `renamed` | `/rename`；回放时最后一个生效。 |
 | `model_switched` | 模型切换；回放时最后一条生效，恢复的会话从上次使用的模型开始。 |
@@ -69,8 +69,10 @@
 | `profile_switched` | 活动 profile 的名字。 |
 | `turn_usage` | 一个完成回合的输入/输出 token 数，以及服务该回合的模型；在上报缓存统计的 provider 上还带输入中的缓存前缀子集（`cached`）。 |
 | `context_deleted` / `context_edited` / `context_restored` | `/context` 查看器中的编辑：下标与被移除内容（删除的逆操作），以及撤销标记。 |
+| `context_tool_call_deleted` | `/context` 查看器的钻入视图删除的单个工具调用（`Op::DeleteToolCall`），连同回答它的结果消息——当最后一个调用清空一条无正文的轮次时还包括该助手消息本身。载荷与 `context_deleted` 一样是删除的逆操作。 |
 
 - **回放是忠实的。** 从文件重建对话可精确还原——包括卡片折叠/展开状态。thinking 记录是显示元数据：它们会被回放成卡片，但永远不会重新进入模型上下文。
+- **工具输出裁剪两次，文件从不。** 与 codex 相同，模型看到的会话里每个工具结果都受本次运行的预算约束（`config.toml` 的 `tool_output_token_limit`，默认 4000 估算 token，`0` 关闭）：超限的结果以「头部 + `… N tokens truncated …` 提示 + 尾部」进入会话——记录时裁一次，回放时再裁一次，恢复的会话因此与实时会话看到同样的形状。rollout 文件与工具卡片的显示保留完整输出。
 - **id 立即分配，文件惰性创建。** 会话创建时就分配 id（第一轮请求即带 session 头），文件在第一条用户消息时才创建。空会话不创建文件。
 - **写入是尽力而为的。** 落盘失败不影响对话；错误写到 stderr，回合继续。
 - **文件名不是 uuid 的文件不是会话。** 列表会跳过它，包括旧版本用 hex 纳秒命名的文件。

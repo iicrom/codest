@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::core::protocol::Message;
+use crate::core::protocol::Role;
 
 const ROLLOUT_PREFIX: &str = "rollout-";
 const ROLLOUT_SUFFIX: &str = ".jsonl";
@@ -249,6 +250,22 @@ pub enum RolloutItem {
         index: usize,
         content: String,
         previous: String,
+    },
+    /// One tool call was spliced out of an assistant message's `tool_calls`
+    /// by the `/context` viewer (`Op::DeleteToolCall`), with the result
+    /// message answering it. `results` are the removed result messages at
+    /// their transcript indices at deletion time, `assistant_removed` the
+    /// assistant message itself when it was dropped whole (last call, no
+    /// content) — the whole payload is the delete's own inverse, exactly
+    /// like [`RolloutItem::ContextDeleted`], so replay applies it and
+    /// rebuilds the checkpoint an undo needs.
+    ContextToolCallDeleted {
+        index: usize,
+        call: crate::core::tools::ToolCall,
+        position: usize,
+        results: Vec<(usize, Message)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assistant_removed: Option<Message>,
     },
     /// The most recent `ContextDeleted`/`ContextEdited` was undone
     /// (`Op::UndoContextEdit`). Replay pops the checkpoint stack the earlier
@@ -480,9 +497,20 @@ fn attach_reasoning(
     }
 }
 
-/// Load and replay one rollout file. Unknown item types are skipped so newer
-/// codest versions can extend the format without breaking older readers.
+/// Load and replay one rollout file with the default tool-output budget.
+/// Unknown item types are skipped so newer codest versions can extend the
+/// format without breaking older readers.
 pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
+    load_session_with_limit(path, crate::core::truncate::DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT)
+}
+
+/// Same, with the run's tool-output budget: the file keeps full payloads,
+/// and the conversation that comes out of a replay carries the truncated
+/// shape the live session saw ([`crate::core::truncate`]).
+pub fn load_session_with_limit(
+    path: &Path,
+    tool_output_token_limit: usize,
+) -> io::Result<LoadedSession> {
     let content = std::fs::read_to_string(path)?;
     let mut meta = None;
     let mut messages = Vec::new();
@@ -543,7 +571,10 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
             RolloutItem::ToolResult {
                 tool_call_id,
                 content,
-            } => messages.push(Message::tool_result(tool_call_id, content)),
+            } => messages.push(Message::tool_result(
+                tool_call_id,
+                crate::core::truncate::truncate_tool_output(&content, tool_output_token_limit),
+            )),
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
             RolloutItem::Cleared => {
                 messages.clear();
@@ -647,6 +678,81 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 undo.push(crate::core::conversation::UndoEntry::Edited { index, previous });
                 message.content = content;
             }
+            // A tool-call removal replays like the live op: the results go
+            // back-to-front (indices are deletion-time positions), then the
+            // call is spliced out — or the emptied assistant message dropped
+            // whole. The marker is validated before anything moves, and a
+            // mismatch skips the whole record, like the other context
+            // markers.
+            RolloutItem::ContextToolCallDeleted {
+                index,
+                call,
+                position,
+                results,
+                assistant_removed,
+            } => {
+                let mut pairs: Vec<(usize, Message)> = results;
+                pairs.sort_by_key(|(at, _)| *at);
+                let results_ok = pairs.iter().all(|(at, message)| {
+                    *at < messages.len()
+                        && *at > index
+                        && message.role == Role::Tool
+                        && message.tool_call_id.as_deref() == Some(call.id.as_str())
+                });
+                let call_ok = messages.get(index).is_some_and(|message| {
+                    message.role == Role::Assistant
+                        && message
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|calls| calls.get(position).is_some_and(|found| found.id == call.id))
+                });
+                // A whole-message removal replays only when the transcript
+                // still holds exactly the recorded snapshot (the round with
+                // this one call, no content); anything else is a corrupt
+                // marker and skips whole, like the other context markers.
+                let assistant_ok = match &assistant_removed {
+                    Some(assistant) => position == 0 && messages.get(index) == Some(assistant),
+                    None => true,
+                };
+                if !results_ok || !call_ok || !assistant_ok {
+                    continue;
+                }
+                for (at, _) in pairs.iter().rev() {
+                    for record in thinking.iter_mut() {
+                        if record.before > *at {
+                            record.before -= 1;
+                        }
+                    }
+                    messages.remove(*at);
+                }
+                if assistant_removed.is_some() {
+                    // The message matches the snapshot above: drop it whole.
+                    for record in thinking.iter_mut() {
+                        if record.before > index {
+                            record.before -= 1;
+                        }
+                    }
+                    messages.remove(index);
+                } else if let Some(message) = messages.get_mut(index) {
+                    let calls = message
+                        .tool_calls
+                        .as_mut()
+                        .expect("checked above");
+                    calls.remove(position);
+                    if calls.is_empty() {
+                        message.tool_calls = None;
+                    }
+                }
+                undo.push(crate::core::conversation::UndoEntry::ToolCallRemoved(
+                    crate::core::conversation::ToolCallRemoval {
+                        index,
+                        call,
+                        position,
+                        results: pairs,
+                        assistant_removed,
+                    },
+                ));
+            }
             RolloutItem::ContextRestored => match undo.pop() {
                 Some(crate::core::conversation::UndoEntry::Deleted { removed }) => {
                     for (index, message) in removed {
@@ -661,6 +767,36 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
                 Some(crate::core::conversation::UndoEntry::Edited { index, previous }) => {
                     if let Some(message) = messages.get_mut(index) {
                         message.content = previous;
+                    }
+                }
+                Some(crate::core::conversation::UndoEntry::ToolCallRemoved(removal)) => {
+                    // The whole-message case restores the assistant message
+                    // (its snapshot still carries the call), then the
+                    // results; the partial case re-inserts the results
+                    // first — the message never moved — and splices the
+                    // call back at its position.
+                    if let Some(assistant) = &removal.assistant_removed {
+                        messages.insert(removal.index, assistant.clone());
+                        for record in thinking.iter_mut() {
+                            if record.before >= removal.index {
+                                record.before += 1;
+                            }
+                        }
+                    }
+                    for (index, message) in &removal.results {
+                        messages.insert(*index, message.clone());
+                        for record in thinking.iter_mut() {
+                            if record.before >= *index {
+                                record.before += 1;
+                            }
+                        }
+                    }
+                    if removal.assistant_removed.is_none()
+                        && let Some(message) = messages.get_mut(removal.index)
+                    {
+                        let calls = message.tool_calls.get_or_insert_with(Vec::new);
+                        let position = removal.position.min(calls.len());
+                        calls.insert(position, removal.call.clone());
                     }
                 }
                 None => {}
@@ -699,12 +835,21 @@ pub fn load_session(path: &Path) -> io::Result<LoadedSession> {
     })
 }
 
-/// Load every session of a workspace, oldest first. Files that fail to load
-/// are reported on stderr and skipped; the rest still restore.
+/// Load every session of a workspace, oldest first, with the default
+/// tool-output budget. Files that fail to load are reported on stderr and
+/// skipped; the rest still restore.
 pub fn load_workspace_sessions(dir: &Path) -> io::Result<Vec<LoadedSession>> {
+    load_workspace_sessions_with_limit(dir, crate::core::truncate::DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT)
+}
+
+/// Same, with the run's tool-output budget (see [`load_session_with_limit`]).
+pub fn load_workspace_sessions_with_limit(
+    dir: &Path,
+    tool_output_token_limit: usize,
+) -> io::Result<Vec<LoadedSession>> {
     let mut loaded = Vec::new();
     for path in list_workspace_sessions(dir)? {
-        match load_session(&path) {
+        match load_session_with_limit(&path, tool_output_token_limit) {
             Ok(session) => loaded.push(session),
             Err(error) => eprintln!("codest: skipping rollout: {error}"),
         }
@@ -964,6 +1109,210 @@ mod tests {
         let loaded = load_session(&rollout.path).expect("load");
         assert_eq!(loaded.messages.len(), 1);
         assert!(loaded.undo.is_empty());
+    }
+
+    fn tool_round_rollout() -> (std::path::PathBuf, RolloutFile) {
+        let dir = tempdir("context-toolcall");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
+        for text in ["hi", "next"] {
+            rollout
+                .append(&RolloutItem::UserMessage {
+                    message: text.to_string(),
+                })
+                .expect("append");
+        }
+        let call = |id: &str| crate::core::tools::ToolCall {
+            id: id.to_string(),
+            name: "ping".to_string(),
+            arguments: "{}".to_string(),
+        };
+        rollout
+            .append(&RolloutItem::AssistantToolCalls {
+                calls: vec![call("c1"), call("c2")],
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ToolResult {
+                tool_call_id: "c1".to_string(),
+                content: "one".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ToolResult {
+                tool_call_id: "c2".to_string(),
+                content: "two".to_string(),
+            })
+            .expect("append");
+        (dir, rollout)
+    }
+
+    /// A tool-call removal marker replays the splice and rebuilds the
+    /// checkpoint: the loaded session shows one call left and an undo that
+    /// restores the round whole.
+    #[test]
+    fn context_tool_call_deletes_replay_and_rebuild_the_checkpoint() {
+        use crate::core::conversation::{ToolCallRemoval, UndoEntry};
+
+        let (_dir, mut rollout) = tool_round_rollout();
+        let call = crate::core::tools::ToolCall {
+            id: "c1".to_string(),
+            name: "ping".to_string(),
+            arguments: "{}".to_string(),
+        };
+        rollout
+            .append(&RolloutItem::ContextToolCallDeleted {
+                index: 2,
+                call: call.clone(),
+                position: 0,
+                results: vec![(3, Message::tool_result("c1", "one"))],
+                assistant_removed: None,
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        // Transcript: the two user messages, the round with `c2` left, its
+        // result — the `c1` pair is gone.
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![Role::User, Role::User, Role::Assistant, Role::Tool]
+        );
+        let calls = loaded.messages[2].tool_calls.as_ref().expect("some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c2");
+        assert_eq!(loaded.messages[3], Message::tool_result("c2", "two"));
+        assert_eq!(
+            loaded.undo.first(),
+            Some(&UndoEntry::ToolCallRemoved(ToolCallRemoval {
+                index: 2,
+                call,
+                position: 0,
+                results: vec![(3, Message::tool_result("c1", "one"))],
+                assistant_removed: None,
+            }))
+        );
+
+        let mut conversation = Conversation::replayed(
+            loaded.meta.system_prompt.clone(),
+            loaded.messages.clone(),
+            loaded.undo.clone(),
+        );
+        assert!(conversation.undo_last_edit());
+        assert_eq!(conversation.len(), 5);
+        assert_eq!(
+            Conversation::validate_tool_structure(conversation.messages()),
+            Ok(())
+        );
+    }
+
+    /// The whole-message variant (last call, no content) replays the message
+    /// removal too, and its checkpoint restores both halves.
+    #[test]
+    fn a_whole_message_tool_call_delete_replays_and_restores() {
+        use crate::core::conversation::UndoEntry;
+
+        let (_dir, mut rollout) = tool_round_rollout();
+        let call = crate::core::tools::ToolCall {
+            id: "c1".to_string(),
+            name: "ping".to_string(),
+            arguments: "{}".to_string(),
+        };
+        // A second round (index 5) that loses its only call, and the
+        // emptied assistant message with it.
+        let round = Message::assistant_tool_calls(vec![call.clone()]);
+        rollout
+            .append(&RolloutItem::AssistantToolCalls {
+                calls: vec![call.clone()],
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ToolResult {
+                tool_call_id: "c1".to_string(),
+                content: "one".to_string(),
+            })
+            .expect("append");
+        rollout
+            .append(&RolloutItem::ContextToolCallDeleted {
+                index: 5,
+                call,
+                position: 0,
+                results: vec![(6, Message::tool_result("c1", "one"))],
+                assistant_removed: Some(round.clone()),
+            })
+            .expect("append");
+
+        let loaded = load_session(&rollout.path).expect("load");
+        // The second round went whole: the transcript is the first round
+        // with both user messages — no trailing assistant, no result.
+        assert_eq!(
+            loaded
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![Role::User, Role::User, Role::Assistant, Role::Tool, Role::Tool]
+        );
+        assert_eq!(
+            loaded.undo.first().map(|entry| match entry {
+                UndoEntry::ToolCallRemoved(removal) => removal.assistant_removed.as_ref(),
+                _ => None,
+            }),
+            Some(Some(&round)),
+            "the checkpoint carries the removed assistant message"
+        );
+
+        let mut conversation = Conversation::replayed(
+            loaded.meta.system_prompt.clone(),
+            loaded.messages.clone(),
+            loaded.undo.clone(),
+        );
+        assert!(conversation.undo_last_edit());
+        assert_eq!(conversation.len(), 7);
+        assert_eq!(
+            Conversation::validate_tool_structure(conversation.messages()),
+            Ok(())
+        );
+    }
+
+    /// The replay budget is the run's config, not the file's history: the
+    /// file keeps the full payload, a restored session carries whatever
+    /// shape the run's limit implies, and `0` restores everything.
+    #[test]
+    fn replay_applies_the_configured_tool_output_budget() {
+        let dir = tempdir("truncate-replay");
+        let writer = RolloutWriter::new(dir.clone(), "/tmp/demo".to_string());
+        let mut rollout = writer
+            .start_session(&new_id(), "be brief", None, None, None)
+            .expect("start");
+        rollout
+            .append(&RolloutItem::UserMessage {
+                message: "hi".to_string(),
+            })
+            .expect("append");
+        let content = "x".repeat(4_000); // 1k estimated tokens
+        rollout
+            .append(&RolloutItem::ToolResult {
+                tool_call_id: "c1".to_string(),
+                content: content.clone(),
+            })
+            .expect("append");
+
+        // The default budget does not touch a 1k-token result.
+        let loaded = load_session(&rollout.path).expect("load");
+        assert_eq!(loaded.messages[1].content, content);
+
+        // A tight budget cuts what the restored conversation carries; the
+        // file still holds the full text, and `0` restores it all.
+        let loaded = load_session_with_limit(&rollout.path, 100).expect("load");
+        assert!(loaded.messages[1].content.contains("tokens truncated …"));
+        let loaded = load_session_with_limit(&rollout.path, 0).expect("load");
+        assert_eq!(loaded.messages[1].content, content);
     }
 
     /// Reasoning is display metadata: replay hands it back attached to the

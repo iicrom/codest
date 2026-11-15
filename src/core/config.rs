@@ -63,6 +63,13 @@ pub struct GlobalConfig {
     /// error once that many rounds have completed).
     #[serde(default)]
     pub max_tool_rounds: Option<usize>,
+    /// The per-output tool result budget, in estimated tokens
+    /// ([`crate::core::truncate`]). A result that busts it enters the
+    /// conversation as head + a truncation notice + tail; the rollout file
+    /// and the TUI's tool card keep the full output, so replaying applies
+    /// the same cut to whatever limit is in force. `0` disables truncation.
+    #[serde(default = "default_tool_output_token_limit")]
+    pub tool_output_token_limit: usize,
     /// Footer configuration (`[status_bar]`). Absent keeps the defaults:
     /// plugin segments on, in the order the plugins set them.
     #[serde(default)]
@@ -83,6 +90,12 @@ fn default_double_press_interrupt() -> bool {
     true
 }
 
+/// The tool-output budget both the missing key and `Default` resolve to;
+/// the constant itself lives with the policy in [`crate::core::truncate`].
+fn default_tool_output_token_limit() -> usize {
+    crate::core::truncate::DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT
+}
+
 impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
@@ -90,6 +103,7 @@ impl Default for GlobalConfig {
             default_effort: None,
             double_press_interrupt: default_double_press_interrupt(),
             max_tool_rounds: None,
+            tool_output_token_limit: default_tool_output_token_limit(),
             status_bar: StatusBarConfig::default(),
             plugins: BTreeMap::new(),
         }
@@ -395,6 +409,23 @@ mod tests {
         let global = load_global(&capped).unwrap();
         assert_eq!(global.max_tool_rounds, Some(64));
         assert_eq!(global.default, None);
+    }
+
+    #[test]
+    fn tool_output_token_limit_defaults_to_the_policy_and_parses_when_set() {
+        // Absent: the module's own default, exactly what a plain spawn gets.
+        let unset = write_temp("global-limit-unset.toml", "");
+        let global = load_global(&unset).unwrap();
+        assert_eq!(
+            global.tool_output_token_limit,
+            crate::core::truncate::DEFAULT_TOOL_OUTPUT_TOKEN_LIMIT
+        );
+
+        // `0` is the documented off switch; anything else is the budget.
+        let off = write_temp("global-limit-off.toml", "tool_output_token_limit = 0\n");
+        assert_eq!(load_global(&off).unwrap().tool_output_token_limit, 0);
+        let tight = write_temp("global-limit-tight.toml", "tool_output_token_limit = 500\n");
+        assert_eq!(load_global(&tight).unwrap().tool_output_token_limit, 500);
     }
 
     #[test]

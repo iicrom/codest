@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 use crate::core::protocol::Message;
 use crate::core::protocol::Role;
+use crate::core::tools::ToolCall;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "You are codest, a concise and helpful terminal assistant. Answer in the user's language.";
@@ -24,6 +25,27 @@ pub const DEFAULT_SYSTEM_PROMPT: &str =
 /// to the interruption instead of the shape being rejected on the wire.
 pub const INTERRUPTED_TOOL_RESULT: &str =
     "interrupted: the session ended before this tool call finished";
+
+/// The inverse of one `remove_tool_call`: the call and its position within
+/// the assistant message's `tool_calls`, the result messages that went with
+/// it (original transcript indices, ascending), and the assistant message
+/// itself when removing the last call emptied the message entirely. Both the
+/// undo checkpoint and the rollout marker carry exactly this, so an undo
+/// works unchanged after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallRemoval {
+    /// The assistant message's transcript index at removal time.
+    pub index: usize,
+    pub call: ToolCall,
+    /// Where the call sat within the message's `tool_calls`.
+    pub position: usize,
+    /// Removed result messages as `(transcript index, message)` pairs in
+    /// ascending index order — the same pair shape `Deleted` stores.
+    pub results: Vec<(usize, Message)>,
+    /// The assistant message as it stood before the delete, set only when
+    /// the removal also dropped the (now empty) message itself.
+    pub assistant_removed: Option<Message>,
+}
 
 /// One reversible context modification: the inverse of a `delete_at` or
 /// `edit_content`, recorded automatically so [`Conversation::undo_last_edit`]
@@ -38,6 +60,9 @@ pub enum UndoEntry {
     Deleted { removed: Vec<(usize, Message)> },
     /// The message at `index` carried `previous` before the edit.
     Edited { index: usize, previous: String },
+    /// One tool call was spliced out of an assistant message's `tool_calls`
+    /// together with its result message; [`ToolCallRemoval`] is the inverse.
+    ToolCallRemoved(ToolCallRemoval),
 }
 
 #[derive(Debug, Clone)]
@@ -185,6 +210,83 @@ impl Conversation {
         Ok(previous)
     }
 
+    /// Splice one tool call out of the transcript message at `index`, taking
+    /// the result message that answers it along. The pair goes as one, so the
+    /// tool wire shape (`validate_tool_structure`) stays satisfied. A round
+    /// emptied this way keeps its text (the message becomes a plain assistant
+    /// message) or goes entirely when it had none. Fails without side effects
+    /// when `index` is out of range or the message has no such call.
+    ///
+    /// Returns the removal's inverse — what the rollout marker and the
+    /// checkpoint both need. The checkpoint is recorded here, like the other
+    /// primitives.
+    pub fn remove_tool_call(&mut self, index: usize, call_id: &str) -> Result<ToolCallRemoval, String> {
+        if index >= self.messages.len() {
+            return Err(format!(
+                "cannot remove a tool call from message {index}: the transcript has {} messages",
+                self.messages.len()
+            ));
+        }
+        let Some(position) = self.messages[index]
+            .tool_calls
+            .as_ref()
+            .and_then(|calls| calls.iter().position(|call| call.id == call_id))
+        else {
+            return Err(format!("message {index} has no tool call `{call_id}`"));
+        };
+        let call = self.messages[index].tool_calls.as_ref().expect("checked above")[position].clone();
+
+        // The result answering this call sits in the Role::Tool block
+        // directly after the message — the shape validate_tool_structure
+        // enforces. A call without one is a dangling round; removing the
+        // call is the repair, so an absent result is not an error.
+        let mut results: Vec<(usize, Message)> = Vec::new();
+        let mut cursor = index + 1;
+        while cursor < self.messages.len() && self.messages[cursor].role == Role::Tool {
+            if self.messages[cursor].tool_call_id.as_deref() == Some(call_id) {
+                results.push((cursor, self.messages.remove(cursor)));
+                break;
+            }
+            cursor += 1;
+        }
+
+        // The whole-message inverse needs the message as it stood BEFORE
+        // the call was spliced out — the snapshot is what the undo (and the
+        // rollout replay) restores, and it must still carry the call.
+        let assistant_before = self.messages[index].clone();
+        let calls = self.messages[index]
+            .tool_calls
+            .as_mut()
+            .expect("the call was found above");
+        calls.remove(position);
+        let emptied = calls.is_empty();
+        if emptied {
+            self.messages[index].tool_calls = None;
+        }
+
+        // A round that lost its last call and has nothing to say is dropped
+        // whole; keeping an "(empty)" entry would only puzzle the model and
+        // the viewer. The result indices stay as they were recorded: the
+        // undo re-inserts the assistant message (which precedes them) first,
+        // exactly like `Deleted`'s ascending re-insertion.
+        let mut assistant_removed = None;
+        if emptied && assistant_before.content.is_empty() {
+            self.messages.remove(index);
+            assistant_removed = Some(assistant_before);
+        }
+
+        let removal = ToolCallRemoval {
+            index,
+            call,
+            position,
+            results,
+            assistant_removed,
+        };
+        self.undo
+            .push(UndoEntry::ToolCallRemoved(removal.clone()));
+        Ok(removal)
+    }
+
     /// Undo the most recent delete or edit. `false` when nothing recorded.
     pub fn undo_last_edit(&mut self) -> bool {
         match self.undo.pop() {
@@ -206,6 +308,27 @@ impl Conversation {
                 // valid); treat as spent rather than panic.
                 None => false,
             },
+            Some(UndoEntry::ToolCallRemoved(removal)) => {
+                // The whole-message case restores the assistant message (its
+                // snapshot still carries the call), then the results; the
+                // partial case re-inserts the results first — the message
+                // never moved — and splices the call back at its position.
+                let whole = removal.assistant_removed.is_some();
+                if let Some(assistant) = removal.assistant_removed {
+                    self.messages.insert(removal.index, assistant);
+                }
+                for (index, message) in removal.results {
+                    self.messages.insert(index, message);
+                }
+                if !whole
+                    && let Some(message) = self.messages.get_mut(removal.index)
+                {
+                    let calls = message.tool_calls.get_or_insert_with(Vec::new);
+                    let position = removal.position.min(calls.len());
+                    calls.insert(position, removal.call);
+                }
+                true
+            }
             None => false,
         }
     }
@@ -520,6 +643,156 @@ mod tests {
             Ok(())
         );
         assert_eq!(conv.len(), 4);
+    }
+
+    /// Splicing one call out of a multi-call round removes exactly that call
+    /// and its result; the rest of the round, and the wire shape, survive.
+    #[test]
+    fn remove_tool_call_splices_one_call_and_its_result() {
+        let mut conv = Conversation::new("be brief");
+        conv.push_user("hi");
+        conv.push_message(Message::assistant_tool_calls(vec![call("call_1"), call("call_2")]));
+        conv.push_message(Message::tool_result("call_1", "one"));
+        conv.push_message(Message::tool_result("call_2", "two"));
+        conv.push_assistant("done");
+
+        conv.remove_tool_call(1, "call_1").expect("in range");
+
+        let calls = conv.messages()[1].tool_calls.as_ref().expect("still some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_2");
+        assert_eq!(conv.messages()[2], Message::tool_result("call_2", "two"));
+        assert_eq!(conv.len(), 4);
+        assert_eq!(Conversation::validate_tool_structure(conv.messages()), Ok(()));
+
+        // The undo puts back the pair and the exact call order.
+        assert!(conv.undo_last_edit());
+        assert_eq!(
+            conv.messages()[1]
+                .tool_calls
+                .as_ref()
+                .expect("restored")
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_1", "call_2"]
+        );
+        assert_eq!(conv.len(), 5);
+        assert_eq!(Conversation::validate_tool_structure(conv.messages()), Ok(()));
+    }
+
+    /// Results may answer a round's calls in any order; the removal finds
+    /// its result wherever the block keeps it, and the undo restores the
+    /// block exactly as it stood.
+    #[test]
+    fn remove_tool_call_finds_the_result_anywhere_in_the_block() {
+        let mut conv = Conversation::new("be brief");
+        conv.push_user("hi");
+        conv.push_message(Message::assistant_tool_calls(vec![call("call_1"), call("call_2")]));
+        conv.push_message(Message::tool_result("call_2", "two"));
+        conv.push_message(Message::tool_result("call_1", "one"));
+
+        conv.remove_tool_call(1, "call_1").expect("in range");
+        // The assistant keeps `call_2`; `call_1`'s result (last in the
+        // block) is gone.
+        let calls = conv.messages()[1].tool_calls.as_ref().expect("some");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_2");
+        assert_eq!(conv.messages()[2], Message::tool_result("call_2", "two"));
+
+        assert!(conv.undo_last_edit());
+        // The block restores exactly as it stood: call_2's result first,
+        // then call_1's.
+        assert_eq!(conv.messages()[2], Message::tool_result("call_2", "two"));
+        assert_eq!(conv.messages()[3], Message::tool_result("call_1", "one"));
+    }
+
+    /// A round that keeps its text becomes a plain assistant message when its
+    /// last call goes; the undo brings the call back.
+    #[test]
+    fn removing_the_last_call_of_a_round_with_text_turns_it_into_plain_assistant() {
+        let mut conv = Conversation::new("be brief");
+        conv.push_user("hi");
+        let mut round = Message::assistant("thinking out loud");
+        round.tool_calls = Some(vec![call("call_1")]);
+        conv.push_message(round);
+        conv.push_message(Message::tool_result("call_1", "pong"));
+
+        conv.remove_tool_call(1, "call_1").expect("in range");
+        assert_eq!(conv.messages()[1], Message::assistant("thinking out loud"));
+        assert_eq!(Conversation::validate_tool_structure(conv.messages()), Ok(()));
+
+        assert!(conv.undo_last_edit());
+        assert_eq!(
+            conv.messages()[1].tool_calls.as_ref().expect("restored").len(),
+            1
+        );
+    }
+
+    /// A round with no text loses the message entirely with its last call —
+    /// an "(empty)" entry would puzzle the model and the viewer — and the
+    /// undo rebuilds the round exactly.
+    #[test]
+    fn removing_the_last_call_of_an_empty_round_drops_the_message() {
+        let mut conv = Conversation::new("be brief");
+        conv.push_user("hi");
+        conv.push_message(Message::assistant_tool_calls(vec![call("call_1")]));
+        conv.push_message(Message::tool_result("call_1", "pong"));
+        conv.push_assistant("done");
+
+        conv.remove_tool_call(1, "call_1").expect("in range");
+        assert_eq!(conv.len(), 2);
+        assert_eq!(Conversation::validate_tool_structure(conv.messages()), Ok(()));
+
+        assert!(conv.undo_last_edit());
+        assert_eq!(conv.len(), 4);
+        assert_eq!(conv.messages()[1].tool_calls.as_ref().expect("restored").len(), 1);
+        assert_eq!(conv.messages()[2], Message::tool_result("call_1", "pong"));
+        assert_eq!(Conversation::validate_tool_structure(conv.messages()), Ok(()));
+    }
+
+    /// Unknown calls, non-assistant messages, and out-of-range indices fail
+    /// without side effects: no message moves, no checkpoint records.
+    #[test]
+    fn remove_tool_call_errors_without_side_effects() {
+        let mut conv = transcript();
+        conv.push_message(Message::assistant_tool_calls(vec![call("call_1")]));
+        conv.push_message(Message::tool_result("call_1", "pong"));
+
+        assert!(conv.remove_tool_call(1, "call_9").is_err());
+        assert!(conv.remove_tool_call(9, "call_1").is_err());
+        assert!(conv.remove_tool_call(0, "call_1").is_err(), "a user message");
+        assert_eq!(conv.len(), 4);
+        assert_eq!(conv.undo_depth(), 0);
+    }
+
+    /// Undo of a middle-call removal restores the call at its original
+    /// position, not appended at the end.
+    #[test]
+    fn undo_of_a_removal_restores_the_call_at_its_position() {
+        let mut conv = Conversation::new("be brief");
+        conv.push_user("hi");
+        conv.push_message(Message::assistant_tool_calls(vec![
+            call("call_1"),
+            call("call_2"),
+            call("call_3"),
+        ]));
+        conv.push_message(Message::tool_result("call_1", "one"));
+        conv.push_message(Message::tool_result("call_2", "two"));
+        conv.push_message(Message::tool_result("call_3", "three"));
+
+        conv.remove_tool_call(1, "call_2").expect("in range");
+        assert!(conv.undo_last_edit());
+        assert_eq!(
+            conv.messages()[1]
+                .tool_calls
+                .as_ref()
+                .expect("restored")
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_1", "call_2", "call_3"]
+        );
     }
 
     /// An interrupted turn leaves its calls unanswered; the repair closes the

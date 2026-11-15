@@ -37,6 +37,7 @@ The global file holds top-level keys plus two tables:
 | `default_effort` | string | — | Initial reasoning effort for fresh sessions (`off` included). Set by `Ctrl+S` in the `/model` menu. |
 | `double_press_interrupt` | boolean | `true` | While a turn runs, `Esc`/`Ctrl+C` must be pressed twice to interrupt; the first press only shows a hint. |
 | `max_tool_rounds` | integer | absent | Optional cap on model → tool → model rounds per user turn. |
+| `tool_output_token_limit` | integer | `4000` | Per-output tool result budget, in estimated tokens: an oversized result enters the conversation as head + a truncation notice + tail; the rollout file and the tool card keep the full output. `0` disables the cut. |
 | `[status_bar]` | table | segments on | The footer: `plugin_segments` master switch and `order` display priority for plugin segments, plus the `context` / `cache_rate` toggles for the host's context readout. |
 | `[plugins."<id>"]` | table | — | A plugin's private settings pocket; the host interprets no key. |
 
@@ -46,6 +47,7 @@ default = "openai/gpt-4o-mini"
 default_effort = "high"               # Ctrl+S in /model writes both keys
 # double_press_interrupt = true
 # max_tool_rounds = 64
+# tool_output_token_limit = 4000     # per-output tool result budget (0 = off)
 
 [status_bar]
 plugin_segments = true                # plugin segments in the footer (default on)
@@ -56,6 +58,8 @@ enabled = true                        # start with the meter on (default off)
 ```
 
 `max_tool_rounds` is **unbounded by default**, following codex: the turn ends when the model stops calling tools, errors, or you press `Esc`. Set a value to re-enable the runaway guard — the turn then ends with a `tool round limit reached` error once that many rounds have completed. `64` is the commonly used guardrail.
+
+`tool_output_token_limit` is the per-output budget of the live conversation: the estimate is the same script-weighted count `/usage` renders (ASCII ≈ 4 chars/token, CJK ≈ 1.4). Like codex, the rollout file always stores the full payload and the tool card shows it whole — only what the model sees is trimmed, at record time and again on replay, so a restored session carries the same shape.
 
 `default` is the third step of the startup selection chain: `--provider`/`--model` > active profile's `default` > `config.toml` `default` > first model of first instance. It names one model of one instance as `"provider/model"`, parsed at the first slash, so model ids may themselves contain `/`.
 

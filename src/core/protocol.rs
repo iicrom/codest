@@ -71,6 +71,13 @@ pub enum Op {
     /// tool fields are untouched, so edits can never break the wire shape.
     /// Answered with a `ConversationSnapshot`, or an `Error`.
     EditMessage { index: usize, content: String },
+    /// Splice one tool call out of the transcript message at `index` (the
+    /// `/context` viewer's tool-round drill-down), together with the result
+    /// message answering it — the pair goes as one, so the tool wire shape
+    /// stays satisfied. A round emptied this way keeps its text (the message
+    /// becomes a plain assistant message) or goes entirely when it had none.
+    /// Answered with a `ConversationSnapshot`, or an `Error`.
+    DeleteToolCall { index: usize, call_id: String },
     /// Undo the most recent delete/edit (`/context` checkpoints). Each
     /// mutation records its inverse; this pops and applies it. Answered with
     /// a `ConversationSnapshot`, or an `Error` when nothing is reversible.
@@ -168,9 +175,9 @@ pub enum EventMsg {
     ToolsSwitched { enabled: Vec<String> },
     /// The active conversation, as asked by `Op::InspectConversation` and
     /// re-sent as the confirmation of every context mutation
-    /// (`DeleteMessages` / `EditMessage` / `UndoContextEdit`) so the
-    /// `/context` viewer refreshes atomically from the worker's own state.
-    /// System prompt first, then the transcript.
+    /// (`DeleteMessages` / `DeleteToolCall` / `EditMessage` /
+    /// `UndoContextEdit`) so the `/context` viewer refreshes atomically from
+    /// the worker's own state. System prompt first, then the transcript.
     ConversationSnapshot { messages: Vec<Message> },
     /// The worker has stopped.
     ShutdownComplete,

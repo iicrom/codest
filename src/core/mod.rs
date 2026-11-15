@@ -41,6 +41,7 @@ pub mod sse;
 pub mod tokens;
 pub mod tools;
 pub mod tools_switch;
+pub mod truncate;
 pub mod usage;
 
 pub use commands::{

@@ -37,6 +37,7 @@ codest 的状态全部在 `~/.codest` 下（根目录可用 `CODEST_HOME` 覆盖
 | `default_effort` | string | — | 新会话的初始推理 effort（含 `off`）。由 `/model` 菜单的 `Ctrl+S` 写入。 |
 | `double_press_interrupt` | boolean | `true` | 回合进行中，`Esc`/`Ctrl+C` 需连按两次才中断；第一次按下只显示提示。 |
 | `max_tool_rounds` | integer | 缺省 | 每个用户回合「模型 → 工具 → 模型」轮数的可选上限。 |
+| `tool_output_token_limit` | integer | `4000` | 单条工具结果进入会话的预算（估算 token）：超限的结果以「头部 + 截断提示 + 尾部」进入对话；rollout 文件与工具卡片保留完整输出。`0` 关闭裁剪。 |
 | `[status_bar]` | table | 分段开启 | 页脚：`plugin_segments` 总开关与插件分段的 `order` 显示优先级，外加宿主上下文读数的 `context` / `cache_rate` 开关。 |
 | `[plugins."<id>"]` | table | — | 插件私有的配置口袋；宿主不解释任何键。 |
 
@@ -46,6 +47,7 @@ default = "openai/gpt-4o-mini"
 default_effort = "high"               # /model 里 Ctrl+S 同时写入这两个键
 # double_press_interrupt = true
 # max_tool_rounds = 64
+# tool_output_token_limit = 4000     # 单条工具结果进入会话的预算（0 = 关闭）
 
 [status_bar]
 plugin_segments = true                # 页脚显示插件分段（默认开启）
@@ -56,6 +58,8 @@ enabled = true                        # 启动即开启计量（默认关闭）
 ```
 
 `max_tool_rounds` **默认不设上限**（与 codex 一致）：模型不再调工具、出错或按 `Esc` 才结束回合。设置数值即重新启用失控兜底——完成该轮数后回合以 `tool round limit reached` 错误结束。`64` 是常用的兜底值。
+
+`tool_output_token_limit` 是实时对话的单条工具输出预算：估算与 `/usage` 渲染用的是同一套按文字类型加权的计数（ASCII ≈ 4 字符/token，CJK ≈ 1.4）。与 codex 相同，rollout 文件始终保留完整原文，工具卡片也完整显示——被裁剪的只有模型看到的内容，记录时与回放时各裁一次，恢复的会话因此与实时会话看到同样的形状。
 
 `default` 是启动选择链的第三环：`--provider`/`--model` > 激活 profile 的 `default` > `config.toml` 的 `default` > 第一个实例的第一个模型。它以 `"provider/model"` 指名某个实例的某个模型，在第一个 `/` 处解析，因此模型 id 本身可以带 `/`。
 
