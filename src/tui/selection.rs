@@ -15,6 +15,15 @@
 //! its foreground — a solid highlight that reads like a native terminal's.
 //! Extraction ([`slice_line`]) walks the same spans, so what is copied is
 //! exactly what is highlighted, wide characters included whole.
+//!
+//! Copied text is *not* the raw screen text: the transcript's own chrome is
+//! decoration, not content. A card's `┌ │ └` spine, the two-column indent a
+//! message's wrapped rows hang under, and the `• ` / `▎ ` markers markdown
+//! puts in front are all there to make the screen readable, and pasting them
+//! into an editor leaves a stripe of box-drawing characters down the left.
+//! [`join_rows`] removes the *common* indent of a copied block, so a
+//! multi-row copy comes out as the text the user selected, with the relative
+//! indentation that carries meaning — code, nested lists — intact.
 
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -253,6 +262,81 @@ pub fn slice_line(line: &Line<'_>, from: usize, to: usize) -> String {
     out
 }
 
+/// The glyphs the transcript draws as chrome instead of content: the card
+/// spine (`┌ │ └`), markdown's block markers (`▎ │ • `), and the gutter glyph
+/// of each cell kind (`› ! ■ ▪ ● ✗`).
+const CHROME: &str = "│┌└┏┓┗┛▎┃•›■▪●✗";
+
+/// Whether `c` is decoration: one of [`CHROME`], or a blank — a marker never
+/// sits flush against the text it introduces, and a nested list item steps in
+/// by blanking its parent's marker, so blanks carry no content either.
+fn is_decoration(c: char) -> bool {
+    c.is_whitespace() || CHROME.contains(c)
+}
+
+/// How many display columns of chrome and blanks `row` starts with, and where
+/// that run ends in the string.
+fn decoration_end(row: &str) -> (usize, usize) {
+    let mut width = 0usize;
+    for (index, c) in row.char_indices() {
+        if !is_decoration(c) {
+            return (width, index);
+        }
+        width += crate::tui::wrap::char_width(c);
+    }
+    (width, row.len())
+}
+
+/// The text a copy of `rows` produces.
+///
+/// The transcript's left chrome is decoration, not content: copying a card's
+/// body or a message's wrapped rows verbatim would paste a column of `│` and
+/// the indent hanging under it into the user's editor. So the block's
+/// **common** indent comes off — every row loses the narrowest leading
+/// decoration run in the selection — while whatever a row carries beyond that
+/// stays: code keeps its relative indentation, a diff row its `+`/`-` sign,
+/// and a nested list its nesting. A single row therefore loses its whole
+/// gutter, and a selection that starts inside the text (its first row already
+/// cut at content) loses nothing at all, because the common run is then zero.
+pub fn join_rows(rows: &[String]) -> String {
+    // Per row: the chrome's width, where it ends, and whether anything is left
+    // after it. Blank rows (and rows that are pure chrome, like a card's
+    // closing ` └ `) have no content to align with, so they never shrink the
+    // common indent.
+    let decorated: Vec<(usize, usize, bool)> = rows
+        .iter()
+        .map(|row| {
+            let (width, at) = decoration_end(row);
+            (width, at, at < row.trim_end().len())
+        })
+        .collect();
+    let common = decorated
+        .iter()
+        .filter(|(_, _, content)| *content)
+        .map(|(width, _, _)| *width)
+        .min()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (index, (row, &(width, at, content))) in rows.iter().zip(&decorated).enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        if !content {
+            // A blank or chrome-only row copies as the blank line it reads as.
+            continue;
+        }
+        // Trailing blanks are the padding the layout drew the row with.
+        let text = row[at..].trim_end();
+        if width > common {
+            out.push_str(&" ".repeat(width - common));
+        }
+        out.push_str(text);
+    }
+    // The blank separator rows a selection can begin or end on are not part of
+    // what was selected; interior blanks stay.
+    out.trim_matches('\n').to_string()
+}
+
 /// The word-class run covering display column `col` in `text`, as
 /// `(start, end)` display columns (end exclusive). Word characters cluster
 /// with their class — alphanumerics plus the path/punctuation companions a
@@ -372,6 +456,72 @@ mod tests {
         };
         apply_overlay(&mut lines, 1, &selection);
         assert!(lines[0].spans.iter().all(|span| span.style.bg.is_none()));
+    }
+
+    #[test]
+    fn joining_rows_strips_the_common_chrome() {
+        // A card body: the `┌ │ └` spine plus the code under it. Every row
+        // loses the spine, and the code's own indentation survives.
+        let rows = vec![
+            " ┌  fn main() {".to_string(),
+            " │      let x = 1;".to_string(),
+            " └  }".to_string(),
+        ];
+        assert_eq!(join_rows(&rows), "fn main() {\n    let x = 1;\n}");
+    }
+
+    #[test]
+    fn joining_rows_keeps_relative_indentation_and_markers() {
+        // A markdown list under a message's two-column indent: one row loses
+        // the whole gutter, the nested one keeps its extra step.
+        let rows = vec![
+            "• item one".to_string(),
+            "  • nested".to_string(),
+            "  continuing".to_string(),
+        ];
+        assert_eq!(join_rows(&rows), "item one\n  nested\ncontinuing");
+        // A diff body keeps its number column and its sign column: nothing of
+        // either is decoration, so the common run stops at the lead.
+        let rows = vec!["    3 +added".to_string(), "    4 -removed".to_string()];
+        assert_eq!(join_rows(&rows), "3 +added\n4 -removed");
+    }
+
+    #[test]
+    fn joining_rows_leaves_a_content_started_selection_alone() {
+        // The first row was cut inside the text, so the common run is zero:
+        // no row is shifted sideways. A row that is only chrome still loses
+        // the glyph, and keeps the column it occupied as blanks — alignment
+        // survives without the decoration.
+        let rows = vec![
+            "e rest of the sentence".to_string(),
+            "  │  second row".to_string(),
+        ];
+        assert_eq!(
+            join_rows(&rows),
+            "e rest of the sentence\n     second row",
+            "no common indent, and no chrome glyph"
+        );
+        // A single row loses its whole gutter.
+        assert_eq!(join_rows(&["  │  hello  ".to_string()]), "hello");
+    }
+
+    #[test]
+    fn joining_rows_ignores_blank_and_chrome_only_rows() {
+        // The blank separator and the closing corner carry no content, so they
+        // must not pull the common indent down to the corner's own width.
+        let rows = vec![
+            " │  first".to_string(),
+            String::new(),
+            " │  second".to_string(),
+            " └  ".to_string(),
+        ];
+        assert_eq!(join_rows(&rows), "first\n\nsecond");
+    }
+
+    #[test]
+    fn joining_rows_leaves_a_single_line_copied_mid_text_alone() {
+        // Nothing decorative in front: a word copy from the middle of a row.
+        assert_eq!(join_rows(&["hello world".to_string()]), "hello world");
     }
 
     #[test]
