@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed
+
+- A multi-row mouse copy no longer carries the transcript's decoration into the clipboard: the block's common left chrome (card `┌ │ └` spine, the wrapped-row indent, markdown's `• ` / `▎ ` markers) is stripped, while relative indentation and the body's own `+`/`-` and number columns stay.
+
 ## [0.2.0] — 2026-11-15
 
 Merge of `feat/plan-plugin` (`e539881`), plus the release bookkeeping this changelog introduces.

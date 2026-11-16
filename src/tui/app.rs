@@ -1833,7 +1833,10 @@ impl App {
     /// The selected text: walk the same layout the last render used, slice
     /// each covered row, and join one output line per screen row. (Wrapped
     /// rows stay separate lines — the wrap happens per cell line, and the
-    /// layout does not carry logical-line boundaries.)
+    /// layout does not carry logical-line boundaries.) The transcript's own
+    /// left chrome — the card spine, the indent wrapped rows hang under —
+    /// comes off in [`selection::join_rows`], so a paste is the text rather
+    /// than the decoration in front of it.
     fn selected_text(&mut self) -> String {
         let Some(selection) = self.selection else {
             return String::new();
@@ -1870,7 +1873,7 @@ impl App {
             rows.push(text);
         }
         self.last_layout = Some(layout);
-        rows.join("\n")
+        crate::tui::selection::join_rows(&rows)
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -9747,6 +9750,65 @@ mod tests {
     /// path, and never touches the real system clipboard.
     fn stub_copy(_: &str) -> crate::tui::clipboard::CopyPath {
         crate::tui::clipboard::CopyPath::Native
+    }
+
+    /// A copy stub that records the text it was handed, for the tests that
+    /// assert on what a selection copies.
+    fn recording_copy(text: &str) -> crate::tui::clipboard::CopyPath {
+        COPIED.with(|slot| *slot.borrow_mut() = Some(text.to_string()));
+        crate::tui::clipboard::CopyPath::Native
+    }
+
+    thread_local! {
+        static COPIED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// The last text [`recording_copy`] was handed.
+    fn last_copied() -> String {
+        COPIED.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn a_multi_row_copy_drops_the_card_chrome() {
+        // A tool card body: `┌ │ └` spine, a number column, then the file's
+        // own indentation. Dragging over the body rows must copy the file's
+        // text — not the spine and not the number column on every row.
+        let mut app = test_app();
+        app.copy_text = recording_copy;
+        app.view_mut().history.push(HistoryCell::ToolCall {
+            name: "read".to_string(),
+            arguments: r#"{"path": "src/main.rs"}"#.to_string(),
+            result: "     1\tfn main() {\n     2\t    let x = 1;\n     3\t}".to_string(),
+            error: None,
+            duration_ms: Some(1_000),
+        });
+        let lines = render_lines(&mut app, 60, 14);
+        // The body rows are the ones carrying the card spine.
+        let rows: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with(['│', '┌', '└']))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(rows.len(), 3, "the body renders: {lines:#?}");
+        let top = rows[0] as u16;
+        let bottom = rows[2] as u16;
+        let at = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        use MouseEventKind as K;
+
+        // Drag from the first body row down past the last: the whole body.
+        app.handle_mouse(at(K::Down(MouseButton::Left), 0, top));
+        app.handle_mouse(at(K::Drag(MouseButton::Left), 59, bottom));
+        app.handle_mouse(at(K::Up(MouseButton::Left), 59, bottom));
+        // The spine is the card's decoration, so it comes off every row; the
+        // body's own number column is content and stays, like a diff's sign.
+        assert_eq!(last_copied(), "1 fn main() {\n2     let x = 1;\n3 }");
+        crate::plugins::builtin::TPS.reset_for_test();
     }
 
     #[tokio::test]
