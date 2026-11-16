@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-17
+
+Hotfix on `main` (`a9cd72e`), no merge — the patch release the release bookkeeping reserves for one.
+
+### Fixed
+
+- An error cell no longer copies with its `! ` gutter. `!` was missing from the chrome set, so a copied error message carried `! ` down the left of every row — the one cell kind whose gutter survived the copy cleanup.
+
 ## [0.3.0] — 2026-11-16
 
 Merge of `fix/copy-strips-decoration` (`f681b98`): the mouse-copy cleanup and the `pwsh` tool's lost-output fix.
