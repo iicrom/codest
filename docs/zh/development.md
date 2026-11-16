@@ -87,6 +87,18 @@ python3 scripts/plugin_smoke.py --skip-git-check
 - **构造上离线。** 任何测试——单元的或冒烟的——都不访问公网。需要服务的都起在 `127.0.0.1` 的 0 号端口并读回实际端口。
 - **状态隔离。** 每个脚本把 `CODEST_HOME` 指向新的临时目录（`$CODEST_HOME`，否则 `$HOME/.codest` 才是真实根目录），既避免碰开发者的状态，也让 `--continue` 用例可复现。
 
+## 分支合并与发版记账
+
+工作通过功能分支落到 `main`，合并本身就是发版事件。每次合并进 `main` 之后，都按下面的顺序做这三步，它属于合并的一部分，而不是之后另开的杂务：
+
+1. **写 changelog。** 在 [`CHANGELOG.md`](../../CHANGELOG.md) 里加一节本次发布的版本：带版本号与日期的标题，然后是 `Added` / `Changed` / `Fixed` / `Internal` 子节（空着的子节直接省略）。写合并进来的分支对用户的可见影响——分支上那些 `feat:` / `fix:` / `perf:` 提交标题是素材，不是正文。顶部的 `[Unreleased]` 小节要保留，发版后重新清空。
+2. **推进小版本号。** 把 `Cargo.toml` 的 `version` 加一个次版本号（`0.2.0` → `0.3.0`），让 `Cargo.lock` 跟上（`cargo update -p codest --offline`，或任意一次构建）。`CHANGELOG.md` 的标题必须与这个号完全一致。不要动 `crates/cst-plugin-api`：那个 crate 跟着契约版本走，不跟发版节奏。
+3. **打 tag。** 在合并提交（或记账提交）上 `git tag vX.Y.Z`，并把 tag 与分支一起推送。
+
+修订号发布（`0.2.1`）留给不经过合并、直接在 `main` 上做的 hotfix；主版本号则是插件或 provider 契约的刻意破坏性变更，要在合并前决定，并写进该版本的 changelog 小节。
+
+这三步是一个提交（`chore(release): vX.Y.Z`）或合并提交的尾部——两种都行，但打 tag 时 `cargo test` 必须是通过的。
+
 ## 新增插件或改文档
 
 插件是链接进二进制的 Rust 代码。要新增插件，从 [plugins.md](../plugins.md) 开始：`Plugin` trait、effect 词表、作为示例的内置插件、装配期校验规则，以及为什么注册表是一个静态数组。如果只是安装来自其他仓库的插件而不在这里编写，[local-plugins.md](../local-plugins.md) 讲仓库外的 wrapper crate、生成的 crate 布局与契约版本规则。
@@ -128,7 +140,8 @@ python3 scripts/plugin_smoke.py --skip-git-check
 
 1. 保证 `cargo test` 通过（完全离线）；
 2. 涉及用户可见流程时，补充或更新对应的冒烟脚本；
-3. 遵循 [Conventional Commits](https://www.conventionalcommits.org)——本仓库历史使用 `feat:` / `fix:` / `chore:` / `test:` 前缀。
+3. 遵循 [Conventional Commits](https://www.conventionalcommits.org)——本仓库历史使用 `feat:` / `fix:` / `chore:` / `test:` 前缀；
+4. 目标分支是功能分支，不是 `main`。把它合并进 `main` 就是发版：changelog 小节、小版本号推进、打 tag——见[分支合并与发版记账](#分支合并与发版记账)。
 
 反馈渲染或 TUI 问题时，附上 `scripts/markdown_smoke.py` 或 `scripts/pty_smoke.py` 的复现会很有帮助。两个脚本都会把捕获的屏幕渲染成纯文本、把每条断言按名字打印为 `PASS` 或 `FAIL`，失败的检查通常能直接从输出里读出来；在脚本里加一条断言也是修复的天然回归测试。
 

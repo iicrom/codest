@@ -49,7 +49,8 @@ codest    # 或：cst
 | 文档 | 内容 | English |
 | --- | --- | --- |
 | [架构](docs/zh/architecture.md) | 消息流、从 codex 提取了什么、项目结构、扩展点。 | [EN](docs/architecture.md) |
-| [开发](docs/zh/development.md) | 构建、离线测试、冒烟脚本、已知边界、路线图、贡献指南。 | [EN](docs/development.md) |
+| [开发](docs/zh/development.md) | 构建、离线测试、冒烟脚本、合并后写 changelog + 推小版本号 + 打 tag 的规则、已知边界、路线图、贡献指南。 | [EN](docs/development.md) |
+| [变更日志](CHANGELOG.md) | 已发布的版本，新的在前。每次合并进 `main` 都加一节并推进小版本号。 | — |
 | [设计笔记](docs/README.md#design-notes-chinese-only) | 更深入的设计理由，仅中文：`/provider` 向导、会话 id、`/continue`。 | — |
 
 ## 许可证

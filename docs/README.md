@@ -34,7 +34,8 @@ All user-facing guides are maintained bilingually: English in `docs/`, Chinese m
 | Document | Contents | 中文 |
 | --- | --- | --- |
 | [architecture.md](architecture.md) | The `Op`/`Event` message flow, what was distilled from codex, project layout, extension points. | [zh](zh/architecture.md) |
-| [development.md](development.md) | Build and run, offline test suite, smoke scripts, known limitations, roadmap, contributing. | [zh](zh/development.md) |
+| [development.md](development.md) | Build and run, offline test suite, smoke scripts, the post-merge changelog + version bump + tag rule, known limitations, roadmap, contributing. | [zh](zh/development.md) |
+| [../CHANGELOG.md](../CHANGELOG.md) | Released versions, newest first; one section per merge into `main`. | — |
 
 ## Design notes (Chinese only)
 

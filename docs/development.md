@@ -87,6 +87,18 @@ The server holds no state between requests: it decides what to answer by inspect
 - **Offline by construction.** No test, unit or smoke, reaches the public internet. Anything that needs a server starts one on `127.0.0.1` with port 0 and reads back the chosen port.
 - **State isolation.** Every script points `CODEST_HOME` at a fresh temp directory (`$CODEST_HOME`, else `$HOME/.codest` is the real root), which is how they avoid touching a developer's state and how `--continue` cases are reproducible.
 
+## Branch merge and release bookkeeping
+
+Work lands on `main` through a feature branch, and the merge itself is the release event. Every merge into `main` is followed by the same three steps, in this order, as part of the merge rather than as a later chore:
+
+1. **Write the changelog.** Add a section to [`CHANGELOG.md`](../CHANGELOG.md) for the version being released: a heading with the version and the date, then `Added` / `Changed` / `Fixed` / `Internal` subsections (omit any that stayed empty). Describe the user-visible effect of the merged branch — the `feat:` / `fix:` / `perf:` subjects of its commits are the raw material, not the text. Keep the `[Unreleased]` section at the top and leave it empty again after the release.
+2. **Roll the minor version.** Bump `version` in `Cargo.toml` by one minor step (`0.2.0` → `0.3.0`) and let `Cargo.lock` follow (`cargo update -p codest --offline`, or any build). The `CHANGELOG.md` section heading must carry exactly the same number. Do not bump `crates/cst-plugin-api`: that crate is versioned by its contract, not by release cadence.
+3. **Tag the commit.** `git tag vX.Y.Z` on the merge (or on the bookkeeping commit) and push the tag with the branch.
+
+A patch release (`0.2.1`) is reserved for a `main` hotfix that ships without a merge; a major bump is a deliberate breaking change to the plugin or provider contract, decided before the merge and noted in its changelog section.
+
+The three steps are one commit (`chore(release): vX.Y.Z`) or the tail of the merge commit — either way `cargo test` has to be green when the tag is cut.
+
 ## Adding a plugin or touching docs
 
 A plugin is Rust code linked into the binary. If you are adding one, start with [plugins.md](plugins.md): the `Plugin` trait, the effect vocabulary, the built-in plugins as examples, the startup validation rules, and the notes on why the registry is a static array. If you are installing a plugin from another repository rather than writing one here, [local-plugins.md](local-plugins.md) covers the out-of-tree wrapper crate, the generated crate layout, and contract versioning.
@@ -128,7 +140,8 @@ Issues and pull requests are welcome. For a PR, please:
 
 1. Keep `cargo test` green (it is fully offline);
 2. Add or update the relevant smoke script if you touch a user-visible flow;
-3. Follow [Conventional Commits](https://www.conventionalcommits.org) — the history is `feat:` / `fix:` / `chore:` / `test:`.
+3. Follow [Conventional Commits](https://www.conventionalcommits.org) — the history is `feat:` / `fix:` / `chore:` / `test:`;
+4. Target a feature branch, not `main`. Merging that branch into `main` is the release: changelog section, minor version bump, tag — see [Branch merge and release bookkeeping](#branch-merge-and-release-bookkeeping).
 
 If you are reporting a rendering or TUI bug, a `scripts/markdown_smoke.py` or `scripts/pty_smoke.py` reproduction helps a lot. Both render the captured screen to plain text and print every assertion as `PASS` or `FAIL` with a name, so the failing check can usually be read straight off the output; a new assertion in that script is also the natural regression test for the fix.
 

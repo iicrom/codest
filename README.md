@@ -49,7 +49,8 @@ Highlights: multi-provider switching with `/model`, named profiles, `bash`/`pwsh
 | Document | Contents | 中文 |
 | --- | --- | --- |
 | [Architecture](docs/architecture.md) | Message flow, what was distilled from codex, project layout, extension points. | [中文](docs/zh/architecture.md) |
-| [Development](docs/development.md) | Build, offline test suite, smoke scripts, known limitations, roadmap, contributing. | [中文](docs/zh/development.md) |
+| [Development](docs/development.md) | Build, offline test suite, smoke scripts, the post-merge changelog + version bump + tag rule, known limitations, roadmap, contributing. | [中文](docs/zh/development.md) |
+| [Changelog](CHANGELOG.md) | Released versions, newest first. Every merge into `main` adds a section and rolls the minor version. | — |
 | [Design notes](docs/README.md#design-notes-chinese-only) | Deeper rationale, Chinese only: `/provider` wizard, session ids, `/continue`. | — |
 
 ## License
