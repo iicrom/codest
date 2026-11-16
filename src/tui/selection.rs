@@ -265,7 +265,7 @@ pub fn slice_line(line: &Line<'_>, from: usize, to: usize) -> String {
 /// The glyphs the transcript draws as chrome instead of content: the card
 /// spine (`┌ │ └`), markdown's block markers (`▎ │ • `), and the gutter glyph
 /// of each cell kind (`› ! ■ ▪ ● ✗`).
-const CHROME: &str = "│┌└┏┓┗┛▎┃•›■▪●✗";
+const CHROME: &str = "│┌└┏┓┗┛▎┃•›!■▪●✗";
 
 /// Whether `c` is decoration: one of [`CHROME`], or a blank — a marker never
 /// sits flush against the text it introduces, and a nested list item steps in
@@ -516,6 +516,23 @@ mod tests {
             " └  ".to_string(),
         ];
         assert_eq!(join_rows(&rows), "first\n\nsecond");
+    }
+
+    #[test]
+    fn joining_rows_strips_the_error_cells_gutter() {
+        // An error cell prefixes its first row with `! ` and hangs the wrapped
+        // rows under it in blanks — the same two-column gutter as the user
+        // prompt's `› `. `!` was missing from CHROME (the comment above it
+        // claimed the glyph; the const disagreed), so an error copy kept the
+        // `! ` stripe the cleanup exists to remove.
+        let rows = vec![
+            "! Something failed".to_string(),
+            "  while reading Cargo.toml".to_string(),
+        ];
+        assert_eq!(
+            join_rows(&rows),
+            "Something failed\nwhile reading Cargo.toml"
+        );
     }
 
     #[test]
