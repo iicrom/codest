@@ -1602,9 +1602,12 @@ mod tests {
         assert_eq!(entry("mode"), "fullscreen");
         assert_eq!(entry("context"), "9.3k/200.0k (4%)");
         assert_eq!(entry("tokens"), "session in 16.2k / out 2.4k");
+        // The shell tool is the host's own (`pwsh` on Windows, `bash`
+        // elsewhere), so the plugin listing must not hardcode one platform.
+        let shell = if cfg!(windows) { "pwsh" } else { "bash" };
         assert_eq!(
             entry("plugins"),
-            "help, clear, quit, status, continue, tps, ask_user_question, bash, fs"
+            format!("help, clear, quit, status, continue, tps, ask_user_question, {shell}, fs")
         );
     }
 }

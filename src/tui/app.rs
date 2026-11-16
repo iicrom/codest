@@ -7500,9 +7500,12 @@ mod tests {
                 .clone()
         };
         assert_eq!(entry("backend"), "test/one");
+        // `pwsh` on Windows, `bash` elsewhere — see the shell tool's platform
+        // alias; a hardcoded name would fail on the other host.
+        let shell = if cfg!(windows) { "pwsh" } else { "bash" };
         assert_eq!(
             entry("plugins"),
-            "help, clear, quit, status, continue, tps, ask_user_question, bash, fs"
+            format!("help, clear, quit, status, continue, tps, ask_user_question, {shell}, fs")
         );
     }
 
