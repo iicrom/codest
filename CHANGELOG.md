@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-16
+
+Merge of `fix/copy-strips-decoration` (`f681b98`): the mouse-copy cleanup and the `pwsh` tool's lost-output fix.
+
 ### Fixed
 
 - A multi-row mouse copy no longer carries the transcript's decoration into the clipboard: the block's common left chrome (card `┌ │ └` spine, the wrapped-row indent, markdown's `• ` / `▎ ` markers) is stripped, while relative indentation and the body's own `+`/`-` and number columns stay.
