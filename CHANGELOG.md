@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 ### Fixed
 
 - A multi-row mouse copy no longer carries the transcript's decoration into the clipboard: the block's common left chrome (card `┌ │ └` spine, the wrapped-row indent, markdown's `• ` / `▎ ` markers) is stripped, while relative indentation and the body's own `+`/`-` and number columns stay.
+- The `pwsh` tool no longer swallows table-shaped output. The epilogue ended with `exit 0`, which tears the runspace down before PowerShell's implicit formatting pass writes the pending objects, so `Get-ChildItem | Select-Object Mode,Name` — the usual first call of a session — reached the model as a bare `[exit code: 0]`. The epilogue now sets the code with `$host.SetShouldExit(...)`, which records the process exit code and still lets the formatter flush; string and `Out-String` pipelines were never affected, which is why only tables looked empty.
 
 ## [0.2.0] — 2026-11-15
 

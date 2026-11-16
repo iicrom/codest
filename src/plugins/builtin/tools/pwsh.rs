@@ -43,8 +43,11 @@ Microsoft.PowerShell`, or put `pwsh` on `PATH`.";
 ///   output (and writes its own) with this encoding, which can still follow
 ///   the console's legacy code page. Pinning UTF-8 keeps `cargo build` and
 ///   friends readable; the `try` covers a host that refuses the assignment.
+/// * `$__codest_failed` — initialized here so the `catch` can flag itself
+///   without `exit` (see [`EPILOGUE`]) and the epilogue can still consult it.
 const PREAMBLE: &str = r#"$ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
+$__codest_failed = $false
 try {
 "#;
 
@@ -55,16 +58,27 @@ try {
 /// statements below would otherwise overwrite `$?` before it is consulted.
 /// A native command's code wins (that is what a build failure looks like); a
 /// failing cmdlet, which only sets `$?`, becomes `1`.
+///
+/// **The exit code is set with `$host.SetShouldExit`, never with `exit`.**
+/// `exit` tears the runspace down immediately, before PowerShell's implicit
+/// formatting pass has written the pending output, so a pipeline that emits
+/// *objects* — `Get-ChildItem | Select-Object Mode,Name`, i.e. anything the
+/// model reaches for first — came back as an empty transcript with a cheerful
+/// `[exit code: 0]` footer. `SetShouldExit` records the code the process will
+/// exit with and lets the statements run to completion, so the formatter still
+/// flushes. Measured: 0 of 5 runs kept only the footer under `exit 0`, 5 of 5
+/// kept the table under `SetShouldExit(0)`.
 const EPILOGUE: &str = r#"
 } catch {
   [Console]::Error.WriteLine($_)
-  exit 1
+  $__codest_failed = $true
 }
 $__codest_ok = $?
 $__codest_code = $LASTEXITCODE
-if ($null -ne $__codest_code -and $__codest_code -ne 0) { exit $__codest_code }
-if (-not $__codest_ok) { exit 1 }
-exit 0
+if ($__codest_failed) { $host.SetShouldExit(1) }
+elseif ($null -ne $__codest_code -and $__codest_code -ne 0) { $host.SetShouldExit($__codest_code) }
+elseif (-not $__codest_ok) { $host.SetShouldExit(1) }
+else { $host.SetShouldExit(0) }
 "#;
 
 /// The model-facing schema. Identical in shape to [`super::bash`]'s — same
@@ -187,6 +201,32 @@ mod tests {
             out.contains(cwd.to_string_lossy().as_ref()),
             "{out} vs {cwd:?}"
         );
+    }
+
+    #[test]
+    fn keeps_a_formatted_table_intact() {
+        // The regression this file exists to keep out: `exit` in the epilogue
+        // tore the runspace down before PowerShell's implicit formatting pass
+        // wrote anything, so an object pipeline reached the model as an empty
+        // transcript with a `[exit code: 0]` footer. A `Select-Object` result
+        // is formatted at exit, not while it streams — a plain string is not,
+        // which is why only table-shaped commands looked "empty".
+        let out = run_json(r#"{"command": "Get-ChildItem Cargo.toml | Select-Object Name,Length"}"#)
+            .expect("run");
+        assert!(out.contains("Cargo.toml"), "{out}");
+        assert!(out.contains("[exit code: 0]"), "{out}");
+    }
+
+    #[test]
+    fn a_native_commands_code_reaches_the_footer_without_losing_the_table() {
+        // The exit code and the pending formatted output must both survive:
+        // `SetShouldExit` records the code and lets the formatter flush.
+        let out = run_json(
+            r#"{"command": "Get-ChildItem Cargo.toml | Select-Object Name; cmd /c exit 5"}"#,
+        )
+        .expect("run");
+        assert!(out.contains("Cargo.toml"), "{out}");
+        assert!(out.contains("[exit code: 5]"), "{out}");
     }
 
     #[test]
