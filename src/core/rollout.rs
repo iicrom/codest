@@ -189,6 +189,11 @@ pub enum RolloutItem {
     ToolResult {
         tool_call_id: String,
         content: String,
+        /// Images the tool attached (`read_image`), inline data URLs. Empty
+        /// for every text-only tool and absent in files written before image
+        /// tools existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::core::tools::ToolImage>,
     },
     Renamed {
         name: String,
@@ -571,9 +576,11 @@ pub fn load_session_with_limit(
             RolloutItem::ToolResult {
                 tool_call_id,
                 content,
-            } => messages.push(Message::tool_result(
+                images,
+            } => messages.push(Message::tool_result_with_images(
                 tool_call_id,
                 crate::core::truncate::truncate_tool_output(&content, tool_output_token_limit),
+                images,
             )),
             RolloutItem::Renamed { name: renamed } => name = Some(renamed),
             RolloutItem::Cleared => {
@@ -701,10 +708,9 @@ pub fn load_session_with_limit(
                 });
                 let call_ok = messages.get(index).is_some_and(|message| {
                     message.role == Role::Assistant
-                        && message
-                            .tool_calls
-                            .as_ref()
-                            .is_some_and(|calls| calls.get(position).is_some_and(|found| found.id == call.id))
+                        && message.tool_calls.as_ref().is_some_and(|calls| {
+                            calls.get(position).is_some_and(|found| found.id == call.id)
+                        })
                 });
                 // A whole-message removal replays only when the transcript
                 // still holds exactly the recorded snapshot (the round with
@@ -734,10 +740,7 @@ pub fn load_session_with_limit(
                     }
                     messages.remove(index);
                 } else if let Some(message) = messages.get_mut(index) {
-                    let calls = message
-                        .tool_calls
-                        .as_mut()
-                        .expect("checked above");
+                    let calls = message.tool_calls.as_mut().expect("checked above");
                     calls.remove(position);
                     if calls.is_empty() {
                         message.tool_calls = None;
@@ -1138,12 +1141,14 @@ mod tests {
             .append(&RolloutItem::ToolResult {
                 tool_call_id: "c1".to_string(),
                 content: "one".to_string(),
+                images: Vec::new(),
             })
             .expect("append");
         rollout
             .append(&RolloutItem::ToolResult {
                 tool_call_id: "c2".to_string(),
                 content: "two".to_string(),
+                images: Vec::new(),
             })
             .expect("append");
         (dir, rollout)
@@ -1235,6 +1240,7 @@ mod tests {
             .append(&RolloutItem::ToolResult {
                 tool_call_id: "c1".to_string(),
                 content: "one".to_string(),
+                images: Vec::new(),
             })
             .expect("append");
         rollout
@@ -1300,6 +1306,7 @@ mod tests {
             .append(&RolloutItem::ToolResult {
                 tool_call_id: "c1".to_string(),
                 content: content.clone(),
+                images: Vec::new(),
             })
             .expect("append");
 
@@ -1855,6 +1862,7 @@ mod tests {
             .append(&RolloutItem::ToolResult {
                 tool_call_id: "call_1".to_string(),
                 content: "pong".to_string(),
+                images: Vec::new(),
             })
             .expect("append");
         let loaded = load_session(&rollout.path).expect("load");

@@ -1843,7 +1843,7 @@ async fn execute_tool_call(
                 tokio::select! {
                     biased;
                     _ = turn.cancel.cancelled() => return false,
-                    outcome = tokio::task::spawn_blocking(move || executor.execute(&owned)) => {
+                    outcome = tokio::task::spawn_blocking(move || executor.execute_output(&owned)) => {
                         outcome
                             .unwrap_or_else(|error| Err(format!("tool `{}` task failed: {error}", call.name)))
                     }
@@ -1855,9 +1855,9 @@ async fn execute_tool_call(
             )),
         }
     };
-    let (result, error) = match outcome {
-        Ok(output) => (output, None),
-        Err(message) => (String::new(), Some(message)),
+    let (result, images, error) = match outcome {
+        Ok(output) => (output.text, output.images, None),
+        Err(message) => (String::new(), Vec::new(), Some(message)),
     };
     let content = match &error {
         Some(message) => format!("error: {message}"),
@@ -1876,16 +1876,20 @@ async fn execute_tool_call(
     // Two copies, like codex: the conversation gets the budget-trimmed
     // result (head, notice, tail), while the rollout and the tool card's
     // event above keep the full payload. Replays apply the same cut, so a
-    // restored session sees what a live one saw.
-    conversation.push_message(Message::tool_result(
+    // restored session sees what a live one saw. Attached images are part of
+    // the result, not of the text budget: the bytes are already bounded by
+    // the image tool's own resize, and trimming base64 would corrupt them.
+    conversation.push_message(Message::tool_result_with_images(
         &call.id,
         crate::core::truncate::truncate_tool_output(&content, deps.tool_output_token_limit),
+        images.clone(),
     ));
     rollouts.append(
         current,
         RolloutItem::ToolResult {
             tool_call_id: call.id,
             content,
+            images,
         },
     );
     true
@@ -2042,6 +2046,7 @@ fn finalize_aborted(
             RolloutItem::ToolResult {
                 tool_call_id: id,
                 content,
+                images: Vec::new(),
             },
         );
     }
@@ -4836,6 +4841,97 @@ mod tests {
         assert!(raw.contains(&"x".repeat(1_000)), "the full payload is kept");
         let loaded = crate::core::rollout::load_session(&path).expect("load");
         assert!(loaded.messages[2].content.contains("tokens truncated …"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tool that returns an image (`read_image`): the conversation message
+    /// carries it, the next round's request would include it, and the rollout
+    /// replays it — so a resumed session still holds the picture the model
+    /// saw.
+    #[tokio::test]
+    async fn tool_images_reach_the_conversation_and_survive_a_replay() {
+        struct ImageExecutor;
+        impl ToolExecutor for ImageExecutor {
+            fn execute(&self, _call: &ToolCall) -> Result<String, String> {
+                // The turn runner reads results through `execute_output`, so
+                // this text-only half is never reached for an image tool.
+                Err("images only".to_string())
+            }
+
+            fn execute_output(
+                &self,
+                _call: &ToolCall,
+            ) -> Result<crate::core::tools::ToolOutput, String> {
+                Ok(crate::core::tools::ToolOutput::with_images(
+                    "read image shot.png (4x4, image/png, 90 B)",
+                    vec![crate::core::tools::ToolImage {
+                        data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                        mime: "image/png".to_string(),
+                        detail: "high".to_string(),
+                    }],
+                ))
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "codest-tool-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
+            vec![StreamItem::Delta("done".to_string())],
+        ]);
+        let seen = client.snapshots();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                rollout_dir: Some(dir.clone()),
+                cwd: "/tmp/demo".to_string(),
+                tools: vec![PING_SPEC],
+                executor: Some(Arc::new(ImageExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+        session.submit_user_turn("hi");
+        collect_turn(&mut session).await;
+
+        // The second request carries the tool result with its attachment, and
+        // the text is exactly the tool's report — images are not text.
+        let snapshots = seen.lock().expect("lock");
+        assert_eq!(snapshots.len(), 2);
+        let result = snapshots[1]
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("the tool result");
+        assert_eq!(result.content, "read image shot.png (4x4, image/png, 90 B)");
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].mime, "image/png");
+        assert_eq!(
+            result.images[0].data_url,
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+        drop(snapshots);
+
+        session.shutdown();
+        drop(session);
+        let mut paths = crate::core::rollout::list_workspace_sessions(&dir).expect("list");
+        let loaded = crate::core::rollout::load_session(&paths.remove(0)).expect("load");
+        let restored = loaded
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("the replayed tool result");
+        assert_eq!(restored.images.len(), 1);
+        assert_eq!(restored.images[0].detail, "high");
+        assert_eq!(
+            restored.images[0].data_url,
+            "data:image/png;base64,iVBORw0KGgo="
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -31,6 +31,7 @@ use crate::core::model::ModelStream;
 use crate::core::model::StreamItem;
 use crate::core::model::TurnOptions;
 use crate::core::protocol::Message;
+use crate::core::protocol::Role;
 use crate::core::sse::SseDecoder;
 use crate::core::tools::ToolCall;
 use crate::core::tools::ToolSpec;
@@ -157,7 +158,7 @@ impl OpenAiCompatClient {
         let mut body = json!({
             "model": self.model,
             "stream": true,
-            "messages": messages.iter().map(message_json).collect::<Vec<_>>(),
+            "messages": message_list_json(messages),
         });
         let object = body
             .as_object_mut()
@@ -193,8 +194,48 @@ pub fn endpoint_url(base_url: &str) -> String {
     }
 }
 
+/// The `messages` array for a request, in transcript order.
+///
+/// A tool result that carries images needs a second wire message: chat
+/// completions gives `role: "tool"` only text, so the images follow it as a
+/// `user` message with `image_url` content parts — the shape gateway
+/// adapters and MCP clients use (see `cht-provider-qoder`'s `toolMessage`).
+/// The tool message keeps its `tool_call_id` and text, and the user message
+/// is inserted directly after it, before the next round's messages. Every
+/// other message maps one-to-one through [`message_json`].
+fn message_list_json(messages: &[Message]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        out.push(message_json(message));
+        if message.role == Role::Tool && !message.images.is_empty() {
+            let mut parts: Vec<Value> = Vec::with_capacity(message.images.len() + 1);
+            parts.push(json!({
+                "type": "text",
+                "text": format!(
+                    "{} image{} returned by the tool call above; inspect {} below.",
+                    message.images.len(),
+                    if message.images.len() == 1 { "" } else { "s" },
+                    if message.images.len() == 1 { "it" } else { "them" },
+                ),
+            }));
+            for image in &message.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image.data_url,
+                        "detail": image.detail,
+                    },
+                }));
+            }
+            out.push(json!({ "role": "user", "content": parts }));
+        }
+    }
+    out
+}
+
 /// One conversation message on the wire: role and content, plus the
-/// tool-calling fields when present.
+/// tool-calling fields when present. Images never travel here — they ride
+/// the follow-up user message [`message_list_json`] inserts.
 fn message_json(message: &Message) -> Value {
     let mut object = json!({
         "role": message.role.as_str(),
@@ -637,6 +678,65 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "tool");
         assert_eq!(body["messages"][1]["tool_call_id"], "call_1");
         assert_eq!(body["messages"][1]["content"], "pong");
+    }
+
+    /// A tool result that attached an image becomes two wire messages: the
+    /// text-only `tool` result (which must keep its `tool_call_id`), then a
+    /// `user` message carrying an explanatory text part and the image as an
+    /// `image_url` content part. A text-only result stays one message.
+    #[test]
+    fn tool_images_ride_a_follow_up_user_message() {
+        let image = crate::core::tools::ToolImage {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            mime: "image/png".to_string(),
+            detail: "high".to_string(),
+        };
+        let assistant = Message::assistant_tool_calls(vec![crate::core::tools::ToolCall {
+            id: "c1".to_string(),
+            name: "read_image".to_string(),
+            arguments: r#"{"path":"a.png"}"#.to_string(),
+        }]);
+        let result = Message::tool_result_with_images(
+            "c1",
+            "read image a.png (2x2, image/png)",
+            vec![image],
+        );
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+        let body = client.request_body(&[assistant, result], &TurnOptions::default());
+
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(body["messages"][1]["role"], "tool");
+        assert_eq!(body["messages"][1]["tool_call_id"], "c1");
+        assert_eq!(
+            body["messages"][1]["content"],
+            "read image a.png (2x2, image/png)"
+        );
+        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][2]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+        assert_eq!(
+            body["messages"][2]["content"][1]["image_url"]["detail"],
+            "high"
+        );
+
+        // No images → no extra message.
+        let text_only = Message::tool_result("c1", "plain");
+        let body = client.request_body(
+            &[
+                Message::assistant_tool_calls(vec![crate::core::tools::ToolCall {
+                    id: "c1".to_string(),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                }]),
+                text_only,
+            ],
+            &TurnOptions::default(),
+        );
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
     }
 
     #[test]
