@@ -49,6 +49,7 @@ binary. The host side lives in [`src/plugins/mod.rs`](../src/plugins/mod.rs).
 | `system_prompt()` | — | `Option<&'static str>` | `None` |
 | `tools()` | — | `&'static [ToolSpec]` | empty |
 | `run_tool(&ToolCall)` | the raw JSON arguments | `Result<String, PluginError>` | error |
+| `run_tool_output(&ToolCall)` | the raw JSON arguments | `Result<ToolOutput, PluginError>` | wraps `run_tool` |
 | `set_prompt_host(Arc<dyn PromptHost>)` | the front-end's question service | — | no-op |
 | `protocols()` | — | `&'static [&'static dyn ProtocolFactory]` | empty |
 | `auth_providers()` | — | `&'static [AuthProvider]` | empty |
@@ -292,6 +293,12 @@ A hooks-only plugin skips `commands()` entirely and implements, say,
 `ToolSpec { name, description, parameters_json, read_only }` — the schema is
 raw JSON-Schema text so it can live in a `const`. State goes in a `Mutex`,
 via interior mutability like the shipped plugins.
+
+A tool whose result carries an image overrides `run_tool_output` instead and
+returns `ToolOutput { text, images }`; the two methods default to each other,
+so a plugin implements whichever fits. The host reads results through
+`run_tool_output`, keeps the text for the conversation message, and sends the
+images on the following request.
 
 ## 6. Observing the agent: events, status segments, background tasks
 

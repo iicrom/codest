@@ -35,7 +35,7 @@ Rust 类型；代价是新增插件必须重新编译（取舍见第 6 节；
 
 trait 及其交换的数据都在契约 crate
 [`cst-plugin-api`](../../crates/cst-plugin-api/README.md) 里（
-`PLUGIN_API_VERSION` 当前为 `1`），因此外部插件实现契约不需要依赖宿主
+`PLUGIN_API_VERSION` 当前为 `2`），因此外部插件实现契约不需要依赖宿主
 二进制。宿主侧在 [`src/plugins/mod.rs`](../../src/plugins/mod.rs)。
 
 ### trait 方法
@@ -47,6 +47,7 @@ trait 及其交换的数据都在契约 crate
 | `system_prompt()` | — | `Option<&'static str>` | `None` |
 | `tools()` | — | `&'static [ToolSpec]` | 空 |
 | `run_tool(&ToolCall)` | 原始 JSON 参数 | `Result<String, PluginError>` | 报错 |
+| `run_tool_output(&ToolCall)` | 原始 JSON 参数 | `Result<ToolOutput, PluginError>` | 包装 `run_tool` |
 | `set_prompt_host(Arc<dyn PromptHost>)` | 前端的问题服务 | — | 无操作 |
 | `protocols()` | — | `&'static [&'static dyn ProtocolFactory]` | 空 |
 | `auth_providers()` | — | `&'static [AuthProvider]` | 空 |
@@ -269,6 +270,11 @@ cargo clippy --all-targets -- -D warnings
 `ToolSpec { name, description, parameters_json, read_only }`——schema 是
 原始 JSON-Schema 文本，这样它能放进 `const`。状态放在 `Mutex` 里，与内置
 插件一样走内部可变性。
+
+结果要带图片的工具改为重写 `run_tool_output`，返回
+`ToolOutput { text, images }`；两个方法互为默认实现，插件实现适配自己的那个
+即可。宿主通过 `run_tool_output` 读取结果，文本进入会话消息，图片随下一次
+请求发出。
 
 ## 6. 观测 agent：事件流、状态栏分段、后台任务
 

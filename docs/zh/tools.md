@@ -49,6 +49,9 @@ Windows 上值得知道的差异：
 | `read` | 对文本文件做带行号的窗口读取，支持 `offset`（从 1 开始）与 `limit` 续读；拒绝二进制文件并指向宿主的 shell 工具（`bash`/`pwsh`）。标记为 `read_only`。 |
 | `write` | 以完整内容创建或覆盖文件，按需创建父目录。 |
 | `edit` | 通过 `old_string`/`new_string` 做精确字符串替换；要求唯一匹配，或使用 `replace_all`。保留 BOM 与 CRLF，未被改动的行保持原字节。 |
+| `read_image` | 载入本地 PNG/JPEG/GIF/WebP 供视觉查看——即 codex 的 `view_image`。图片按模型的图像预算缩放并附在工具结果上，文本部分说明读了什么、如何准备。标记为 `read_only`。 |
+
+`read_image` 先解码文件，再把它裁进 **patch 预算**（32 像素一个 patch）：`detail: "high"`（默认）允许 2500 个 patch、每边最多 2048 px；`detail: "original"` 允许 10 000 个 patch、6000 px。先压长边，再按面积收缩，保证整数结果落在预算内——2304x864 的截图以 2048x768 抵达。PNG、JPEG、WebP 在无需缩放时逐字节透传；任何重编码（GIF 帧、被缩放的图）都落为 PNG。字节以 inline `data:` URL 传输：chat-completions 请求没有上传文件句柄，而 `role: "tool"` 只能带文本——因此客户端把图片作为紧随其后的 `user` 消息、以 `image_url` content part 发出，这是网关适配器接受的形状。超过 128 MB 的文件与非图片会被拒绝，并在消息里指出下一步（文本走 `read`）。
 
 相对路径一律按工作目录解析。
 
@@ -133,6 +136,7 @@ Windows 上值得知道的差异：
 | --- | --- |
 | `@bash <command>`（Windows 上为 `@pwsh`） | 宿主的 shell 工具，参数 `{"command": "<command>"}` |
 | `@read <path>` | `read`，参数 `{"path": "<path>"}` |
+| `@read-image <path> [high\|original]` | `read_image`，参数 `{"path": "<path>"}`（给了 detail 时一并带上） |
 | `@write <path> <content>` | `write` |
 | `@edit <path> \| <old> \| <new>` | `edit` |
 | `@tool [args…]` | `--tool` 指定的工具（默认 `ping`，没有任何实现），参数来自 `--tool-arguments` |

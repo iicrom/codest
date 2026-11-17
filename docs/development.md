@@ -68,7 +68,7 @@ Each prints one `PASS`/`FAIL` line per assertion and returns a non-zero exit cod
 
 - `POST /chat/completions` — an OpenAI-shaped request in, an SSE stream out (`data:` frames, then `data: [DONE]`), including a final chunk carrying usage. Reasoning deltas precede the visible reply, mirroring reasoning-tuned backends whose `reasoning_content` arrives first;
 - `GET /models` — an OpenAI-shaped model catalog, so `fetch_models` discovery has something to find;
-- keyword triggers — `@bash` (`@pwsh` on Windows, following the host's shell tool), `@read`, `@write`, `@edit`, `@ask-user` map to that built-in tool with the text after the keyword (`@bash ls -la` → `bash` with `{"command": "ls -la"}`); `@write <path> <content>`, `@edit <path> | <old> | <new>`, and `@ask-user <question> | <label> | <label>` (2-4 options, answered through the question dialog) follow a fixed shape; `@tool` calls whatever `--tool` / `--tool-arguments` name;
+- keyword triggers — `@bash` (`@pwsh` on Windows, following the host's shell tool), `@read`, `@read-image`, `@write`, `@edit`, `@ask-user` map to that built-in tool with the text after the keyword (`@bash ls -la` → `bash` with `{"command": "ls -la"}`); `@read-image <path> [high|original]`, `@write <path> <content>`, `@edit <path> | <old> | <new>`, and `@ask-user <question> | <label> | <label>` (2-4 options, answered through the question dialog) follow a fixed shape; `@tool` calls whatever `--tool` / `--tool-arguments` name;
 - plain messages — any message without a keyword gets a help reply that lists these keywords and the endpoints.
 
 The server holds no state between requests: it decides what to answer by inspecting the messages it was sent. A turn that already carries a tool round gets the round-summary reply instead of another call — without that guard the keyword would stay in the user message and the loop would never terminate. That single rule is what lets a smoke test drive the complete agent loop — request, tool call, tool result, follow-up round — with no network and no real model.
@@ -114,7 +114,7 @@ Docs are maintained bilingually: `docs/*.md` is primary, `docs/zh/*.md` mirrors 
 
 ## Known limitations
 
-- Text-only chat: no image input, no approvals, no MCP.
+- Tool-result images (`read_image`) are the one media path: chat input is still text only, there are no approvals, and no MCP.
 - Markdown rendering is a curated subset: no OSC 8 hyperlinks, no key/value table degradation, no mermaid or math; images show alt text and URL only.
 - Plugins are compile-time static: adding or changing one requires a rebuild; no runtime `.so` or script plugins. Plugins run with host privileges — no sandbox.
 - Plugin hooks run synchronously on the TUI thread; no blocking I/O in hooks.

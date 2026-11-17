@@ -124,7 +124,7 @@ codest/
     ├── plugins/
     │   ├── mod.rs             # Plugin trait 宿主 / effects / 协议收集
     │   ├── install.rs         # codest plugin install|uninstall|list|build
-    │   └── builtin/           # 静态注册表：help、clear、quit、status、continue、tps、tools/{shell,bash,pwsh,fs,truncate}
+    │   └── builtin/           # 静态注册表：help、clear、quit、status、continue、tps、tools/{shell,bash,pwsh,fs,image,truncate}
     └── tui/
         ├── app.rs             # 事件循环 / fullscreen & inline 渲染 / 菜单
         ├── session.rs         # 每会话视图状态
