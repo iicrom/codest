@@ -16,6 +16,15 @@
 //! successive pieces of `arguments`), and reassembling them is identical work
 //! for `openai-compat` and for any plugin protocol. It lives here so both
 //! share one implementation instead of re-bugging fragment order twice.
+//!
+//! A tool result is text ([`ToolOutput::text`]) plus, for tools that read or
+//! render media, attached images ([`ToolImage`]). The text-only
+//! [`Plugin::run_tool`](crate::plugin::Plugin::run_tool) contract stays the
+//! simple path: it is what most tools return, and the image-carrying path has
+//! a default that wraps it.
+
+use serde::Deserialize;
+use serde::Serialize;
 
 /// The default cap on model → tool → model rounds in one user turn: none.
 ///
@@ -71,6 +80,78 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// One image attached to a tool result.
+///
+/// Carried inline as a `data:` URL (base64), like codex's `view_image`: a
+/// chat-completions request has no uploaded-file handle, so the bytes travel
+/// with the message. `mime` names the encoding (`image/png`, `image/jpeg`, …)
+/// and is separate from the URL so a front-end can label a card without
+/// decoding it. `detail` is the hint requested from the model backend —
+/// `"high"` for the downscaled default, `"original"` when the tool kept the
+/// source resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolImage {
+    /// `data:<mime>;base64,<payload>`.
+    pub data_url: String,
+    pub mime: String,
+    /// `"high"` or `"original"`, the values the wire's `detail` field takes.
+    pub detail: String,
+}
+
+impl ToolImage {
+    /// The encoded byte length after the data-URL prefix, for status lines
+    /// and token estimates (the base64 payload is 4/3 of the image bytes).
+    pub fn payload_bytes(&self) -> usize {
+        self.data_url
+            .rfind(',')
+            .map(|comma| self.data_url.len() - comma - 1)
+            .unwrap_or(0)
+    }
+}
+
+/// The result of one tool call: its text and any images it attached.
+///
+/// Text-only tools never construct this — [`ToolOutput::text`] wraps a
+/// `String`. A tool that returns an image states what it did in `text`
+/// ("read image … (2304x864 → 2048x768, image/png)") and attaches the
+/// prepared bytes; the model sees the text, the following request carries
+/// the images.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<ToolImage>,
+}
+
+impl ToolOutput {
+    /// A text-only result.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// A result whose text reports on an attached image.
+    pub fn with_images(text: impl Into<String>, images: Vec<ToolImage>) -> Self {
+        Self {
+            text: text.into(),
+            images,
+        }
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(text: &str) -> Self {
+        Self::text(text.to_string())
+    }
+}
+
 /// Executes tool calls on behalf of the worker. Implemented by the plugin
 /// host, which dispatches to the plugin that declared the tool.
 ///
@@ -79,7 +160,18 @@ pub struct ToolCall {
 /// while it runs: implementations may block freely, and an interrupted turn
 /// discards the outcome of a still-running call.
 pub trait ToolExecutor: Send + Sync {
+    /// Execute one call, text only. Required: this is the method every
+    /// existing executor already implements, and it must stay the one a
+    /// text-only executor writes — a pair of mutually defaulted methods would
+    /// recurse forever on a type that implements neither.
     fn execute(&self, call: &ToolCall) -> Result<String, String>;
+
+    /// Execute one call, images included. The default wraps [`Self::execute`]
+    /// with no images, so an executor that overrides only [`Self::execute`]
+    /// compiles and behaves exactly as before.
+    fn execute_output(&self, call: &ToolCall) -> Result<ToolOutput, String> {
+        self.execute(call).map(ToolOutput::text)
+    }
 }
 
 /// Reassembles streamed `delta.tool_calls` fragments into complete calls.
@@ -160,11 +252,7 @@ impl ToolCallAccumulator {
                 },
             })
             .collect::<Vec<_>>();
-        if calls.is_empty() {
-            None
-        } else {
-            Some(calls)
-        }
+        if calls.is_empty() { None } else { Some(calls) }
     }
 }
 
@@ -185,11 +273,23 @@ mod tests {
         assert_eq!(function["description"], "reply with pong");
         assert_eq!(function["parameters"]["properties"]["n"]["type"], "integer");
 
-        let empty = ToolSpec { parameters_json: "", ..spec };
-        assert_eq!(empty.function_json()["function"]["parameters"], serde_json::json!({ "type": "object" }));
+        let empty = ToolSpec {
+            parameters_json: "",
+            ..spec
+        };
+        assert_eq!(
+            empty.function_json()["function"]["parameters"],
+            serde_json::json!({ "type": "object" })
+        );
 
-        let malformed = ToolSpec { parameters_json: "not json", ..spec };
-        assert_eq!(malformed.function_json()["function"]["parameters"], serde_json::json!({ "type": "object" }));
+        let malformed = ToolSpec {
+            parameters_json: "not json",
+            ..spec
+        };
+        assert_eq!(
+            malformed.function_json()["function"]["parameters"],
+            serde_json::json!({ "type": "object" })
+        );
     }
 
     #[test]
@@ -200,6 +300,9 @@ mod tests {
             arguments: r#"{ "n": 2 }"#.to_string(),
         };
         let text = serde_json::to_string(&call).expect("serialize");
-        assert_eq!(serde_json::from_str::<ToolCall>(&text).expect("deserialize"), call);
+        assert_eq!(
+            serde_json::from_str::<ToolCall>(&text).expect("deserialize"),
+            call
+        );
     }
 }

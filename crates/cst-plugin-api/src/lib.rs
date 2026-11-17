@@ -114,4 +114,6 @@ pub use tools::DEFAULT_MAX_TOOL_ROUNDS;
 pub use tools::ToolCall;
 pub use tools::ToolCallAccumulator;
 pub use tools::ToolExecutor;
+pub use tools::ToolImage;
+pub use tools::ToolOutput;
 pub use tools::ToolSpec;
