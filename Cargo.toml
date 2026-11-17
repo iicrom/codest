@@ -27,10 +27,22 @@ path = "src/bin/cst.rs"
 [dependencies]
 anyhow = "1"
 async-stream = "0.3"
+# The `read_image` tool's data-URL encoding (base64 of the prepared bytes).
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 cst-plugin-api = { path = "crates/cst-plugin-api", version = "0.2.0" }
 futures-util = "0.3"
+# Decoding, downscaling, and re-encoding for the `read_image` tool. The four
+# formats vision backends accept are exactly what chat-completions image
+# input takes, so the default set is trimmed to them: avif/exr/tiff/dds add
+# heavy codecs (ravif pulls a C/asm build) for formats no model reads.
+image = { version = "0.25", default-features = false, features = [
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
 pulldown-cmark = { version = "0.13", default-features = false }
 # Only the crossterm backend is used (plus TestBackend in tests), so the
 # default set is dropped: `all-widgets` (calendar → `time` crate) and the

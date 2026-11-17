@@ -1,4 +1,4 @@
-//! The `fs` tools: `read`, `write`, and `edit`.
+//! The `fs` tools: `read`, `write`, `edit`, and `read_image`.
 //!
 //! * `read` — line-numbered window over a text file (dsh's caps: 2000
 //!   chars/line, 50 KB total) with an `offset` continuation hint from pi.
@@ -7,16 +7,22 @@
 //!   `replace_all` semantics: exactly one match unless `replace_all`), with
 //!   pi's BOM strip/restore and CRLF preservation so the untouched lines
 //!   keep their bytes.
+//! * `read_image` — codex's `view_image`: decode a local image, downscale it
+//!   to the model's image budget, and attach the bytes to the tool result
+//!   (see [`super::image`]).
 //!
-//! All paths resolve against the working directory when relative. Reads are
-//! `read_only`; writes and edits are not — that flag drives `/tools` markers
-//! and the future read-only profiles.
+//! All paths resolve against the working directory when relative. Reads and
+//! images are `read_only`; writes and edits are not — that flag drives
+//! `/tools` markers and the future read-only profiles.
 
 use std::path::PathBuf;
 
+use cst_plugin_api::tools::ToolOutput;
+
+use super::SHELL_TOOL_NAME;
+use super::image;
 use super::truncate;
 use super::workdir;
-use super::SHELL_TOOL_NAME;
 
 /// Lines `read` returns when the model does not ask for a window.
 const DEFAULT_LIMIT: usize = truncate::MAX_LINES;
@@ -41,10 +47,7 @@ fn resolve_path(raw: &str) -> Result<PathBuf, String> {
 }
 
 /// Pull a string argument out of a parsed JSON object.
-fn arg_string<'a>(
-    parsed: &'a serde_json::Value,
-    key: &str,
-) -> Result<&'a str, String> {
+fn arg_string<'a>(parsed: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
     parsed
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -53,8 +56,8 @@ fn arg_string<'a>(
 
 /// `read`: a line-numbered window over a text file.
 pub(crate) fn run_read(arguments: &str) -> Result<String, String> {
-    let parsed: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid arguments: {error}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
     let path = resolve_path(arg_string(&parsed, "path")?)?;
     let offset = match parsed.get("offset") {
         None | Some(serde_json::Value::Null) => 1usize,
@@ -84,8 +87,15 @@ pub(crate) fn run_read(arguments: &str) -> Result<String, String> {
     let bytes = std::fs::read(&path).map_err(|error| read_error(&path, error))?;
     let head = &bytes[..bytes.len().min(4096)];
     if head.contains(&0u8) {
+        // An image is the one binary a tool can actually consume: point the
+        // model at `read_image` before falling back to the shell.
+        let hint = if image::looks_like_an_image(head) {
+            "if it is an image, use `read_image`; otherwise use"
+        } else {
+            "use"
+        };
         return Err(format!(
-            "`{}` looks like a binary file; use `{}` with a targeted command instead",
+            "`{}` looks like a binary file; {hint} `{}` with a targeted command instead",
             path.display(),
             SHELL_TOOL_NAME
         ));
@@ -109,13 +119,7 @@ pub(crate) fn run_read(arguments: &str) -> Result<String, String> {
     let window: Vec<String> = all_lines[offset - 1..(offset - 1 + limit).min(total)]
         .iter()
         .enumerate()
-        .map(|(index, line)| {
-            format!(
-                "{:>6}\t{}",
-                offset + index,
-                truncate::clip_line(line)
-            )
-        })
+        .map(|(index, line)| format!("{:>6}\t{}", offset + index, truncate::clip_line(line)))
         .collect();
     let (mut kept, dropped) = truncate::truncate_head(&window, offset);
     if dropped == 0 {
@@ -137,11 +141,48 @@ fn read_error(path: &std::path::Path, error: std::io::Error) -> String {
     }
 }
 
+/// `read_image`: decode a local image and attach it to the result.
+///
+/// Codex's `view_image`, adapted to a text-first tool contract: the model
+/// gets one line saying what was read and how it was prepared, and the
+/// prepared bytes travel as an attachment ([`ToolOutput::images`]) that the
+/// next request carries. A `detail` of `"original"` asks for the larger
+/// budget; anything else (including an absent value) is the downscaled
+/// default.
+pub(crate) fn run_read_image(arguments: &str) -> Result<ToolOutput, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
+    let path = resolve_path(arg_string(&parsed, "path")?)?;
+    let detail = match parsed.get("detail") {
+        None | Some(serde_json::Value::Null) => image::Detail::High,
+        Some(serde_json::Value::String(value)) if value == "high" => image::Detail::High,
+        Some(serde_json::Value::String(value)) if value == "original" => image::Detail::Original,
+        Some(other) => {
+            return Err(format!(
+                "`detail` only supports \"high\" or \"original\", got {other}"
+            ));
+        }
+    };
+
+    let prepared = image::prepare(&path, detail)?;
+    let text = format!(
+        "read image {} ({}){}",
+        path.display(),
+        prepared.describe(),
+        if prepared.width == prepared.source_width && prepared.height == prepared.source_height {
+            ""
+        } else {
+            "; downscaled to fit the model's image budget"
+        }
+    );
+    Ok(ToolOutput::with_images(text, vec![prepared.image]))
+}
+
 /// `write`: create or overwrite a file with the given content, creating
 /// parent directories as needed.
 pub(crate) fn run_write(arguments: &str) -> Result<String, String> {
-    let parsed: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid arguments: {error}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
     let path = resolve_path(arg_string(&parsed, "path")?)?;
     let content = arg_string(&parsed, "content")?;
 
@@ -164,15 +205,16 @@ pub(crate) fn run_write(arguments: &str) -> Result<String, String> {
 
 /// `edit`: replace exact occurrences of `old_string` with `new_string`.
 pub(crate) fn run_edit(arguments: &str) -> Result<String, String> {
-    let parsed: serde_json::Value = serde_json::from_str(arguments)
-        .map_err(|error| format!("invalid arguments: {error}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|error| format!("invalid arguments: {error}"))?;
     let path = resolve_path(arg_string(&parsed, "path")?)?;
     let old_string = arg_string(&parsed, "old_string")?;
     let new_string = match parsed.get("new_string") {
         Some(value) if value.is_string() => value.as_str().unwrap_or_default(),
         _ => {
-            return Err("missing required argument `new_string` (use \"\" to delete text)"
-                .to_string())
+            return Err(
+                "missing required argument `new_string` (use \"\" to delete text)".to_string(),
+            );
         }
     };
     let replace_all = parsed
@@ -213,11 +255,7 @@ pub(crate) fn run_edit(arguments: &str) -> Result<String, String> {
             path.display()
         ));
     }
-    let replaced = if replace_all {
-        matches
-    } else {
-        1
-    };
+    let replaced = if replace_all { matches } else { 1 };
     let edited = if replace_all {
         content.replace(&old_string, &new_string)
     } else {
@@ -242,12 +280,12 @@ pub(crate) fn run_edit(arguments: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tools::ToolCall;
+    use crate::plugins::Plugin;
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "codest-fs-test-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("codest-fs-test-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create tempdir");
         dir
     }
@@ -315,6 +353,20 @@ mod tests {
             "{out:?}"
         );
         let _ = std::fs::remove_file(bin);
+
+        // Binary bytes that carry an image signature get the better hint:
+        // the model should reach for `read_image`, not the shell.
+        let image = dir.join("shot.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").expect("setup");
+        let out = run_read(&format!(
+            r#"{{"path": {}}}"#,
+            json_str(&image.display().to_string())
+        ));
+        assert!(
+            matches!(&out, Err(message) if message.contains("read_image")),
+            "{out:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -420,5 +472,65 @@ mod tests {
             "{bad:?}"
         );
         let _ = std::fs::remove_file(bin);
+    }
+
+    /// A real PNG on disk comes back as a text report plus one attached
+    /// image with a `data:` URL — the shape the session puts on the tool
+    /// message. The FsPlugin routes it through `run_tool_output`, not the
+    /// text-only method.
+    #[test]
+    fn read_image_returns_an_attachment() {
+        let dir = tempdir("read-image");
+        let path = dir.join("shot.png");
+        let buffer = ::image::RgbaImage::from_pixel(120, 80, ::image::Rgba([30u8, 60, 90, 255]));
+        buffer
+            .save_with_format(&path, ::image::ImageFormat::Png)
+            .expect("write png");
+
+        let call = ToolCall {
+            id: "c1".to_string(),
+            name: "read_image".to_string(),
+            arguments: format!(r#"{{"path": {}}}"#, json_str(&path.display().to_string())),
+        };
+        let output = crate::plugins::builtin::tools::FS
+            .run_tool_output(&call)
+            .expect("read image");
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].mime, "image/png");
+        assert_eq!(output.images[0].detail, "high");
+        assert!(
+            output.images[0]
+                .data_url
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(output.text.contains("120x80"), "{}", output.text);
+        assert!(output.text.contains("image/png"), "{}", output.text);
+
+        // The text-only entry point refuses rather than dropping the image.
+        assert!(crate::plugins::builtin::tools::FS.run_tool(&call).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_image_rejects_a_bad_path_and_detail() {
+        let dir = tempdir("read-image-errors");
+        let missing = dir.join("nope.png").display().to_string();
+        assert!(run_read_image(&format!(r#"{{"path": {}}}"#, json_str(&missing))).is_err());
+        assert!(run_read_image(r#"{}"#).is_err());
+        assert!(
+            run_read_image(&format!(
+                r#"{{"path": {}, "detail": "low"}}"#,
+                json_str(&missing)
+            ))
+            .is_err()
+        );
+        // A directory is not an image, and says so.
+        let error = run_read_image(&format!(
+            r#"{{"path": {}}}"#,
+            json_str(&dir.display().to_string())
+        ))
+        .expect_err("a directory is not an image");
+        assert!(error.contains("directory"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
