@@ -12,7 +12,9 @@ mod r#continue;
 mod help;
 mod quit;
 mod status;
-mod tools;
+// Visible to `/context`'s inspector, which labels an attached image with the
+// same byte formatting the `read_image` result line uses.
+pub(crate) mod tools;
 mod tps;
 
 use crate::plugins::Plugin;
