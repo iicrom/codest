@@ -6,29 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-18
+
+Merge of `feat/read-image-tool` (`d9db34b`) and `feat/pending-queue-control` (`566dc52`): tool results can carry images, and the TUI owns the queue of messages typed mid-turn.
+
 ### Added
 
-- Queued-message management: `Ctrl+R` focuses the queue (`↑↓` select, `Enter` takes the message back into the composer, `Delete` withdraws it, `Alt+Enter` steers the selection, `Esc` closes), and `Alt+S` releases the whole held queue — steered into a running turn, or, when idle, the head starting a turn with the rest following one per turn. Both are host shortcuts, rebindable in `/settings`.
 - `read_image` tool (`fs` plugin): loads a local PNG/JPEG/GIF/WebP, downscales it to the model's image patch budget (codex's `view_image` policy — 2048 px / 2500 patches by default, `detail: "original"` up to 6000 px / 10 000 patches), and attaches the prepared bytes to the tool result. The tool is `read_only`, appears in `/tools`, and is recorded in rollouts so a resumed session keeps its images.
 - Plugin contract: `ToolOutput { text, images }`, `ToolImage`, and the defaulted `Plugin::run_tool_output` / `ToolExecutor::execute_output` pair, so a tool can return media without breaking text-only plugins.
+- Queued-message management: `Ctrl+R` focuses the queue (`↑↓` select, `Enter` takes the message back into the composer, `Delete` withdraws it, `Alt+Enter` steers the selection, `Esc` closes), and `Alt+S` releases the whole held queue — steered into a running turn, or, when idle, the head starting a turn with the rest following one per turn. Both are host shortcuts, rebindable in `/settings`.
 - `scripts/openai_test_server.py` gained an `@read-image <path> [high|original]` keyword, and looks past the image-carrying follow-up message when it decides which turn a request belongs to.
 
 ### Fixed
 
 - `Esc`/`Ctrl+C` now really stops the conversation: queued messages are held (visible and editable above the composer) instead of being submitted straight into the worker's FIFO, which ran them as the next turn the moment the abort settled. A steer the turn never claimed is likewise held rather than resubmitted.
+- A tool result's `detail` is the tool's budget label (`high`/`original`), not the wire's vocabulary: the client sends `original` as `high`, the only larger-than-low value chat-completions accepts, instead of an enum value endpoints reject.
+- Attached images no longer accumulate across a whole session's requests: the newest 4 MB (decoded) ride a request and older ones stop being re-sent, while their text results and the rollout keep them.
+- The image decoder refuses a canvas past 16384 px per side before allocating it, so a small file declaring a huge one cannot be used as a decompression bomb.
+- `/context` reported an attachment's size as its base64 encoding, 33% above the file's own bytes; it now shows the decoded size, matching the tool's result line.
+- Idle `Alt+S` starts one turn and holds the rest, but flashed "sent N queued messages"; it now reports what it started. A steer claim also retires the row its text names, so identical steers cannot be retired out of order.
 
 ### Internal
 
 - The chat-completions client sends a tool result's images as a follow-up `user` message with `image_url` parts (`role: "tool"` carries text only), the shape gateway adapters accept. The carrier follows the whole run of tool results in a round, so a parallel round's `tool_call_id`s stay answered back to back.
 - `image` and `base64` dependencies (image with only the GIF/JPEG/PNG/WebP codecs compiled in).
 - Corrected the documented `PLUGIN_API_VERSION`, which had said `1` since the contract moved to `2`.
-
-### Fixed
-
-- A tool result's `detail` is the tool's budget label (`high`/`original`), not the wire's vocabulary: the client sends `original` as `high`, the only larger-than-low value chat-completions accepts, instead of an enum value endpoints reject.
-- Attached images no longer accumulate across a whole session's requests: the newest 4 MB (decoded) ride a request and older ones stop being re-sent, while their text results and the rollout keep them.
-- The image decoder refuses a canvas past 16384 px per side before allocating it, so a small file declaring a huge one cannot be used as a decompression bomb.
-- `/context` reported an attachment's size as its base64 encoding, 33% above the file's own bytes; it now shows the decoded size, matching the tool's result line.
 
 ## [0.3.1] — 2026-11-17
 
@@ -99,6 +101,9 @@ The development line from `54d1c4a` (`chore: initial commit`) through `3f23ae5` 
 
 - Open-source release preparation and an offline test suite: unit tests colocated with the code, plus `pty` / markdown / tool smoke scripts driven against a local test server.
 
-[Unreleased]: https://github.com/iicrom/codest/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/iicrom/codest/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/iicrom/codest/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/iicrom/codest/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/iicrom/codest/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iicrom/codest/compare/3f23ae5...v0.2.0
 [0.1.0]: https://github.com/iicrom/codest/compare/54d1c4a...3f23ae5
