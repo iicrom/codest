@@ -722,6 +722,15 @@ struct App {
     /// it delivered (`TurnStarted` / `SteerClaimed`), so the record never
     /// shows it above the answer still streaming.
     pending: Vec<PendingInput>,
+    /// Selected row while the pending queue is focused (`Ctrl+R`); `None`
+    /// hides the selection and returns ↑↓ to history browsing. The queue
+    /// menu borrows the pickers' interaction: ↑↓ move, Enter edits, Del
+    /// withdraws, Alt+Enter sends that one now, Esc closes.
+    pending_selected: Option<usize>,
+    /// Set when the running turn was aborted (`Esc`/`Ctrl+C`): the queue
+    /// holds instead of flushing into the next turn, so an interrupt really
+    /// stops the conversation until the user sends again.
+    turn_aborted: bool,
     tick: usize,
     /// Set by every event that may change what the screen shows. The event
     /// loop draws once per [`MIN_FRAME_INTERVAL`] while it stands, so bursts
@@ -895,9 +904,19 @@ enum PendingPlacement {
 /// A message accepted while a turn runs, shown as a pending row above the
 /// composer until the core reports it delivered — only then does it become
 /// a transcript cell.
+///
+/// The queue is owned here, not in the core: a queued message is *not*
+/// submitted until the moment its turn may start. That is what lets an
+/// interrupted turn hold its queue instead of running it, and what makes
+/// withdrawing or editing a pending message a pure front-end edit.
 struct PendingInput {
     text: String,
     placement: PendingPlacement,
+    /// The submission id once the entry has been handed to the core (`None`
+    /// while it is still held here). A `TurnStarted` for that id is the
+    /// authoritative delivery signal; keeping it avoids guessing by FIFO
+    /// position when an unrelated error or config op lands in between.
+    submission: Option<String>,
 }
 
 struct ModelMenuItem {
@@ -1109,6 +1128,8 @@ impl App {
             command_menu_dismissed: false,
             busy: false,
             pending: Vec::new(),
+            pending_selected: None,
+            turn_aborted: false,
             tick: 0,
             needs_redraw: true,
             last_draw: Instant::now()
@@ -2019,6 +2040,43 @@ impl App {
             }
         }
 
+        // The pending-queue menu (`Ctrl+R`) takes the same navigation shape
+        // as the pickers: ↑↓ move, Enter edits, Alt+Enter sends that one
+        // now, Delete withdraws, Esc closes. Only `Delete` withdraws — a
+        // Backspace here would eat the composer's own edit while the user
+        // types into it. Everything else (typing, Ctrl+C, …) falls through to
+        // its normal handler, exactly like the menus around it.
+        if self.pending_selected.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_pending_selection(-1);
+                    self.needs_redraw = true;
+                    return;
+                }
+                KeyCode::Down => {
+                    self.move_pending_selection(1);
+                    self.needs_redraw = true;
+                    return;
+                }
+                KeyCode::Enter if alt => {
+                    self.send_pending_selected();
+                    return;
+                }
+                KeyCode::Enter if !ctrl && !shift => {
+                    self.edit_pending();
+                    return;
+                }
+                KeyCode::Delete if !ctrl && !alt => {
+                    self.withdraw_pending();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.pending_selected = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
         // The `/sessions`, `/model`, and `/effort` pickers are modal for
         // navigation keys: ↑↓ move, plain Enter confirms, Esc closes.
         // Everything else (typing, Ctrl+C, ...) still reaches its normal
@@ -2195,6 +2253,20 @@ impl App {
             self.history_next();
             return true;
         }
+        // The pending queue's own menu (`/settings`-rebindable, Ctrl+R by
+        // default): focus or close it. It is a host action like the pickers
+        // below, so a rebind takes effect on the very next keypress.
+        if self.keymap.matches("pending_queue", combo) {
+            self.toggle_pending_queue();
+            return true;
+        }
+        // Send the whole held queue now: steered into the running turn while
+        // busy, or released as regular turns when idle (the way out of an
+        // interrupted turn's held queue).
+        if self.keymap.matches("send_queue", combo) {
+            self.send_queue_now();
+            return true;
+        }
         // Inline mode leaves paging to the terminal's native scrollback and
         // has no viewport to jump — the newest line is already at the
         // bottom — so the scroll keys are not consumed there and fall
@@ -2329,6 +2401,7 @@ impl App {
             || self.effort_menu.is_some()
             || self.tools_menu.is_some()
             || self.provider_wizard.is_some()
+            || self.pending_selected.is_some()
         {
             return Vec::new();
         }
@@ -2436,17 +2509,38 @@ impl App {
     }
 
     /// Queue the message for after the running turn (Enter while busy). The
-    /// core's op channel is FIFO, so the turn starts the moment the current
-    /// one finishes; the transcript cell lands when `TurnStarted` confirms
-    /// delivery, not before.
+    /// entry is held here — nothing reaches the core yet — and
+    /// [`Self::flush_queue`] submits it when the turn that is running now
+    /// finishes cleanly. Holding it is what makes an interrupt stop the
+    /// conversation: an aborted turn leaves the queue standing.
     fn queue_text(&mut self, text: String) {
-        self.pending.push(PendingInput {
-            text: text.clone(),
-            placement: PendingPlacement::Queue,
-        });
         let output = self.plugins.user_message(&text, self.plugin_info());
         self.apply_output(output);
-        self.session.submit_user_turn(text);
+        self.pending.push(PendingInput {
+            text,
+            placement: PendingPlacement::Queue,
+            submission: None,
+        });
+        self.clamp_pending_selection();
+    }
+
+    /// Hand the oldest held queued entry to the core and remember its
+    /// submission id. One entry per turn, matching the worker's FIFO: the
+    /// confirmed `TurnStarted` retires it and the next `TurnComplete` sends
+    /// the next. `busy` turns true so the turn that just started is not
+    /// treated as idle by the next event.
+    fn flush_queue(&mut self) {
+        let Some(index) = self.pending.iter().position(|entry| {
+            entry.placement == PendingPlacement::Queue && entry.submission.is_none()
+        }) else {
+            return;
+        };
+        let text = self.pending[index].text.clone();
+        self.pending[index].submission = Some(self.session.submit_user_turn(text));
+        self.busy = true;
+        if self.view().live.is_none() {
+            self.view_mut().live = Some(String::new());
+        }
     }
 
     /// Steer the message into the running turn (Alt+Enter while busy): it
@@ -2463,40 +2557,46 @@ impl App {
         self.pending.push(PendingInput {
             text,
             placement: PendingPlacement::Steer,
+            submission: None,
         });
+        self.clamp_pending_selection();
     }
 
-    /// Deliver the oldest queued message: its turn is starting (or was
-    /// rejected before it could), so it becomes a transcript cell. The core
-    /// event carries no text — FIFO order pairs one `TurnStarted` with one
-    /// queued entry — so the entry's own text is used.
-    fn deliver_queued(&mut self) {
+    /// Deliver the queued message whose turn is starting. The submission id
+    /// pairs the event with its entry exactly; an id no entry claims (a
+    /// plugin- or command-driven turn) leaves the queue alone.
+    fn deliver_queued(&mut self, submission: &str) {
         let index = self
             .pending
             .iter()
-            .position(|entry| entry.placement == PendingPlacement::Queue);
+            .position(|entry| entry.submission.as_deref() == Some(submission));
         if let Some(index) = index {
             let text = self.pending.remove(index).text;
             self.view_mut().history.push(HistoryCell::User(text));
+            self.clamp_pending_selection();
         }
     }
 
-    /// Retire the oldest steered entry: the core claimed it at a boundary.
-    /// The claim event carries the authoritative text for the cell.
-    fn retire_steer(&mut self) {
+    /// Retire the steered entry the core just claimed at a boundary. The
+    /// claim event carries the authoritative text, and pairing on it (rather
+    /// than on "the first steer") keeps the right row when the same message
+    /// was steered twice or the queue was edited in between.
+    fn retire_steer(&mut self, text: &str) {
         if let Some(index) = self
             .pending
             .iter()
-            .position(|entry| entry.placement == PendingPlacement::Steer)
+            .position(|entry| entry.placement == PendingPlacement::Steer && entry.text == text)
         {
             self.pending.remove(index);
+            self.clamp_pending_selection();
         }
     }
 
     /// Requeue a steered message the turn never claimed: the pending entry
-    /// flips to queued — moved to the back, matching its place at the end of
-    /// the core's submission queue — and a regular turn is submitted so the
-    /// input still gets answered.
+    /// flips back to held (`submission: None`, moved to the back, matching
+    /// its place behind everything still waiting). Nothing is submitted —
+    /// the next clean `TurnComplete` flushes it, and an abort leaves it
+    /// standing with the rest of the queue.
     fn requeue_steer(&mut self, text: String) {
         let index = self
             .pending
@@ -2506,14 +2606,184 @@ impl App {
             Some(index) => {
                 let mut entry = self.pending.remove(index);
                 entry.placement = PendingPlacement::Queue;
+                entry.submission = None;
                 self.pending.push(entry);
             }
             None => self.pending.push(PendingInput {
-                text: text.clone(),
+                text,
                 placement: PendingPlacement::Queue,
+                submission: None,
             }),
         }
-        self.session.submit_user_turn(text);
+        self.clamp_pending_selection();
+    }
+
+    /// Move the pending selection with `delta`, wrapping at both ends.
+    /// Returns false when the queue is not focused (or empty), so the caller
+    /// keeps its own ↑↓ meaning.
+    fn move_pending_selection(&mut self, delta: isize) -> bool {
+        let Some(selected) = self.pending_selected else {
+            return false;
+        };
+        let len = self.pending.len();
+        if len == 0 {
+            return false;
+        }
+        let current = selected.min(len - 1);
+        self.pending_selected = Some(if delta < 0 {
+            (current + len - 1) % len
+        } else {
+            (current + 1) % len
+        });
+        true
+    }
+
+    /// Keep [`Self::pending_selected`] inside the queue: the index follows
+    /// removals and the focus closes when nothing is left to select.
+    fn clamp_pending_selection(&mut self) {
+        match self.pending_selected {
+            _ if self.pending.is_empty() => self.pending_selected = None,
+            Some(selected) if selected >= self.pending.len() => {
+                self.pending_selected = Some(self.pending.len() - 1);
+            }
+            _ => {}
+        }
+    }
+
+    /// `Ctrl+R`: focus the pending queue, or close it again when it already
+    /// has the selection. An empty queue has nothing to manage, so the key
+    /// reports that in the footer instead of opening an empty menu.
+    fn toggle_pending_queue(&mut self) {
+        if self.pending_selected.is_some() {
+            self.pending_selected = None;
+            return;
+        }
+        if self.pending.is_empty() {
+            self.flash("no queued messages");
+            return;
+        }
+        self.pending_selected = Some(0);
+    }
+
+    /// `Enter` in the queue menu: take the selected message back into the
+    /// composer, removing it from the queue. The running turn keeps whatever
+    /// it already knows; this only affects what would have been sent next.
+    fn edit_pending(&mut self) {
+        let Some(selected) = self.pending_selected else {
+            return;
+        };
+        if selected >= self.pending.len() {
+            return;
+        }
+        let entry = self.pending.remove(selected);
+        // A steered message may already be inside the running turn's
+        // conversation; withdrawing it here cannot take it back, and the
+        // flash says so rather than pretending the edit undid it.
+        if entry.placement == PendingPlacement::Steer {
+            self.flash("already steered — the edit starts a new message");
+        }
+        self.composer.set_text(entry.text);
+        self.prompt_index = None;
+        self.clamp_pending_selection();
+        // With nothing left the menu closes; with entries left the selection
+        // stays on the same index, now naming the message that followed.
+        self.command_selection = 0;
+        self.command_menu_dismissed = false;
+    }
+
+    /// `Delete` in the queue menu: withdraw the selected message without
+    /// touching the composer. Backspace is deliberately not bound — the
+    /// composer keeps it while the user types. The menu stays open on the
+    /// next entry.
+    fn withdraw_pending(&mut self) {
+        let Some(selected) = self.pending_selected else {
+            return;
+        };
+        if selected >= self.pending.len() {
+            return;
+        }
+        let entry = self.pending.remove(selected);
+        if entry.placement == PendingPlacement::Steer {
+            self.flash("already steered — it cannot be recalled");
+        } else {
+            self.flash("queued message withdrawn");
+        }
+        self.clamp_pending_selection();
+    }
+
+    /// `Alt+Enter` in the queue menu: deliver the selected message now —
+    /// steered into the running turn while busy, a regular turn when idle.
+    fn send_pending_selected(&mut self) {
+        let Some(selected) = self.pending_selected else {
+            return;
+        };
+        if selected >= self.pending.len() {
+            return;
+        }
+        if self.pending[selected].placement == PendingPlacement::Steer {
+            // Already inside the running turn's inbox; it waits for the same
+            // boundary anything else would.
+            self.flash("already steered · waiting for the next boundary");
+            return;
+        }
+        let entry = self.pending.remove(selected);
+        self.clamp_pending_selection();
+        if self.busy {
+            self.steer_text(entry.text);
+        } else {
+            self.submit_user_turn(entry.text);
+        }
+    }
+
+    /// Send every held queued message now, queue order preserved: while a
+    /// turn runs they all steer into it; idle, they are submitted as regular
+    /// turns (one call per message — the worker's FIFO runs them in order).
+    /// The recovery path for an interrupted session, whose queue
+    /// [`Self::turn_aborted`] holds.
+    fn send_queue_now(&mut self) {
+        if self.pending.is_empty() {
+            self.flash("no queued messages");
+            return;
+        }
+        // Entries already handed to the core (a `TurnStarted` is on its way)
+        // stay pending and untouched; only held ones are sent.
+        let mut kept: Vec<PendingInput> = Vec::with_capacity(self.pending.len());
+        let mut held: Vec<PendingInput> = Vec::new();
+        for entry in std::mem::take(&mut self.pending) {
+            let held_now = entry.submission.is_none() && entry.placement == PendingPlacement::Queue;
+            if held_now {
+                held.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.pending = kept;
+        self.pending_selected = None;
+        let count = held.len();
+        if count == 0 {
+            return;
+        }
+        if self.busy {
+            for entry in held {
+                self.steer_text(entry.text);
+            }
+            self.flash(format!("steered {count} queued message(s)"));
+            return;
+        }
+        // Idle: restore the held entries, then flush the head. The rest stay
+        // held and follow one per `TurnComplete`, so each message is a proper
+        // turn with its transcript cell in order — not a pile of cells above
+        // an answer that has not started.
+        let at = self.pending.len();
+        self.pending.splice(at..at, held);
+        self.flush_queue();
+        // Only the head is running; the rest are released as their turns
+        // finish, so the flash must not claim they all went out.
+        self.flash(if count == 1 {
+            "sent 1 queued message".to_string()
+        } else {
+            format!("started 1 of {count} queued messages")
+        });
     }
 
     /// Why the active route cannot serve a message right now, if it can't:
@@ -2546,7 +2816,11 @@ impl App {
         if (self.busy || !self.pending.is_empty())
             && matches!(invocation.spec.name, "new" | "sessions")
         {
-            self.flash("busy — press Esc to interrupt first");
+            self.flash(if self.busy {
+                "busy — press Esc to interrupt first"
+            } else {
+                "queued messages held — Ctrl+R to manage them first"
+            });
             return;
         }
         match invocation.spec.name {
@@ -4178,8 +4452,9 @@ impl App {
                 // A queued message's turn is starting: the pending entry
                 // becomes the transcript cell now, so it lands below the
                 // answer that just finished instead of above the one still
-                // streaming. FIFO pairs one `TurnStarted` with one entry.
-                self.deliver_queued();
+                // streaming. The submission id pairs the event with its
+                // entry.
+                self.deliver_queued(&event.id);
                 self.busy = true;
                 if self.view().live.is_none() {
                     self.view_mut().live = Some(String::new());
@@ -4316,6 +4591,17 @@ impl App {
                 self.settle_running_tool("interrupted");
                 self.finalize_live();
                 self.view_mut().history.push(HistoryCell::Interrupted);
+                // The interrupt stops the conversation, queue included: the
+                // `TurnComplete` that follows must not flush it into a new
+                // turn the user never asked for. The held rows stay visible
+                // (and editable) until Esc-plus-send, Ctrl+R, or Alt+S.
+                self.turn_aborted = true;
+                if !self.pending.is_empty() {
+                    let held = self.pending.len();
+                    self.flash(format!(
+                        "interrupted · {held} queued message(s) held · Alt+S sends"
+                    ));
+                }
             }
             EventMsg::Error { message } => {
                 // The same unwind for a turn that dies on an error.
@@ -4329,9 +4615,17 @@ impl App {
                 // A queued turn rejected before it ever started (no usable
                 // route in the core) never sees `TurnStarted`: its pending
                 // entry retires here, so the message shows next to its
-                // rejection.
-                if !self.busy {
-                    self.deliver_queued();
+                // rejection. Only an id that names a held entry counts —
+                // unrelated errors must not eat the queue.
+                if self
+                    .pending
+                    .iter()
+                    .any(|entry| entry.submission.as_deref() == Some(event.id.as_str()))
+                {
+                    self.deliver_queued(&event.id);
+                    if !self.busy {
+                        self.flush_queue();
+                    }
                 }
                 self.settle_running_tool("interrupted");
                 self.finalize_live();
@@ -4345,13 +4639,22 @@ impl App {
                 self.last_ctrl_c = None;
                 self.last_interrupt_press = None;
                 self.apply_output(output);
+                // A clean finish releases the next held message. An aborted
+                // turn keeps the queue standing (`turn_aborted`), so Esc
+                // really ends the conversation: nothing runs until the user
+                // sends, edits, or withdraws what is waiting.
+                if self.turn_aborted {
+                    self.turn_aborted = false;
+                } else {
+                    self.flush_queue();
+                }
             }
             EventMsg::SteerClaimed { text } => {
                 // The running turn absorbed a steered message at a step
                 // boundary: retire the pending row and give the message its
                 // transcript cell, below the round that just committed and
                 // above the round about to stream.
-                self.retire_steer();
+                self.retire_steer(&text);
                 self.view_mut().history.push(HistoryCell::User(text));
             }
             EventMsg::SteerUnclaimed { texts } => {
@@ -4675,10 +4978,15 @@ impl App {
     }
 
     /// Rows the pending-preview needs: one per queued/steered message, up to
-    /// [`MAX_PENDING_ROWS`], plus one fold line when there are more.
+    /// [`MAX_PENDING_ROWS`], plus one fold line when there are more. While
+    /// the queue menu is focused it takes the pickers' shared row cap so the
+    /// selected entry is always on screen.
     fn pending_row_count(&self) -> usize {
         if self.pending.is_empty() {
             return 0;
+        }
+        if self.pending_selected.is_some() {
+            return self.pending.len().min(MAX_COMMAND_MENU_ROWS);
         }
         let shown = self.pending.len().min(MAX_PENDING_ROWS);
         shown + usize::from(self.pending.len() > shown)
@@ -4687,37 +4995,39 @@ impl App {
     /// The pending preview: messages accepted mid-turn that the core has not
     /// reported delivered yet. Each row names its destination and the
     /// message's first line, so the user can see what will go out and when.
+    /// With the queue focused (`Ctrl+R`) the selected row is highlighted and
+    /// the window follows it; otherwise the list shows the first
+    /// [`MAX_PENDING_ROWS`] and folds the rest.
     fn pending_lines(&self) -> Vec<Line<'static>> {
         if self.pending.is_empty() {
             return Vec::new();
         }
-        let shown = self.pending.len().min(MAX_PENDING_ROWS);
-        let mut lines: Vec<Line<'static>> = self
-            .pending
-            .iter()
-            .take(shown)
-            .map(|entry| {
-                let (marker, destination) = match entry.placement {
-                    PendingPlacement::Queue => ("⏳", "queued · after this turn"),
-                    PendingPlacement::Steer => ("⚡", "steer · next boundary"),
-                };
-                let text = crate::tui::session::truncated(
-                    entry.text.lines().next().unwrap_or_default(),
-                    48,
-                );
-                Line::from(Span::styled(
-                    format!("{marker} {destination} ↳ {text}"),
-                    Style::default().fg(theme::SUBTLE),
-                ))
-            })
-            .collect();
-        if self.pending.len() > shown {
-            let rest = self.pending.len() - shown;
-            lines.push(Line::from(Span::styled(
-                format!("  … and {rest} more pending"),
-                Style::default().fg(theme::DIM),
-            )));
-        }
+        let lines: Vec<Line<'static>> = match self.pending_selected {
+            Some(selected) => {
+                let window =
+                    command_menu_window(self.pending.len(), selected, MAX_COMMAND_MENU_ROWS);
+                window
+                    .map(|index| pending_line(&self.pending[index], Some(index) == Some(selected)))
+                    .collect()
+            }
+            None => {
+                let shown = self.pending.len().min(MAX_PENDING_ROWS);
+                let mut lines: Vec<Line<'static>> = self
+                    .pending
+                    .iter()
+                    .take(shown)
+                    .map(|entry| pending_line(entry, false))
+                    .collect();
+                if self.pending.len() > shown {
+                    let rest = self.pending.len() - shown;
+                    lines.push(Line::from(Span::styled(
+                        format!("  … and {rest} more pending · Ctrl+R manages the queue"),
+                        Style::default().fg(theme::DIM),
+                    )));
+                }
+                lines
+            }
+        };
         lines
     }
 
@@ -5084,6 +5394,16 @@ impl App {
         } else {
             "Enter queue · Alt+Enter steer · Esc interrupt"
         };
+        // A held queue names its own keys: interrupt and send-now are the
+        // gestures that matter once messages are waiting with no turn
+        // running.
+        let busy_hint = if self.pending.is_empty() {
+            busy_hint
+        } else if self.busy {
+            "Enter queue · Alt+Enter steer · Ctrl+R queue · Esc×2 interrupt"
+        } else {
+            "queued held · Ctrl+R manage · Alt+S send all"
+        };
         let state = if self.busy {
             format!("{spinner} working · {interrupt_label}")
         } else {
@@ -5105,6 +5425,8 @@ impl App {
                     "↑↓ select · Tab effort · Enter switch · Ctrl+S default · r refresh · Esc close"
                 } else if self.effort_menu.is_some() {
                     "↑↓ select · Enter switch · Esc close"
+                } else if self.pending_selected.is_some() {
+                    "↑↓ select · Enter edit · Del withdraw · Alt+Enter steer · Esc close"
                 } else if self.command_menu_open() {
                     "↑↓ select · Tab complete · Enter run · Esc close"
                 } else if self.show_ctrl_c_hint() {
@@ -5825,8 +6147,31 @@ fn effort_menu_line(number: usize, item: &EffortMenuItem, selected: bool) -> Lin
     Line::from(spans)
 }
 
-/// One row of the `/tools` picker: checkbox, tool name, and a read-only
-/// marker on the tools that only inspect state.
+/// One row of the pending preview: the destination marker, then the first
+/// line of the message. The selected row (only while the queue menu is
+/// focused) takes the pickers' `▸` accent treatment.
+fn pending_line(entry: &PendingInput, selected: bool) -> Line<'static> {
+    let (marker, destination) = match entry.placement {
+        PendingPlacement::Queue => ("⏳", "queued · after this turn"),
+        PendingPlacement::Steer => ("⚡", "steer · next boundary"),
+    };
+    let text = crate::tui::session::truncated(entry.text.lines().next().unwrap_or_default(), 48);
+    let body = format!("{marker} {destination} ↳ {text}");
+    if selected {
+        Line::from(vec![
+            Span::styled(
+                "▸ ",
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(body, Style::default().add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from(Span::styled(body, Style::default().fg(theme::SUBTLE)))
+    }
+}
+
 fn tools_menu_line(item: &ToolsMenuItem, selected: bool) -> Line<'static> {
     let marker = if selected { "▸ " } else { "  " };
     let (marker_style, text_style) = if selected {
@@ -6005,11 +6350,13 @@ mod tests {
     fn test_shortcut_registry() -> Vec<crate::core::keymap::ShortcutEntry> {
         // The shipped host's registry: the host's own actions plus whatever
         // the built-in plugins registered (tps:meter among them).
-        let specs: Vec<(&'static str, &'static [cst_plugin_api::shortcuts::ShortcutSpec])> =
-            crate::plugins::BUILTIN_PLUGINS
-                .iter()
-                .map(|plugin| (plugin.id(), plugin.shortcuts()))
-                .collect();
+        let specs: Vec<(
+            &'static str,
+            &'static [cst_plugin_api::shortcuts::ShortcutSpec],
+        )> = crate::plugins::BUILTIN_PLUGINS
+            .iter()
+            .map(|plugin| (plugin.id(), plugin.shortcuts()))
+            .collect();
         crate::core::keymap::build_registry(&specs).expect("shipped registry")
     }
 
@@ -7286,8 +7633,9 @@ mod tests {
         assert_eq!(app.view().history.len(), before);
     }
 
-    /// Enter while a turn streams queues the message: nothing lands in the
-    /// transcript until `TurnStarted` reports the queued turn running.
+    /// Enter while a turn streams queues the message: it is held in the app,
+    /// not handed to the core, and the transcript gains nothing until its
+    /// turn actually starts.
     #[tokio::test]
     async fn enter_while_busy_queues_and_delivers_on_turn_started() {
         let mut app = test_app();
@@ -7298,7 +7646,8 @@ mod tests {
         app.try_submit();
 
         // The composer clears and the running turn's live text survives,
-        // but the transcript gains no cell yet — only the pending row.
+        // but the transcript gains no cell yet — only the pending row, and
+        // nothing has been submitted to the core.
         assert!(app.composer.is_empty());
         assert!(app.busy);
         assert_eq!(
@@ -7309,20 +7658,88 @@ mod tests {
         assert_eq!(app.pending.len(), 1);
         assert_eq!(app.pending[0].placement, PendingPlacement::Queue);
         assert!(
+            app.pending[0].submission.is_none(),
+            "a queued message is held until its turn may start"
+        );
+        assert!(
             !app.view()
                 .history
                 .iter()
                 .any(|cell| matches!(cell, HistoryCell::User(text) if text == "second"))
         );
 
-        app.handle_agent_event(crate::core::Event::new("sub-2", EventMsg::TurnStarted));
+        // The running turn finishes cleanly; the queue releases its head and
+        // only its own `TurnStarted` turns the row into a transcript cell.
+        app.handle_agent_event(crate::core::Event::new("sub-1", EventMsg::TurnComplete));
+        assert_eq!(app.pending.len(), 1);
+        let submission = app.pending[0].submission.clone().expect("flushed");
+        assert!(app.busy, "the released turn is running");
 
-        // Delivery: the pending row retires and the cell lands.
+        app.handle_agent_event(crate::core::Event::new(submission, EventMsg::TurnStarted));
+
         assert!(app.pending.is_empty());
         assert!(matches!(
             app.view().history.last(),
             Some(HistoryCell::User(text)) if text == "second"
         ));
+    }
+
+    /// `Esc` (a `TurnAborted` + `TurnComplete` pair) holds the queue instead
+    /// of flushing it: the interrupt really ends the conversation.
+    #[tokio::test]
+    async fn interrupt_holds_queued_messages() {
+        let mut app = test_app();
+        app.busy = true;
+        app.composer.set_text("second".to_string());
+        app.try_submit();
+        assert_eq!(app.pending.len(), 1);
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::TurnAborted {
+                reason: "interrupted".to_string(),
+            },
+        ));
+        app.handle_agent_event(crate::core::Event::new("sub-1", EventMsg::TurnComplete));
+
+        assert!(!app.busy, "the interrupted turn is over");
+        assert_eq!(app.pending.len(), 1, "the queue still waits");
+        assert!(
+            app.pending[0].submission.is_none(),
+            "nothing was submitted after the interrupt"
+        );
+        assert!(
+            !app.view()
+                .history
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::User(text) if text == "second"))
+        );
+    }
+
+    /// A claim retires the row matching the text the event carries, not
+    /// whatever steer happens to be first: with the same message steered
+    /// twice, the second claim must retire the second row.
+    #[tokio::test]
+    async fn a_steer_claim_retires_the_row_its_text_names() {
+        let mut app = test_app();
+        app.busy = true;
+        for text in ["first", "first"] {
+            app.composer.set_text(text.to_string());
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        }
+        assert_eq!(app.pending.len(), 2);
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::SteerClaimed {
+                text: "first".to_string(),
+            },
+        ));
+        assert_eq!(app.pending.len(), 1, "one row retired");
+        assert_eq!(app.pending[0].placement, PendingPlacement::Steer);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::User(text)) if text == "first")
+        );
     }
 
     /// Alt+Enter while a turn streams steers: the pending row retires when
@@ -7353,22 +7770,38 @@ mod tests {
         ));
     }
 
-    /// A steer the turn never claimed (interrupted, or no boundary reached)
-    /// flips to queued and a regular turn is submitted for it — the worker
-    /// answers it after the current one settles. Driven end-to-end over the
-    /// real worker: the test fabricates `busy` without a turn, so the steer
-    /// lands on an idle worker and comes straight back as `SteerUnclaimed`.
+    /// A steer the turn never claimed flips back to queued and is *held* —
+    /// the following clean `TurnComplete` releases it, so the input still
+    /// gets answered without racing the turn that just ended. Driven
+    /// end-to-end over the real worker: the test fabricates `busy` without a
+    /// turn, so the steer lands on an idle worker and comes straight back as
+    /// `SteerUnclaimed`.
     #[tokio::test]
-    async fn steer_unclaimed_requeues_and_resubmits() {
+    async fn steer_unclaimed_requeues_and_waits_for_the_next_turn() {
         let mut app = test_app();
         app.busy = true;
         app.composer.set_text("pivot now".to_string());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
         assert_eq!(app.pending[0].placement, PendingPlacement::Steer);
 
-        // The worker's own hand-back arrives; the app requeues and
-        // resubmits, and the worker answers — its `TurnStarted` pops the
-        // pending row into a transcript cell.
+        // The hand-back arrives; the entry becomes held, and only a clean
+        // `TurnComplete` releases it.
+        loop {
+            let event = app.session.next_event().await.expect("worker event");
+            let done = matches!(event.msg, EventMsg::SteerUnclaimed { .. });
+            app.handle_agent_event(event);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].placement, PendingPlacement::Queue);
+        assert!(app.pending[0].submission.is_none());
+
+        app.handle_agent_event(crate::core::Event::new("sub-1", EventMsg::TurnComplete));
+        assert!(app.busy, "the released turn is running");
+
+        // Its `TurnStarted` pops the pending row into a transcript cell.
         loop {
             let event = app.session.next_event().await.expect("worker event");
             let done = matches!(event.msg, EventMsg::TurnStarted);
@@ -7378,11 +7811,116 @@ mod tests {
             }
         }
         assert_eq!(app.pending.len(), 0);
-        assert!(app.busy);
         assert!(matches!(
             app.view().history.last(),
             Some(HistoryCell::User(text)) if text == "pivot now"
         ));
+    }
+
+    /// `Ctrl+R` focuses the queue; Enter takes the selected message back
+    /// into the composer and Delete withdraws it — both pure front-end edits.
+    #[tokio::test]
+    async fn queue_menu_edits_and_withdraws_held_messages() {
+        let mut app = test_app();
+        app.busy = true;
+        app.composer.set_text("first".to_string());
+        app.try_submit();
+        app.composer.set_text("second".to_string());
+        app.try_submit();
+        assert_eq!(app.pending.len(), 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.pending_selected, Some(0));
+
+        // ↓ selects the second entry, Enter brings it back for editing.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "second");
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].text, "first");
+        assert_eq!(app.pending_selected, Some(0), "the menu stays open");
+
+        // Delete withdraws without touching the composer.
+        app.composer.clear();
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(app.pending.is_empty());
+        assert_eq!(app.pending_selected, None, "an empty queue closes the menu");
+        assert!(app.composer.is_empty());
+
+        // Esc closes the menu and leaves the queue untouched.
+        app.composer.set_text("third".to_string());
+        app.try_submit();
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.pending_selected, Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.pending_selected, None);
+        assert_eq!(app.pending.len(), 1);
+    }
+
+    /// `Alt+S` sends the whole held queue now: steered into the running turn
+    /// while busy, released as a regular turn when idle.
+    #[tokio::test]
+    async fn send_queue_now_steers_when_busy_and_releases_when_idle() {
+        let mut app = test_app();
+        app.busy = true;
+        for text in ["first", "second"] {
+            app.composer.set_text(text.to_string());
+            app.try_submit();
+        }
+        assert_eq!(app.pending.len(), 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(
+            app.pending
+                .iter()
+                .all(|entry| entry.placement == PendingPlacement::Steer),
+            "a busy turn takes the queue as steers"
+        );
+
+        // An interrupted turn leaves held entries; Alt+S releases the head
+        // as a regular turn and leaves the rest queued behind it.
+        let mut app = test_app();
+        for text in ["held one", "held two"] {
+            app.pending.push(PendingInput {
+                text: text.to_string(),
+                placement: PendingPlacement::Queue,
+                submission: None,
+            });
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        assert!(app.busy, "the head starts a turn");
+        assert_eq!(app.pending.len(), 2);
+        assert!(app.pending[0].submission.is_some());
+        assert!(app.pending[1].submission.is_none(), "one turn at a time");
+        // The flash names what actually happened: one turn started, not all
+        // of them sent.
+        assert_eq!(
+            app.status.clone().expect("the release flashed").0,
+            "started 1 of 2 queued messages"
+        );
+
+        // Its `TurnStarted` lands the cell; the finish releases the second.
+        let first = app.pending[0].submission.clone().expect("submitted");
+        app.handle_agent_event(crate::core::Event::new(first, EventMsg::TurnStarted));
+        assert_eq!(app.pending.len(), 1);
+        app.handle_agent_event(crate::core::Event::new("finish-1", EventMsg::TurnComplete));
+        assert_eq!(app.pending.len(), 1);
+        let second = app.pending[0]
+            .submission
+            .clone()
+            .expect("the second follows");
+        app.handle_agent_event(crate::core::Event::new(second, EventMsg::TurnStarted));
+        assert!(app.pending.is_empty());
+        let users: Vec<&str> = app
+            .view()
+            .history
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::User(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec!["held one", "held two"]);
     }
 
     /// A command typed mid-turn runs as itself; the ones that would strand a
@@ -9853,7 +10391,10 @@ mod tests {
         app.handle_mouse(release);
         let (text, _) = app.status.expect("the release flashed");
         assert_eq!(text, "copied 10 chars", "the word `transcript`");
-        assert!(app.selection.is_some(), "the selection survives for a re-copy");
+        assert!(
+            app.selection.is_some(),
+            "the selection survives for a re-copy"
+        );
         // Reset the shared static's state this test never touched.
         crate::plugins::builtin::TPS.reset_for_test();
     }
@@ -9953,7 +10494,10 @@ mod tests {
         let (text, _) = app.status.expect("the toggle flashed");
         assert_eq!(text, "thinking expanded");
         // And the idle hint follows the rebind.
-        assert!(app.idle_hints.contains("Ctrl+End latest"), "jump_bottom kept its default");
+        assert!(
+            app.idle_hints.contains("Ctrl+End latest"),
+            "jump_bottom kept its default"
+        );
         crate::plugins::builtin::TPS.reset_for_test();
     }
 

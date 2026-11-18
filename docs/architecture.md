@@ -53,6 +53,8 @@ Text that streamed before a round's tool calls is committed first, together with
 
 **Queued turns.** Enter on a busy front-end submits a plain `Op::UserTurn`, which the FIFO holds until the running turn finalizes — the worker never reads the channel mid-turn. Because a config change made *after* a message was queued must still govern that message's turn, the worker pre-drains the config-op family (`SwitchModel`, `SetReasoningEffort`, `SwitchProfile`, `SetToolsEnabled`, `SetSystemPromptAppendix`) out of the channel before starting any turn and applies them first; everything else keeps its FIFO place. That is what makes `/model` "applies from the next turn" hold regardless of queue order.
 
+The TUI keeps its own queue in front of that FIFO: `queue_text` holds the entry and submits nothing, `TurnComplete` releases one entry per turn (`flush_queue`, which records the submission id and lets `TurnStarted` retire the row), and `TurnAborted` holds the queue instead — so `Esc` really ends the conversation rather than letting the next queued turn run. Withdrawal and editing are therefore pure front-end edits, and `Alt+S` can release the whole held queue at once (steering into a running turn, or starting regular turns when idle).
+
 ## State ownership
 
 Only the worker mutates conversation state. That is the rule the rest of the design follows from, and it explains why several things look indirect.

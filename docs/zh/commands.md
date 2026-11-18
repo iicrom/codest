@@ -79,9 +79,12 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 
 | 按键 | 行为 |
 | --- | --- |
-| `Enter` | 发送；候选可见时执行选中的指令。 |
+| `Enter` | 发送；生成中则排队（当前回合结束后作为独立回合运行）；候选可见时执行选中的指令。 |
+| `Alt+Enter` | 立即投递：空闲时直接发送，生成中以 steer 加入当前回合的下一个 step boundary；队列菜单中 steer 选中项。 |
+| `Ctrl+R` | 聚焦排队消息菜单：`↑↓` 选择、`Enter` 取回编辑、`Delete` 撤回、`Alt+Enter` steer 选中项、`Esc` 关闭。 |
+| `Alt+S` | 释放全部挂起消息——生成中以 steer 加入当前回合；空闲时队首立即开回合，其余逐回合跟进。 |
 | `Tab` | 补全选中的指令；`/model` 菜单中循环高亮模型的 effort（`Shift+Tab` 反向）。 |
-| `Ctrl+J` / `Alt+Enter` / `Shift+Enter` | 插入换行。 |
+| `Ctrl+J` / `Shift+Enter` / `Ctrl+Enter` | 插入换行。 |
 | `↑` / `↓` | 选择候选；多行移动光标；单行浏览输入历史。 |
 | `Ctrl+P` / `Ctrl+N` | 浏览输入历史。 |
 | `←` / `→` / `Home` / `End` | 光标移动。 |
@@ -108,8 +111,9 @@ slash 指令是 TUI 的本地控制面：它们在本地解析并在前端执行
 - **`Ctrl+C` 有三种状态。** 生成中中断当前回合——中断确认开启时（`/settings` 的 *Confirm interrupt*，即 `config.toml` 的 `double_press_interrupt`，默认开启），第一次按下只显示提示，两秒内再按一次才中断，Esc 同理；输入框有文本时清空输入；空输入时必须快速连按两次才退出。
 - **`/model` 菜单自带 effort 条。** 模型列表下方展示高亮模型的档位加 `off`，方括号标出 Enter 将生效的值：已起草的档位、当前模型的生效 effort、或该模型自身的默认档。`Tab`/`Shift+Tab` 循环起草，`Enter` 将模型与 effort 一并应用（浏览过程不发送任何请求）；`Ctrl+S` 把当前组合写入 `config.toml` 的 `default` 与 `default_effort`，新会话由此启动（profile 的 `effort` 仍优先于它）。
 - **`Ctrl+D`** 只在空输入时退出——有文本时不做任何事。
+- **排队消息由前端持有。** 生成中按 `Enter` 只是把消息放进队列，TUI 在回合正常结束（`TurnComplete`）后才逐条交给 core。因此 `Esc`/`Ctrl+C` 中断后队列会**挂起**，不会自动发出：`Alt+S` 一键释放整个队列（生成中转为 steer；空闲时队首立即开回合，其余逐回合跟上），`Ctrl+R` 打开队列菜单逐条编辑或撤回——这些都是纯前端操作，不产生任何模型请求。被 steer 的消息若已进入当前回合则无法取回。
 - **鼠标文字选中（fullscreen）。** 在 transcript 上按住拖拽即可选中——实色高亮、保留前景色；双击选中所在词，三击选中整行；松开鼠标立即把选中文本复制到剪贴板——优先原生工具（macOS `pbcopy`，Linux `wl-copy`/`xclip`/`xsel`），其次 `tmux load-buffer -w`，最后向终端写 OSC 52 序列。footer 闪现提示说明结果——`copied 128 chars`，非默认路径会注明（`(osc52)`）。选区保存在绝对行坐标上，滚轮滚动时高亮跟随文本；除滚动键外的任何按键（含 `Esc`）都会清除选区。inline 模式不上报鼠标，选中/复制由终端原生行为负责。
-- **可改绑快捷键。** 上表中的 8 个宿主动作（`Ctrl+T`、`Ctrl+O`、`PageUp`/`PageDown`、`Ctrl+End`、`Ctrl+P`/`Ctrl+N`、`Ctrl+D`）与每个插件注册的快捷键，都列在 `/settings` 的专属 **Shortcuts** 卡上（`/settings shortcuts` 直接聚焦），与选项卡分开；改绑采用按键捕获：`Enter` 进入捕获后按下组合即绑定（`Enter` 前继续按可添加备选），`Backspace` **彻底禁用**该快捷键（任何键都不触发），`Esc` 取消；保留键（中断守卫、输入框编辑键、补全）与其他绑定的组合在按下的瞬间就会被拒绝。底层是 `config.toml` 的 `[shortcuts]` 表——见 [configuration.md](configuration.md)。中断守卫、输入框按键与补全本身不可改绑。
+- **可改绑快捷键。** 上表中的宿主动作（`Ctrl+T`、`Ctrl+O`、`PageUp`/`PageDown`、`Ctrl+End`、`Ctrl+P`/`Ctrl+N`、`Ctrl+R`、`Alt+S`、`Ctrl+D`）与每个插件注册的快捷键，都列在 `/settings` 的专属 **Shortcuts** 卡上（`/settings shortcuts` 直接聚焦），与选项卡分开；改绑采用按键捕获：`Enter` 进入捕获后按下组合即绑定（`Enter` 前继续按可添加备选），`Backspace` **彻底禁用**该快捷键（任何键都不触发），`Esc` 取消；保留键（中断守卫、输入框编辑键、补全）与其他绑定的组合在按下的瞬间就会被拒绝。底层是 `config.toml` 的 `[shortcuts]` 表——见 [configuration.md](configuration.md)。中断守卫、输入框按键与补全本身不可改绑。
 
 ## 相关文档
 

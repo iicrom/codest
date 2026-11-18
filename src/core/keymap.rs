@@ -91,6 +91,20 @@ pub static HOST_SHORTCUTS: &[ShortcutSpec] = &[
         false,
     ),
     ShortcutSpec::new(
+        "pending_queue",
+        "Pending queue",
+        "Focus the queued-message menu: ↑↓ select, Enter edit, Del withdraw, Esc close.",
+        "ctrl+r",
+        false,
+    ),
+    ShortcutSpec::new(
+        "send_queue",
+        "Send queued now",
+        "Send every held queued message now: steer into the running turn, or start turns when idle.",
+        "alt+s",
+        false,
+    ),
+    ShortcutSpec::new(
         "quit",
         "Quit",
         "Exit the app (when the composer is empty).",
@@ -439,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn the_host_registry_covers_the_eight_actions() {
+    fn the_host_registry_covers_every_host_action() {
         let entries = registry();
         let ids = entries
             .iter()
@@ -455,6 +469,8 @@ mod tests {
                 "jump_bottom",
                 "history_prev",
                 "history_next",
+                "pending_queue",
+                "send_queue",
                 "quit"
             ]
         );
@@ -469,6 +485,10 @@ mod tests {
         assert!(keymap.matches("page_up", &combo("pageup")));
         assert!(keymap.matches("jump_bottom", &combo("ctrl+end")));
         assert!(!keymap.matches("jump_bottom", &combo("ctrl+y")));
+        // The queue's two host actions, disjoint from everything above.
+        assert!(keymap.matches("pending_queue", &combo("ctrl+r")));
+        assert!(keymap.matches("send_queue", &combo("alt+s")));
+        assert!(!keymap.matches("pending_queue", &combo("alt+s")));
     }
 
     #[test]
