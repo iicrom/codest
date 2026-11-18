@@ -15,7 +15,7 @@ cargo install --git https://github.com/iicrom/codest
 codest    # or: cst
 ```
 
-Highlights: multi-provider switching with `/model`, named profiles, `bash`/`pwsh` and `fs` tools with per-session toggles, resumable sessions with UUIDv7 ids, thinking and tool cards, Markdown replies with syntax highlighting, and two TUI modes (fullscreen / inline).
+Highlights: multi-provider switching with `/model`, named profiles, `bash`/`pwsh` and `fs` tools (including `read_image` for local screenshots) with per-session toggles, resumable sessions with UUIDv7 ids, thinking and tool cards, Markdown replies with syntax highlighting, and two TUI modes (fullscreen / inline).
 
 ## Documentation
 

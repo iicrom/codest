@@ -16,8 +16,8 @@ Pass `--port 0` to bind an ephemeral port; the chosen URL is printed on stdout.
 Tool-calling round trip: a keyword in the last user message turns the next
 response into a `tool_calls` delta (fragmented arguments, the shape providers
 stream) instead of text. `@bash` (`@pwsh` on Windows — the built-in shell tool
-is the host's own), `@read`, `@write` and `@edit` call that built-in tool with
-the text after the keyword (`@bash ls -la` → `bash` with
+is the host's own), `@read`, `@write`, `@edit` and `@read-image` call that
+built-in tool with the text after the keyword (`@bash ls -la` → `bash` with
 `{"command": "ls -la"}`); `@ask-user` calls the built-in `ask_user_question`
 plugin with one structured question (`@ask-user Which color? | red | blue`),
 which the front-end shows as a modal dialog; `@tool` calls whatever `--tool` /
@@ -25,6 +25,9 @@ which the front-end shows as a modal dialog; `@tool` calls whatever `--tool` /
 no tool by that name is in the binary, so its result is the
 `error: unknown tool …` text. codest executes the call and feeds the result
 back as a `role: "tool"` message; the following response summarizes the round.
+`@read-image` additionally attaches the prepared image, which codest sends as
+a follow-up `user` message with `image_url` parts — this server looks past
+that carrier when it works out which turn the request is in.
 
 Every message without a keyword gets the help reply, which lists these
 keywords — so the server documents itself on the first turn.
@@ -129,11 +132,32 @@ def usage_report(messages: Any, completion_text: str) -> dict[str, int]:
     }
 
 
+def carries_images(message: dict[str, Any]) -> bool:
+    """Whether a `user` message carries image parts.
+
+    codest sends the images a tool attached (`read_image`) as a follow-up
+    `user` message right after the `tool` result, because chat completions
+    gives `role: "tool"` text only. That carrier opens with an explanatory
+    text part and then the `image_url` parts; it is not a new turn, so the
+    keyword scan and the round bookkeeping look past it. A real user turn
+    never looks like this — codest's chat input is text only.
+    """
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(part, dict) and part.get("type") in ("image_url", "input_image")
+        for part in content
+    )
+
+
 def last_user_text(messages: Any) -> str:
     if not isinstance(messages, list):
         return "(empty message)"
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        if carries_images(message):
             continue
         content = message.get("content")
         if isinstance(content, str):
@@ -236,6 +260,15 @@ def read_arguments(rest: str) -> dict[str, Any]:
     return {"path": path or "README.md", "limit": 40}
 
 
+def read_image_arguments(rest: str) -> dict[str, Any]:
+    """`@read-image <path> [high|original]`."""
+    path, detail = first_word(rest)
+    arguments: dict[str, Any] = {"path": path or "image.png"}
+    if detail in ("high", "original"):
+        arguments["detail"] = detail
+    return arguments
+
+
 def write_arguments(rest: str) -> dict[str, Any] | None:
     """`@write <path> <content>`; `None` when the path is missing."""
     path, content = first_word(rest)
@@ -299,8 +332,10 @@ class Trigger:
     build: Callable[[str], dict[str, Any] | None] | None = None
 
 
-# Order matters only if keywords could overlap; they do not. `@tool` first
-# keeps the historical trigger — and the smoke scripts — working unchanged.
+# Order matters where keywords overlap, and they do in one place: `@read` is
+# a prefix of `@read-image`, so the longer keyword is listed first. `@tool`
+# first keeps the historical trigger — and the smoke scripts — working
+# unchanged.
 TRIGGERS: tuple[Trigger, ...] = (
     Trigger(
         keyword="@tool",
@@ -315,6 +350,15 @@ TRIGGERS: tuple[Trigger, ...] = (
         tool=SHELL_TOOL,
         summary=f"run a shell command, e.g. `@{SHELL_TOOL} {SHELL_EXAMPLE}`",
         build=shell_arguments,
+    ),
+    Trigger(
+        keyword="@read-image",
+        tool="read_image",
+        summary=(
+            "load an image for visual inspection, e.g. "
+            "`@read-image shot.png` (`… original` keeps more resolution)"
+        ),
+        build=read_image_arguments,
     ),
     Trigger(
         keyword="@read",
@@ -388,8 +432,13 @@ def current_turn(messages: Any) -> list[dict[str, Any]]:
         return []
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
-        if isinstance(message, dict) and message.get("role") == "user":
-            return [item for item in messages[index + 1 :] if isinstance(item, dict)]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        # The image carrier a `read_image` round appends is part of the turn,
+        # not the start of a new one.
+        if carries_images(message):
+            continue
+        return [item for item in messages[index + 1 :] if isinstance(item, dict)]
     return [item for item in messages if isinstance(item, dict)]
 
 

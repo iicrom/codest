@@ -67,7 +67,7 @@ codex 的做法最有借鉴价值，因为它是三者中唯一同时解决两�
 
 这条分工解释了为什么 `ProtocolFactory::create(instance, model)` 的签名不需要
 改动：它已经同时拿到 instance 和 model，足够解析头名。外部 provider 插件
-（`cst-provider-qoder` 等）零改动，`PLUGIN_API_VERSION` 保持 1。
+（`cst-provider-qoder` 等）零改动，`PLUGIN_API_VERSION` 保持 2。
 
 **3.4 client 每轮重建，底层连接池进程级共享。**
 

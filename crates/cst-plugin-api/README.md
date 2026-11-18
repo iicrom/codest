@@ -49,7 +49,7 @@ implementation at `../../../cst-provider-qoder`.
 
 ## Versioning
 
-`PLUGIN_API_VERSION` is `1`.
+`PLUGIN_API_VERSION` is `2`.
 
 - Adding a trait method **with a default implementation** does not bump it.
 - Changing an existing signature or its meaning does — plugins must follow.

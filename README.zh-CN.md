@@ -15,7 +15,7 @@ cargo install --git https://github.com/iicrom/codest
 codest    # 或：cst
 ```
 
-主要特性：`/model` 多 Provider 切换、命名 profile、带会话级开关的 `bash`/`pwsh` 与 `fs` 工具、UUIDv7 会话恢复、thinking 与工具卡片、带语法高亮的 Markdown 回复，以及 fullscreen / inline 双 TUI 模式。
+主要特性：`/model` 多 Provider 切换、命名 profile、带会话级开关的 `bash`/`pwsh` 与 `fs` 工具（含 `read_image`，可查看本地截图）、UUIDv7 会话恢复、thinking 与工具卡片、带语法高亮的 Markdown 回复，以及 fullscreen / inline 双 TUI 模式。
 
 ## 文档
 

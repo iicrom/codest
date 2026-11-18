@@ -34,6 +34,13 @@ impl Role {
 /// message may carry `tool_calls`, and a `Role::Tool` message names the call
 /// it answers via `tool_call_id`. Both default to `None` so persisted
 /// rollouts written before tools existed still load.
+///
+/// `images` carries media a tool attached to its result (`read_image`). It is
+/// only ever set on a `Role::Tool` message; the images ride the *next*
+/// request, next to the result text ([`crate::model`] clients serialize them
+/// as a follow-up user message, the shape chat-completions gateways accept).
+/// Empty for every other message, and skipped on the wire when empty, so the
+/// field costs nothing in the common case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -42,6 +49,8 @@ pub struct Message {
     pub tool_calls: Option<Vec<crate::tools::ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::tools::ToolImage>,
 }
 
 impl Message {
@@ -51,6 +60,7 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -74,6 +84,7 @@ impl Message {
             content: String::new(),
             tool_calls: Some(tool_calls),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -84,6 +95,20 @@ impl Message {
             content: content.into(),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            images: Vec::new(),
+        }
+    }
+
+    /// A tool result that attached images (`read_image`): the reported text
+    /// plus the prepared media, keyed to the call that produced them.
+    pub fn tool_result_with_images(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<crate::tools::ToolImage>,
+    ) -> Self {
+        Self {
+            images,
+            ..Self::tool_result(tool_call_id, content)
         }
     }
 }

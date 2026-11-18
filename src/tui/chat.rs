@@ -567,7 +567,7 @@ fn tool_category_color(name: &str) -> Color {
         // names are listed so a card replayed from a session recorded on the
         // other platform still colors as a command runner.
         "bash" | "pwsh" => theme::TOOL_EXEC,
-        "read" => theme::TOOL_READ,
+        "read" | "read_image" => theme::TOOL_READ,
         "write" | "edit" => theme::TOOL_MUTATE,
         _ => theme::ACCENT,
     }

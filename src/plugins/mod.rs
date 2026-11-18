@@ -660,10 +660,16 @@ impl PluginHost {
 /// dispatch to the plugin that declared the tool, errors included.
 impl ToolExecutor for PluginHost {
     fn execute(&self, call: &ToolCall) -> Result<String, String> {
+        self.execute_output(call).map(|output| output.text)
+    }
+
+    fn execute_output(&self, call: &ToolCall) -> Result<cst_plugin_api::tools::ToolOutput, String> {
         let plugin = self
             .tool_owner(&call.name)
             .ok_or_else(|| format!("unknown tool `{}`", call.name))?;
-        plugin.run_tool(call).map_err(|error| error.to_string())
+        plugin
+            .run_tool_output(call)
+            .map_err(|error| error.to_string())
     }
 }
 

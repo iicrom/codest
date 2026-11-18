@@ -46,9 +46,28 @@ Windows differences worth knowing:
 
 | Tool | Behavior |
 | --- | --- |
-| `read` | Line-numbered window over a text file, with `offset` (1-based) and `limit` continuation; refuses binary files and points at the host's shell tool (`bash`/`pwsh`) instead. Marked `read_only`. |
+| `read` | Line-numbered window over a text file, with `offset` (1-based) and `limit` continuation; refuses binary files and points at `read_image` when the bytes carry an image signature, at the host's shell tool (`bash`/`pwsh`) otherwise. Marked `read_only`. |
 | `write` | Create or overwrite a file with complete content, creating parent directories as needed. |
 | `edit` | Exact-string replacement via `old_string`/`new_string`; requires a unique match or `replace_all`. BOM and CRLF are preserved, so untouched lines keep their bytes. |
+| `read_image` | Load a local PNG/JPEG/GIF/WebP for visual inspection — codex's `view_image`. The image is downscaled to the model's image budget and attached to the tool result; the text says what was read and how it was prepared. Marked `read_only`. |
+
+`read_image` decodes the file, then fits it to a **patch budget** (32-pixel
+patches) before attaching it: `detail: "high"` (the default) allows 2500
+patches at most 2048 px per side, `detail: "original"` allows 10 000 patches
+and 6000 px. The longer side is capped first, then the area is shrunk so the
+integer result stays inside the budget — a 2304x864 screenshot arrives as
+2048x768. PNG, JPEG, and WebP pass through byte for byte when no resize was
+needed; anything re-encoded (a GIF frame, a resized image) lands as PNG. The
+bytes travel as an inline `data:` URL, because a chat-completions request has
+no uploaded-file handle, and `role: "tool"` carries text only — so the client
+sends the images as a follow-up `user` message with `image_url` parts, the
+shape gateway adapters accept. That carrier follows the *whole* run of tool
+results in a round, never sits between two of them. Only the newest images
+ride a request: 4 MB of decoded image bytes is the per-request budget, so a
+picture read earlier stops being re-sent while its text result stays in the
+transcript. Files over 128 MB, images whose canvas exceeds 16384 px per side,
+and non-images are refused with a message that names the next step (`read`
+for text).
 
 All paths resolve against the working directory when relative.
 
@@ -135,6 +154,7 @@ The file tools know more than their result string does, so their cards render a 
 | --- | --- |
 | `@bash <command>` (`@pwsh` on Windows) | the host's shell tool with `{"command": "<command>"}` |
 | `@read <path>` | `read` with `{"path": "<path>"}` |
+| `@read-image <path> [high\|original]` | `read_image` with `{"path": "<path>"}` (plus `detail` when given) |
 | `@write <path> <content>` | `write` |
 | `@edit <path> \| <old> \| <new>` | `edit` |
 | `@tool [args…]` | the tool named by `--tool` (default `ping`, which nothing implements) with `--tool-arguments` |

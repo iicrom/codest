@@ -971,7 +971,9 @@ fn preview_text(message: &Message) -> String {
 }
 
 /// The selected entry in full: tool calls first (they are the structure),
-/// then the content, hard-wrapped to the width.
+/// then the content, hard-wrapped to the width. An attached image is named
+/// rather than dumped — the inline data URL would be megabytes of base64 —
+/// so the viewer still says the tool result carries one.
 fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(calls) = &message.tool_calls {
@@ -984,6 +986,17 @@ fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
                 )));
             }
         }
+    }
+    for image in &message.images {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "🖼  image attachment · {} · {} · detail {}",
+                image.mime,
+                crate::plugins::builtin::tools::image::human_bytes(image.decoded_bytes()),
+                image.detail,
+            ),
+            Style::default().fg(theme::DIM),
+        )));
     }
     if message.content.is_empty() {
         if lines.is_empty() {

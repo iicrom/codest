@@ -28,7 +28,7 @@ codest ──depends on──▶ your-plugin ──depends on──▶ cst-plugi
 （`codest::core::model`、`codest::plugins::Plugin`…），所以这次拆分没有改名
 任何东西。
 
-**版本。** `PLUGIN_API_VERSION` 当前是 `1`。没有运行时握手：宿主与插件通过
+**版本。** `PLUGIN_API_VERSION` 当前是 `2`。没有运行时握手：宿主与插件通过
 **Cargo 版本**达成一致，契约不兼容时直接**编译失败**而不是启动失败——后者
 才是糟糕的失败方式。新增带默认实现的方法不升版本；改已有签名或语义必须升。
 依赖写范围（`cst-plugin-api = "0.1"`），不要精确钉死。

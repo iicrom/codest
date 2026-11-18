@@ -70,8 +70,19 @@ pub trait Plugin: Sync {
     /// Execute one call of a tool this plugin declared via [`Plugin::tools`].
     /// `Ok` output becomes the tool message content; `Err` reaches both the
     /// model (as `error: …` content) and the transcript (as a failure line).
+    ///
+    /// A tool that attaches media overrides [`Plugin::run_tool_output`]
+    /// instead; this text-only method is the default it falls back to.
     fn run_tool(&self, _call: &ToolCall) -> Result<String, PluginError> {
         Err(PluginError::new("this plugin declares no tool executor"))
+    }
+
+    /// Execute one call, images included. The default wraps
+    /// [`Plugin::run_tool`] with no images, so a text-only plugin compiles
+    /// unchanged; a tool that returns images (`read_image`) overrides this
+    /// and lets [`Plugin::run_tool`] stay unimplemented.
+    fn run_tool_output(&self, call: &ToolCall) -> Result<crate::tools::ToolOutput, PluginError> {
+        self.run_tool(call).map(crate::tools::ToolOutput::text)
     }
 
     /// Hand this plugin the front-end's prompt service, once at startup.
@@ -550,10 +561,9 @@ impl<'a> PluginContext<'a> {
     /// Queue [`PluginEffect::SetSystemPromptAppendix`]: append this text to
     /// the session's system prompt for every request (`None` clears it).
     pub fn set_system_prompt_appendix(&mut self, appendix: Option<impl Into<String>>) {
-        self.effects
-            .push(PluginEffect::SetSystemPromptAppendix(
-                appendix.map(Into::into),
-            ));
+        self.effects.push(PluginEffect::SetSystemPromptAppendix(
+            appendix.map(Into::into),
+        ));
     }
 
     /// This plugin's stable id — useful for attributing diagnostics.

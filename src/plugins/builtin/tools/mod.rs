@@ -1,13 +1,13 @@
 //! Built-in tool plugins: the shell tool and the file tools
-//! (`read`/`write`/`edit`).
+//! (`read`/`write`/`edit`/`read_image`).
 //!
 //! Two plugins rather than one, so the existing profile machinery's
 //! plugin-id filter already answers the coarse question (a future
 //! read-only profile can enable `fs` without the shell); the session-level
 //! `/tools` switch does the fine-grained work per tool. Shapes follow the
 //! references distilled in each module: pi for schemas/truncation, dsh for
-//! the edit semantics, codex for collection caps and the kill-on-timeout
-//! posture.
+//! the edit semantics, codex for collection caps, the kill-on-timeout
+//! posture, and the image budget (`view_image` → [`image`]).
 //!
 //! The shell tool is the platform's own — `bash` on unix hosts, `pwsh` on
 //! Windows — selected at compile time below. Both are thin shims over the
@@ -21,6 +21,9 @@
 //! prompt sections below teach read-before-edit and edit-over-write.
 
 mod fs;
+// `pub(crate)` so `/context` can label an attached image with the same byte
+// formatting the tool's result line uses.
+pub(crate) mod image;
 mod shell;
 mod truncate;
 
@@ -38,6 +41,7 @@ use self::bash as shell_tool;
 use self::pwsh as shell_tool;
 
 use crate::core::tools::ToolCall;
+use crate::core::tools::ToolOutput;
 use crate::core::tools::ToolSpec;
 use crate::plugins::Plugin;
 use crate::plugins::PluginError;
@@ -56,7 +60,8 @@ pub(crate) use shell_tool::TOOL_NAME as SHELL_TOOL_NAME;
 /// through). The process working directory is the workspace codest was
 /// started in and never changes mid-run, so no per-call context is needed.
 pub(crate) fn workdir() -> Result<std::path::PathBuf, String> {
-    std::env::current_dir().map_err(|error| format!("cannot resolve the working directory: {error}"))
+    std::env::current_dir()
+        .map_err(|error| format!("cannot resolve the working directory: {error}"))
 }
 
 static READ_SPEC: ToolSpec = ToolSpec {
@@ -138,13 +143,38 @@ once — include enough surrounding lines to make it unique — or set \
     read_only: false,
 };
 
+static READ_IMAGE_SPEC: ToolSpec = ToolSpec {
+    name: "read_image",
+    description: "Load a local image (PNG, JPEG, GIF, WebP) so you can look \
+at it. Downscaled to fit the model's image budget unless `detail` is \
+\"original\"; the result reports the source and prepared size. Use this for \
+screenshots, diagrams, and design references already on disk.",
+    parameters_json: r#"{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Image path, absolute or relative to the working directory."
+    },
+    "detail": {
+      "type": "string",
+      "enum": ["high", "original"],
+      "description": "`high` (default) downscales to ~2048px; `original` keeps more resolution (up to 6000px) when the model supports it."
+    }
+  },
+  "required": ["path"]
+}"#,
+    read_only: true,
+};
+
 static FS_PROMPT: &str = r#"## Files
 - `read` shows a numbered window of a text file; continue large files with `offset`.
 - `edit` replaces exact text; `old_string` must be unique (or pass `replace_all`). `write` overwrites whole files.
+- `read_image` loads a local PNG/JPEG/GIF/WebP for visual inspection; `detail: "original"` keeps more resolution than the default downscale.
 - Read a file before editing or overwriting it. Prefer `edit` over `write` for existing files."#;
 
 static SHELL_TOOLS: [ToolSpec; 1] = [shell_tool::SPEC];
-static FS_TOOLS: [ToolSpec; 3] = [READ_SPEC, WRITE_SPEC, EDIT_SPEC];
+static FS_TOOLS: [ToolSpec; 4] = [READ_SPEC, WRITE_SPEC, EDIT_SPEC, READ_IMAGE_SPEC];
 
 impl Plugin for ShellPlugin {
     fn id(&self) -> &'static str {
@@ -188,13 +218,27 @@ impl Plugin for FsPlugin {
             "read" => fs::run_read(&call.arguments),
             "write" => fs::run_write(&call.arguments),
             "edit" => fs::run_edit(&call.arguments),
+            "read_image" => {
+                // An image result is never text-only: it needs the executor
+                // method that carries the attachment.
+                return Err(PluginError::new(
+                    "`read_image` returns an image; execute it through the tool executor",
+                ));
+            }
             other => {
                 return Err(PluginError::new(format!(
                     "plugin `fs` does not implement tool `{other}`"
-                )))
+                )));
             }
         };
         outcome.map_err(PluginError::new)
+    }
+
+    fn run_tool_output(&self, call: &ToolCall) -> Result<ToolOutput, PluginError> {
+        if call.name == "read_image" {
+            return fs::run_read_image(&call.arguments).map_err(PluginError::new);
+        }
+        self.run_tool(call).map(ToolOutput::text)
     }
 }
 
@@ -204,20 +248,43 @@ mod tests {
 
     #[test]
     fn specs_parse_and_carry_the_read_only_flag() {
-        for spec in [&SHELL_TOOLS[0], &READ_SPEC, &WRITE_SPEC, &EDIT_SPEC] {
+        for spec in [
+            &SHELL_TOOLS[0],
+            &READ_SPEC,
+            &WRITE_SPEC,
+            &EDIT_SPEC,
+            &READ_IMAGE_SPEC,
+        ] {
             let function = spec.function_json();
             assert_eq!(function["type"], "function", "{}", spec.name);
             assert_eq!(
-                function["function"]["parameters"]["type"],
-                "object",
+                function["function"]["parameters"]["type"], "object",
                 "{}: parameters_json must be a schema object",
                 spec.name
             );
         }
         assert!(READ_SPEC.read_only);
+        assert!(READ_IMAGE_SPEC.read_only);
         assert!(!SHELL_TOOLS[0].read_only);
         assert!(!WRITE_SPEC.read_only);
         assert!(!EDIT_SPEC.read_only);
+    }
+
+    /// `read_image` is offered with the image-only vocabulary it understands:
+    /// a `detail` the handler accepts, and nothing else optional.
+    #[test]
+    fn the_image_tool_declares_its_detail_values() {
+        let parameters: serde_json::Value =
+            serde_json::from_str(READ_IMAGE_SPEC.parameters_json).expect("schema");
+        assert_eq!(parameters["required"][0], "path");
+        let details = parameters["properties"]["detail"]["enum"]
+            .as_array()
+            .expect("an enum");
+        assert_eq!(details, &[json_str("high"), json_str("original")]);
+    }
+
+    fn json_str(value: &str) -> serde_json::Value {
+        serde_json::Value::String(value.to_string())
     }
 
     /// The tool is the host's own: same argument shape either way, but the
@@ -244,17 +311,22 @@ mod tests {
 
     #[test]
     fn executors_route_by_tool_name() {
-        assert!(SHELL.run_tool(&ToolCall {
-            id: "c1".to_string(),
-            name: "not-the-shell".to_string(),
-            arguments: "{}".to_string(),
-        })
-        .is_err());
-        assert!(FS.run_tool(&ToolCall {
-            id: "c2".to_string(),
-            name: "not-fs".to_string(),
-            arguments: "{}".to_string(),
-        })
-        .is_err());
+        assert!(
+            SHELL
+                .run_tool(&ToolCall {
+                    id: "c1".to_string(),
+                    name: "not-the-shell".to_string(),
+                    arguments: "{}".to_string(),
+                })
+                .is_err()
+        );
+        assert!(
+            FS.run_tool(&ToolCall {
+                id: "c2".to_string(),
+                name: "not-fs".to_string(),
+                arguments: "{}".to_string(),
+            })
+            .is_err()
+        );
     }
 }
