@@ -8,7 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Added
 
-- Queued-message management: `Ctrl+R` focuses the queue (`↑↓` select, `Enter` takes the message back into the composer, `Delete` withdraws it, `Alt+Enter` steers the selection, `Esc` closes), and `Alt+S` sends the whole held queue at once — steered into a running turn, or started as regular turns when idle. Both are host shortcuts, rebindable in `/settings`.
+- Queued-message management: `Ctrl+R` focuses the queue (`↑↓` select, `Enter` takes the message back into the composer, `Delete` withdraws it, `Alt+Enter` steers the selection, `Esc` closes), and `Alt+S` releases the whole held queue — steered into a running turn, or, when idle, the head starting a turn with the rest following one per turn. Both are host shortcuts, rebindable in `/settings`.
 - `read_image` tool (`fs` plugin): loads a local PNG/JPEG/GIF/WebP, downscales it to the model's image patch budget (codex's `view_image` policy — 2048 px / 2500 patches by default, `detail: "original"` up to 6000 px / 10 000 patches), and attaches the prepared bytes to the tool result. The tool is `read_only`, appears in `/tools`, and is recorded in rollouts so a resumed session keeps its images.
 - Plugin contract: `ToolOutput { text, images }`, `ToolImage`, and the defaulted `Plugin::run_tool_output` / `ToolExecutor::execute_output` pair, so a tool can return media without breaking text-only plugins.
 - `scripts/openai_test_server.py` gained an `@read-image <path> [high|original]` keyword, and looks past the image-carrying follow-up message when it decides which turn a request belongs to.

@@ -82,7 +82,7 @@ The composer stays live while a turn streams, and what `Enter` does depends on t
 - **Idle:** `Enter` submits a new turn.
 - **Generating:** `Enter` **queues** the message — it runs as its own turn the moment the current one finishes. `Alt+Enter` **steers** instead: the message joins the running turn at its next step boundary (after the current tool round, before the next request), without waiting for the turn to end. On a turn with no tool rounds the boundary never comes, so a steered message is handed back and requeued automatically.
 - Pending messages show as rows above the composer (`⏳ queued · after this turn`, `⚡ steer · next boundary`) until the core reports them delivered; only then do they become transcript cells, so the record never shows a message above the answer still streaming.
-- **Interrupting holds the queue.** `Esc`/`Ctrl+C` aborts the running turn, and the queued messages stay where they are — nothing runs until you send them. `Alt+S` releases the whole held queue at once (steered into a running turn, or started as regular turns when idle). To withdraw or edit an entry instead, open the queue with `Ctrl+R`: `↑↓` select, `Enter` takes the message back into the composer, `Delete` withdraws it, `Alt+Enter` sends that one now, `Esc` closes.
+- **Interrupting holds the queue.** `Esc`/`Ctrl+C` aborts the running turn, and the queued messages stay where they are — nothing runs until you send them. `Alt+S` releases the whole held queue at once: steered into a running turn, or — when idle — the first entry starts a turn immediately and the rest follow as each turn finishes (one turn at a time, so the transcript stays in order). To withdraw or edit an entry instead, open the queue with `Ctrl+R`: `↑↓` select, `Enter` takes the message back into the composer, `Delete` withdraws it, `Alt+Enter` sends that one now, `Esc` closes.
 - A command typed mid-turn runs as itself — steering is reserved for messages. The exceptions that would strand a streaming turn's output (`/new`, `/sessions`, `/clear`) are refused with a footer flash until the agent is idle again.
 - Config changes made mid-turn (`/model`, `/effort`, `/profile`, `/tools`) apply from the next turn; `/model` says so in its notice.
 
@@ -105,7 +105,7 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 | `Enter` | Send; queue the message while generating; run the selected command when the candidate popup is open. |
 | `Alt+Enter` | Deliver now: send when idle, steer into the running turn's next step boundary while generating; in the queue menu, steer the selected message. |
 | `Ctrl+R` | Focus the queued-message menu: `↑↓` select, `Enter` edit, `Delete` withdraw, `Alt+Enter` steer the selection, `Esc` close. |
-| `Alt+S` | Send every held queued message now — steered while a turn runs, regular turns when idle. |
+| `Alt+S` | Release every held queued message — steered while a turn runs; when idle, the head starts a turn and the rest follow one per turn. |
 | `Tab` | Complete the selected command; in the `/model` menu, cycle the highlighted model's effort (`Shift+Tab` back). |
 | `Ctrl+J` / `Shift+Enter` / `Ctrl+Enter` | Insert a newline. |
 | `↑` / `↓` | Select candidates; move the cursor in multi-line input; browse input history when single-line. |

@@ -2577,13 +2577,15 @@ impl App {
         }
     }
 
-    /// Retire the oldest steered entry: the core claimed it at a boundary.
-    /// The claim event carries the authoritative text for the cell.
-    fn retire_steer(&mut self) {
+    /// Retire the steered entry the core just claimed at a boundary. The
+    /// claim event carries the authoritative text, and pairing on it (rather
+    /// than on "the first steer") keeps the right row when the same message
+    /// was steered twice or the queue was edited in between.
+    fn retire_steer(&mut self, text: &str) {
         if let Some(index) = self
             .pending
             .iter()
-            .position(|entry| entry.placement == PendingPlacement::Steer)
+            .position(|entry| entry.placement == PendingPlacement::Steer && entry.text == text)
         {
             self.pending.remove(index);
             self.clamp_pending_selection();
@@ -2689,8 +2691,10 @@ impl App {
         self.command_menu_dismissed = false;
     }
 
-    /// `Delete`/`Backspace` in the queue menu: withdraw the selected message
-    /// without touching the composer. The menu stays open on the next entry.
+    /// `Delete` in the queue menu: withdraw the selected message without
+    /// touching the composer. Backspace is deliberately not bound — the
+    /// composer keeps it while the user types. The menu stays open on the
+    /// next entry.
     fn withdraw_pending(&mut self) {
         let Some(selected) = self.pending_selected else {
             return;
@@ -2773,7 +2777,13 @@ impl App {
         let at = self.pending.len();
         self.pending.splice(at..at, held);
         self.flush_queue();
-        self.flash(format!("sent {count} queued message(s)"));
+        // Only the head is running; the rest are released as their turns
+        // finish, so the flash must not claim they all went out.
+        self.flash(if count == 1 {
+            "sent 1 queued message".to_string()
+        } else {
+            format!("started 1 of {count} queued messages")
+        });
     }
 
     /// Why the active route cannot serve a message right now, if it can't:
@@ -4644,7 +4654,7 @@ impl App {
                 // boundary: retire the pending row and give the message its
                 // transcript cell, below the round that just committed and
                 // above the round about to stream.
-                self.retire_steer();
+                self.retire_steer(&text);
                 self.view_mut().history.push(HistoryCell::User(text));
             }
             EventMsg::SteerUnclaimed { texts } => {
@@ -6137,8 +6147,6 @@ fn effort_menu_line(number: usize, item: &EffortMenuItem, selected: bool) -> Lin
     Line::from(spans)
 }
 
-/// One row of the `/tools` picker: checkbox, tool name, and a read-only
-/// marker on the tools that only inspect state.
 /// One row of the pending preview: the destination marker, then the first
 /// line of the message. The selected row (only while the queue menu is
 /// focused) takes the pickers' `▸` accent treatment.
@@ -7708,6 +7716,32 @@ mod tests {
         );
     }
 
+    /// A claim retires the row matching the text the event carries, not
+    /// whatever steer happens to be first: with the same message steered
+    /// twice, the second claim must retire the second row.
+    #[tokio::test]
+    async fn a_steer_claim_retires_the_row_its_text_names() {
+        let mut app = test_app();
+        app.busy = true;
+        for text in ["first", "first"] {
+            app.composer.set_text(text.to_string());
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        }
+        assert_eq!(app.pending.len(), 2);
+
+        app.handle_agent_event(crate::core::Event::new(
+            "sub-1",
+            EventMsg::SteerClaimed {
+                text: "first".to_string(),
+            },
+        ));
+        assert_eq!(app.pending.len(), 1, "one row retired");
+        assert_eq!(app.pending[0].placement, PendingPlacement::Steer);
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::User(text)) if text == "first")
+        );
+    }
+
     /// Alt+Enter while a turn streams steers: the pending row retires when
     /// the core claims the message at a step boundary.
     #[tokio::test]
@@ -7858,6 +7892,12 @@ mod tests {
         assert_eq!(app.pending.len(), 2);
         assert!(app.pending[0].submission.is_some());
         assert!(app.pending[1].submission.is_none(), "one turn at a time");
+        // The flash names what actually happened: one turn started, not all
+        // of them sent.
+        assert_eq!(
+            app.status.clone().expect("the release flashed").0,
+            "started 1 of 2 queued messages"
+        );
 
         // Its `TurnStarted` lands the cell; the finish releases the second.
         let first = app.pending[0].submission.clone().expect("submitted");
