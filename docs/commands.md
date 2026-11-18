@@ -82,6 +82,7 @@ The composer stays live while a turn streams, and what `Enter` does depends on t
 - **Idle:** `Enter` submits a new turn.
 - **Generating:** `Enter` **queues** the message — it runs as its own turn the moment the current one finishes. `Alt+Enter` **steers** instead: the message joins the running turn at its next step boundary (after the current tool round, before the next request), without waiting for the turn to end. On a turn with no tool rounds the boundary never comes, so a steered message is handed back and requeued automatically.
 - Pending messages show as rows above the composer (`⏳ queued · after this turn`, `⚡ steer · next boundary`) until the core reports them delivered; only then do they become transcript cells, so the record never shows a message above the answer still streaming.
+- **Interrupting holds the queue.** `Esc`/`Ctrl+C` aborts the running turn, and the queued messages stay where they are — nothing runs until you send them. `Alt+S` releases the whole held queue at once (steered into a running turn, or started as regular turns when idle). To withdraw or edit an entry instead, open the queue with `Ctrl+R`: `↑↓` select, `Enter` takes the message back into the composer, `Delete` withdraws it, `Alt+Enter` sends that one now, `Esc` closes.
 - A command typed mid-turn runs as itself — steering is reserved for messages. The exceptions that would strand a streaming turn's output (`/new`, `/sessions`, `/clear`) are refused with a footer flash until the agent is idle again.
 - Config changes made mid-turn (`/model`, `/effort`, `/profile`, `/tools`) apply from the next turn; `/model` says so in its notice.
 
@@ -102,7 +103,9 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 | Key | Behavior |
 | --- | --- |
 | `Enter` | Send; queue the message while generating; run the selected command when the candidate popup is open. |
-| `Alt+Enter` | Deliver now: send when idle, steer into the running turn's next step boundary while generating. |
+| `Alt+Enter` | Deliver now: send when idle, steer into the running turn's next step boundary while generating; in the queue menu, steer the selected message. |
+| `Ctrl+R` | Focus the queued-message menu: `↑↓` select, `Enter` edit, `Delete` withdraw, `Alt+Enter` steer the selection, `Esc` close. |
+| `Alt+S` | Send every held queued message now — steered while a turn runs, regular turns when idle. |
 | `Tab` | Complete the selected command; in the `/model` menu, cycle the highlighted model's effort (`Shift+Tab` back). |
 | `Ctrl+J` / `Shift+Enter` / `Ctrl+Enter` | Insert a newline. |
 | `↑` / `↓` | Select candidates; move the cursor in multi-line input; browse input history when single-line. |
@@ -132,7 +135,7 @@ Each row is `▸ /name` (fixed-width name column), the command summary, and — 
 - **The `/model` menu carries an effort strip.** Under the model rows it shows the highlighted model's levels plus `off`, bracketing what Enter would set: the drafted level, the active effort for the current model, or the model's own default. `Tab`/`Shift+Tab` cycle the draft and `Enter` applies model and effort together (nothing is sent while browsing); `Ctrl+S` writes the shown combination to `config.toml` as `default` and `default_effort`, which fresh sessions start from (a profile's `effort` still wins over it).
 - **`Ctrl+D`** quits only on empty input — with text present it does nothing.
 - **Mouse text selection (fullscreen).** Press and drag over the transcript to select; releasing copies the highlighted text to the clipboard — a native utility first (`pbcopy`, `wl-copy`/`xclip`/`xsel`), then `tmux load-buffer -w`, then the OSC 52 sequence for the terminal itself. The footer flash names the route when it is not the obvious one (`copied 128 chars (osc52)`). A double click selects the word under it, a triple click the whole line; wheel scrolling keeps the selection pinned to its text; `Esc` (or any other key) clears it. Inline mode does not capture the mouse, so the terminal's own selection applies there.
-- **Rebindable shortcuts.** The eight host actions above (`Ctrl+T`, `Ctrl+O`, `PageUp`/`PageDown`, `Ctrl+End`, `Ctrl+P`/`Ctrl+N`, `Ctrl+D`) and every registered plugin shortcut have their rows on the dedicated **Shortcuts** card in `/settings` (`/settings shortcuts` focuses it) — kept apart from the options cards; typing a combo list there (`ctrl+t, alt+y`) rebinds the action, an empty entry restores the default, and reserved keys (the interrupt guard, the composer's editing keys, completion) plus other bindings' combos are refused. Under the hood this is the `[shortcuts]` table in `config.toml` — see [configuration.md](configuration.md). The interrupt guard, the composer's keys, and completion itself are not rebindable.
+- **Rebindable shortcuts.** The host actions above (`Ctrl+T`, `Ctrl+O`, `PageUp`/`PageDown`, `Ctrl+End`, `Ctrl+P`/`Ctrl+N`, `Ctrl+R`, `Alt+S`, `Ctrl+D`) and every registered plugin shortcut have their rows on the dedicated **Shortcuts** card in `/settings` (`/settings shortcuts` focuses it) — kept apart from the options cards; typing a combo list there (`ctrl+t, alt+y`) rebinds the action, an empty entry restores the default, and reserved keys (the interrupt guard, the composer's editing keys, completion) plus other bindings' combos are refused. Under the hood this is the `[shortcuts]` table in `config.toml` — see [configuration.md](configuration.md). The interrupt guard, the composer's keys, and completion itself are not rebindable.
 
 ## Related
 
