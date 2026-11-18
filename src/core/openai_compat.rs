@@ -197,40 +197,71 @@ pub fn endpoint_url(base_url: &str) -> String {
 /// The `messages` array for a request, in transcript order.
 ///
 /// A tool result that carries images needs a second wire message: chat
-/// completions gives `role: "tool"` only text, so the images follow it as a
+/// completions gives `role: "tool"` only text, so the images follow as a
 /// `user` message with `image_url` content parts — the shape gateway
 /// adapters and MCP clients use (see `cht-provider-qoder`'s `toolMessage`).
-/// The tool message keeps its `tool_call_id` and text, and the user message
-/// is inserted directly after it, before the next round's messages. Every
-/// other message maps one-to-one through [`message_json`].
+/// That carrier goes *after the whole run of tool results*, never between
+/// two of them: the API expects every `tool_call_id` of a round to be
+/// answered back to back, and a `user` message in the middle would orphan
+/// the results that follow it. Every other message maps one-to-one through
+/// [`message_json`].
 fn message_list_json(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
+    let mut carried: Vec<&crate::core::tools::ToolImage> = Vec::new();
     for message in messages {
+        if message.role != Role::Tool && !carried.is_empty() {
+            out.push(image_carrier(&carried));
+            carried.clear();
+        }
         out.push(message_json(message));
-        if message.role == Role::Tool && !message.images.is_empty() {
-            let mut parts: Vec<Value> = Vec::with_capacity(message.images.len() + 1);
-            parts.push(json!({
-                "type": "text",
-                "text": format!(
-                    "{} image{} returned by the tool call above; inspect {} below.",
-                    message.images.len(),
-                    if message.images.len() == 1 { "" } else { "s" },
-                    if message.images.len() == 1 { "it" } else { "them" },
-                ),
-            }));
-            for image in &message.images {
-                parts.push(json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image.data_url,
-                        "detail": image.detail,
-                    },
-                }));
-            }
-            out.push(json!({ "role": "user", "content": parts }));
+        if message.role == Role::Tool {
+            carried.extend(message.images.iter());
         }
     }
+    if !carried.is_empty() {
+        out.push(image_carrier(&carried));
+    }
     out
+}
+
+/// The `user` message that carries the images a run of tool results attached.
+fn image_carrier(images: &[&crate::core::tools::ToolImage]) -> Value {
+    let mut parts: Vec<Value> = Vec::with_capacity(images.len() + 1);
+    parts.push(json!({
+        "type": "text",
+        "text": format!(
+            "{} image{} returned by the tool call{} above; inspect {} below.",
+            images.len(),
+            if images.len() == 1 { "" } else { "s" },
+            if images.len() == 1 { "" } else { "s" },
+            if images.len() == 1 { "it" } else { "them" },
+        ),
+    }));
+    for image in images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image.data_url,
+                "detail": wire_detail(&image.detail),
+            },
+        }));
+    }
+    json!({ "role": "user", "content": parts })
+}
+
+/// The `detail` value a chat-completions request accepts.
+///
+/// [`crate::core::tools::ToolImage::detail`] is the *tool's* budget label:
+/// `original` says the image kept more than the downscaled default, which is
+/// what the transcript and `/context` report. The wire only knows
+/// `low`/`high`/`auto`, so anything else (an image prepared at the larger
+/// budget included) is sent as `high` rather than as a value the endpoint
+/// rejects.
+fn wire_detail(detail: &str) -> &str {
+    match detail {
+        "low" | "high" | "auto" => detail,
+        _ => "high",
+    }
 }
 
 /// One conversation message on the wire: role and content, plus the
@@ -737,6 +768,106 @@ mod tests {
             &TurnOptions::default(),
         );
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+    }
+
+    /// A round of parallel calls answers every `tool_call_id` back to back:
+    /// the image carrier goes after the whole run, never between two
+    /// results, or the API loses track of the rest of the round.
+    #[test]
+    fn the_image_carrier_lands_after_a_whole_run_of_tool_results() {
+        let image = crate::core::tools::ToolImage {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            mime: "image/png".to_string(),
+            detail: "high".to_string(),
+        };
+        let calls = vec![
+            crate::core::tools::ToolCall {
+                id: "c1".to_string(),
+                name: "read_image".to_string(),
+                arguments: "{}".to_string(),
+            },
+            crate::core::tools::ToolCall {
+                id: "c2".to_string(),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            },
+        ];
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+        let body = client.request_body(
+            &[
+                Message::assistant_tool_calls(calls),
+                Message::tool_result_with_images("c1", "img", vec![image]),
+                Message::tool_result("c2", "text"),
+            ],
+            &TurnOptions::default(),
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "c1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "c2");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(
+            messages[3]["content"][0]["text"],
+            "1 image returned by the tool call above; inspect it below."
+        );
+    }
+
+    /// Two image-bearing results in one round share a single carrier, so the
+    /// request does not gain a `user` turn per call.
+    #[test]
+    fn two_image_results_share_one_carrier() {
+        let image = |payload: &str| crate::core::tools::ToolImage {
+            data_url: format!("data:image/png;base64,{payload}"),
+            mime: "image/png".to_string(),
+            detail: "high".to_string(),
+        };
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+        let body = client.request_body(
+            &[
+                Message::tool_result_with_images("c1", "one", vec![image("AAAA")]),
+                Message::tool_result_with_images("c2", "two", vec![image("BBBB")]),
+            ],
+            &TurnOptions::default(),
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2]["role"], "user");
+        let parts = messages[2]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3, "one text part, two images");
+        assert_eq!(
+            parts[0]["text"],
+            "2 images returned by the tool calls above; inspect them below."
+        );
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(parts[2]["image_url"]["url"], "data:image/png;base64,BBBB");
+    }
+
+    /// `detail` is the tool's budget label, not the wire's vocabulary:
+    /// `original` reaches the endpoint as `high`, the only larger-than-low
+    /// value chat-completions accepts.
+    #[test]
+    fn a_non_wire_detail_value_is_sent_as_high() {
+        let image = crate::core::tools::ToolImage {
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            mime: "image/png".to_string(),
+            detail: "original".to_string(),
+        };
+        let client = OpenAiCompatClient::new("k", "https://example.test/v1", "m").unwrap();
+        let body = client.request_body(
+            &[Message::tool_result_with_images("c1", "img", vec![image])],
+            &TurnOptions::default(),
+        );
+        assert_eq!(
+            body["messages"][1]["content"][1]["image_url"]["detail"],
+            "high"
+        );
+        // The transcript keeps the real label.
+        assert_eq!(wire_detail("low"), "low");
+        assert_eq!(wire_detail("auto"), "auto");
+        assert_eq!(wire_detail("high"), "high");
+        assert_eq!(wire_detail("original"), "high");
     }
 
     #[test]

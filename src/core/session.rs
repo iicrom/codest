@@ -757,11 +757,26 @@ fn is_config_op(op: &Op) -> bool {
     )
 }
 
+/// How many decoded image bytes a single request may carry, across every
+/// image in the transcript. Four megabytes is several screenshots' worth
+/// while staying far below the body size a gateway rejects; older images
+/// fall out of the request ([`budget_images`]) rather than riding along
+/// forever.
+const MAX_REQUEST_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
 /// The messages for one model request: the conversation's snapshot with the
 /// active session's system-prompt appendix appended to the system message.
 /// The appendix is session state (`Op::SetSystemPromptAppendix`), not part
 /// of the conversation — the transcript, the rollout, and the
 /// `ConversationSnapshot` read path never see it.
+///
+/// Attached images are budgeted here, not in the conversation: every request
+/// re-sends the whole transcript, so images a tool attached earlier would
+/// otherwise ride along forever, growing the body by megabytes per picture
+/// with no way to reclaim it. The newest images win — the one the current
+/// round just produced is never dropped — and an evicted image simply stops
+/// travelling; its text result ("read image … 412 KB") stays in the
+/// transcript, so the model still knows a picture was read.
 fn request_messages(conversation: &Conversation, appendix: Option<&str>) -> Vec<Message> {
     let mut messages = conversation.snapshot();
     if let (Some(system), Some(appendix)) = (messages.first_mut(), appendix) {
@@ -772,7 +787,36 @@ fn request_messages(conversation: &Conversation, appendix: Option<&str>) -> Vec<
             system.content.push_str(appendix);
         }
     }
+    budget_images(&mut messages);
     messages
+}
+
+/// Keep the most recent images up to [`MAX_REQUEST_IMAGE_BYTES`], walking the
+/// transcript backwards so the budget is spent on what the model is most
+/// likely to be looking at. At least the newest image always survives, even
+/// alone over budget — dropping it would make `read_image` useless for the
+/// very turn that asked for it.
+fn budget_images(messages: &mut [Message]) {
+    let mut spent = 0usize;
+    let mut kept_any = false;
+    for message in messages.iter_mut().rev() {
+        if message.images.is_empty() {
+            continue;
+        }
+        let mut kept: Vec<crate::core::tools::ToolImage> =
+            Vec::with_capacity(message.images.len());
+        for image in message.images.drain(..).rev() {
+            let cost = image.decoded_bytes();
+            if kept_any && spent.saturating_add(cost) > MAX_REQUEST_IMAGE_BYTES {
+                continue;
+            }
+            spent = spent.saturating_add(cost);
+            kept_any = true;
+            kept.push(image);
+        }
+        kept.reverse();
+        message.images = kept;
+    }
 }
 
 async fn run_worker(
@@ -4933,5 +4977,78 @@ mod tests {
             "data:image/png;base64,iVBORw0KGgo="
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The oldest images stop riding the request once their total passes the
+    /// budget, while the conversation and the rollout keep them — a picture
+    /// the model saw is never silently deleted from the record, it just stops
+    /// being re-sent. The newest image survives even alone over budget.
+    #[test]
+    fn old_images_fall_out_of_the_request_but_stay_in_the_record() {
+        let image = |bytes: usize| crate::core::tools::ToolImage {
+            // `decoded_bytes` recovers 3/4 of the payload length, so a payload
+            // of `bytes * 4 / 3` characters decodes to exactly `bytes`.
+            data_url: format!(
+                "data:image/png;base64,{}",
+                "A".repeat(bytes / 3 * 4)
+            ),
+            mime: "image/png".to_string(),
+            detail: "high".to_string(),
+        };
+        let mut conversation = Conversation::new("system");
+        // Three fit the budget; the fourth (oldest) falls out.
+        let each = MAX_REQUEST_IMAGE_BYTES / 3;
+        for index in 0..4 {
+            conversation.push_message(Message::tool_result_with_images(
+                format!("c{index}"),
+                format!("image {index}"),
+                vec![image(each)],
+            ));
+        }
+        let messages = request_messages(&conversation, None);
+        let kept: Vec<&Message> = messages
+            .iter()
+            .filter(|message| !message.images.is_empty())
+            .collect();
+        assert_eq!(kept.len(), 3, "three fit the budget, the fourth is dropped");
+        // The newest three are the ones that survive, and the oldest's text
+        // result is still there — only its image stopped travelling.
+        assert_eq!(kept[0].content, "image 1");
+        assert_eq!(kept[2].content, "image 3");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content == "image 0" && message.images.is_empty())
+        );
+        // The conversation itself was not touched.
+        assert_eq!(
+            conversation
+                .messages()
+                .iter()
+                .filter(|message| !message.images.is_empty())
+                .count(),
+            4
+        );
+    }
+
+    /// One image larger than the whole budget still rides: `read_image` would
+    /// be pointless in the turn that asked for it otherwise.
+    #[test]
+    fn a_single_oversized_image_still_reaches_the_request() {
+        let mut conversation = Conversation::new("system");
+        conversation.push_message(Message::tool_result_with_images(
+            "c1",
+            "huge",
+            vec![crate::core::tools::ToolImage {
+                data_url: format!(
+                    "data:image/png;base64,{}",
+                    "A".repeat(MAX_REQUEST_IMAGE_BYTES)
+                ),
+                mime: "image/png".to_string(),
+                detail: "high".to_string(),
+            }],
+        ));
+        let messages = request_messages(&conversation, None);
+        assert_eq!(messages.last().expect("the result").images.len(), 1);
     }
 }

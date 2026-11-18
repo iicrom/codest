@@ -10,12 +10,13 @@
 //! 6000 px and is only offered to models that ask for it (see
 //! [`ToolSpec`](cst_plugin_api::tools::ToolSpec) `detail` in `fs.rs`).
 //!
-//! Scaling preserves aspect ratio: first shrink so the longest side fits
-//! `MAX_DIMENSION`, then, if the patch count is still over budget, shrink by
-//! area and round the resulting patch grid *down*, so the integer output
-//! dimensions stay inside the budget. The encoder keeps the source format
-//! when it is one that can be passed through (PNG/JPEG/WebP); a re-encode
-//! (a GIF frame, say) always lands as PNG.
+//! Scaling preserves aspect ratio: first shrink so the longest side fits the
+//! budget's [`HIGH_DETAIL_MAX_DIMENSION`] (or its `original` counterpart),
+//! then, if the patch count is still over budget, shrink by area and round
+//! the resulting patch grid *down*, so the integer output dimensions stay
+//! inside the budget. The encoder keeps the source format when it is one that
+//! can be passed through (PNG/JPEG/WebP); a re-encode (a GIF frame, say)
+//! always lands as PNG.
 
 use std::io::Cursor;
 
@@ -41,6 +42,11 @@ const ORIGINAL_DETAIL_MAX_PATCHES: usize = 10_000;
 /// tool should be handed, low enough that a mislabeled multi-GB file is
 /// refused without being buffered first.
 const MAX_INPUT_BYTES: usize = 128 * 1024 * 1024;
+/// Hard cap on either side the decoder will materialize. The `original`
+/// budget resizes *down* to 6000 px, so anything beyond this is a file
+/// nothing would display anyway — and refusing it at the decoder keeps a
+/// decompression bomb from allocating a canvas the tool would only shrink.
+const MAX_DECODE_DIMENSION: u32 = 16_384;
 
 /// What the caller asked for: which budget to apply and what `detail` the
 /// request should carry.
@@ -163,7 +169,16 @@ pub(crate) fn prepare_bytes(bytes: &[u8], detail: Detail) -> Result<Prepared, St
         }
     };
 
-    let decoded = ImageReader::with_format(Cursor::new(bytes), format)
+    // The decode itself is bounded: a small file can still declare a huge
+    // canvas, and without dimension caps the decoder would allocate it in
+    // full before [`output_dimensions`] ever runs. The cap is well above
+    // anything a screenshot is, so it only ever catches a decompression bomb.
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIMENSION);
+    limits.max_image_height = Some(MAX_DECODE_DIMENSION);
+    reader.limits(limits);
+    let decoded = reader
         .decode()
         .map_err(|error| format!("cannot decode the image: {error}"))?;
     let (source_width, source_height) = (decoded.width(), decoded.height());
@@ -427,6 +442,44 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(4096), "4 KB");
         assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    /// The reported size is the image's own bytes, not the 4/3 base64 the
+    /// wire carries — the result line and the `/context` inspector both show
+    /// the file's cost, so they must agree with each other and with the file.
+    #[test]
+    fn the_attachment_reports_the_encoded_file_size() {
+        let prepared = prepare_bytes(&png(64, 48), Detail::High).expect("prepare");
+        // The payload is base64 (4 encoded chars per 3 bytes), so decoding it
+        // recovers exactly the bytes the encoder wrote.
+        assert_eq!(prepared.image.decoded_bytes(), prepared.encoded_bytes);
+        assert!(prepared.image.payload_bytes() > prepared.image.decoded_bytes());
+        let payload = prepared.image.data_url.split_once(',').expect("a data URL").1;
+        let raw = BASE64_STANDARD.decode(payload).expect("base64");
+        assert_eq!(raw.len(), prepared.image.decoded_bytes());
+    }
+
+    /// A file that declares a canvas past the decode cap is refused at the
+    /// decoder, before anything is allocated for it. These 68 bytes are a
+    /// real PNG whose IHDR claims 20000x20000 — the shape of a decompression
+    /// bomb, where the pixel data costs almost nothing but the canvas does
+    /// not. Sizing it down afterwards would already be too late.
+    #[test]
+    fn a_bomb_sized_canvas_is_refused_at_the_decoder() {
+        const BOMB: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x4e, 0x20, 0x00, 0x00, 0x4e, 0x20, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0xe3, 0x70, 0x46, 0x39, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x60, 0x00, 0x02, 0x00, 0x00, 0x05, 0x00, 0x01, 0x7a, 0x5e, 0xab, 0x3f,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let error = prepare_bytes(BOMB, Detail::High)
+            .err()
+            .expect("a 20000x20000 canvas must be refused");
+        assert!(error.contains("cannot decode"), "{error}");
+        // The cap only ever catches a bomb: everything the tool would keep,
+        // `original`'s 6000 px included, still gets through.
+        assert!(prepare_bytes(&png(7000, 100), Detail::Original).is_ok());
     }
 
     /// `read` points at `read_image` only for bytes that are recognizably an

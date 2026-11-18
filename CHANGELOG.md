@@ -14,9 +14,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ### Internal
 
-- The chat-completions client sends a tool result's images as a follow-up `user` message with `image_url` parts (`role: "tool"` carries text only), the shape gateway adapters accept.
+- The chat-completions client sends a tool result's images as a follow-up `user` message with `image_url` parts (`role: "tool"` carries text only), the shape gateway adapters accept. The carrier follows the whole run of tool results in a round, so a parallel round's `tool_call_id`s stay answered back to back.
 - `image` and `base64` dependencies (image with only the GIF/JPEG/PNG/WebP codecs compiled in).
 - Corrected the documented `PLUGIN_API_VERSION`, which had said `1` since the contract moved to `2`.
+
+### Fixed
+
+- A tool result's `detail` is the tool's budget label (`high`/`original`), not the wire's vocabulary: the client sends `original` as `high`, the only larger-than-low value chat-completions accepts, instead of an enum value endpoints reject.
+- Attached images no longer accumulate across a whole session's requests: the newest 4 MB (decoded) ride a request and older ones stop being re-sent, while their text results and the rollout keep them.
+- The image decoder refuses a canvas past 16384 px per side before allocating it, so a small file declaring a huge one cannot be used as a decompression bomb.
+- `/context` reported an attachment's size as its base64 encoding, 33% above the file's own bytes; it now shows the decoded size, matching the tool's result line.
 
 ## [0.3.1] — 2026-11-17
 

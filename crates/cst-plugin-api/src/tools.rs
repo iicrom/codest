@@ -94,13 +94,34 @@ pub struct ToolImage {
     /// `data:<mime>;base64,<payload>`.
     pub data_url: String,
     pub mime: String,
-    /// `"high"` or `"original"`, the values the wire's `detail` field takes.
+    /// `"high"` or `"original"`: the budget the tool prepared the image at.
+    /// `original` is this contract's label, not a wire value — a client maps
+    /// it to whatever its protocol accepts (chat-completions knows only
+    /// `low`/`high`/`auto`).
     pub detail: String,
 }
 
 impl ToolImage {
-    /// The encoded byte length after the data-URL prefix, for status lines
-    /// and token estimates (the base64 payload is 4/3 of the image bytes).
+    /// The image's own byte count, decoded — what the file cost before
+    /// base64 and the `data:` prefix inflated it (`payload_bytes` is 4/3 of
+    /// it). This is the number a status line or an inspector should show: a
+    /// 412 KB PNG reads as `412 KB`, not as the size of its encoding.
+    pub fn decoded_bytes(&self) -> usize {
+        // base64 pads to a multiple of four; undo the padding to recover the
+        // exact source length rather than the rounded-up encoding length.
+        let encoded = self.payload_bytes();
+        let padding = self
+            .data_url
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'=')
+            .count();
+        encoded / 4 * 3 - padding.min(2)
+    }
+
+    /// The encoded length after the data-URL prefix — the bytes actually on
+    /// the wire.
     pub fn payload_bytes(&self) -> usize {
         self.data_url
             .rfind(',')

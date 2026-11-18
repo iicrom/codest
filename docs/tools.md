@@ -46,7 +46,7 @@ Windows differences worth knowing:
 
 | Tool | Behavior |
 | --- | --- |
-| `read` | Line-numbered window over a text file, with `offset` (1-based) and `limit` continuation; refuses binary files and points at the host's shell tool (`bash`/`pwsh`) instead. Marked `read_only`. |
+| `read` | Line-numbered window over a text file, with `offset` (1-based) and `limit` continuation; refuses binary files and points at `read_image` when the bytes carry an image signature, at the host's shell tool (`bash`/`pwsh`) otherwise. Marked `read_only`. |
 | `write` | Create or overwrite a file with complete content, creating parent directories as needed. |
 | `edit` | Exact-string replacement via `old_string`/`new_string`; requires a unique match or `replace_all`. BOM and CRLF are preserved, so untouched lines keep their bytes. |
 | `read_image` | Load a local PNG/JPEG/GIF/WebP for visual inspection — codex's `view_image`. The image is downscaled to the model's image budget and attached to the tool result; the text says what was read and how it was prepared. Marked `read_only`. |
@@ -61,8 +61,13 @@ needed; anything re-encoded (a GIF frame, a resized image) lands as PNG. The
 bytes travel as an inline `data:` URL, because a chat-completions request has
 no uploaded-file handle, and `role: "tool"` carries text only — so the client
 sends the images as a follow-up `user` message with `image_url` parts, the
-shape gateway adapters accept. Files over 128 MB and non-images are refused
-with a message that names the next step (`read` for text).
+shape gateway adapters accept. That carrier follows the *whole* run of tool
+results in a round, never sits between two of them. Only the newest images
+ride a request: 4 MB of decoded image bytes is the per-request budget, so a
+picture read earlier stops being re-sent while its text result stays in the
+transcript. Files over 128 MB, images whose canvas exceeds 16384 px per side,
+and non-images are refused with a message that names the next step (`read`
+for text).
 
 All paths resolve against the working directory when relative.
 

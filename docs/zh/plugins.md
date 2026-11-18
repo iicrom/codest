@@ -272,9 +272,11 @@ cargo clippy --all-targets -- -D warnings
 插件一样走内部可变性。
 
 结果要带图片的工具改为重写 `run_tool_output`，返回
-`ToolOutput { text, images }`；两个方法互为默认实现，插件实现适配自己的那个
-即可。宿主通过 `run_tool_output` 读取结果，文本进入会话消息，图片随下一次
-请求发出。
+`ToolOutput { text, images }`。默认实现只有单向的：`run_tool_output` 包装
+`run_tool`，所以纯文本工具只实现 `run_tool`，完全不必接触图片。反方向刻意
+不做默认——两个方法互相调用会在谁都没实现时无限递归——因此带图片的工具不实现
+`run_tool`，只实现 `run_tool_output`。宿主通过 `run_tool_output` 读取结果，
+文本进入会话消息，图片随下一次请求发出。
 
 ## 6. 观测 agent：事件流、状态栏分段、后台任务
 

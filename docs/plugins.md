@@ -295,10 +295,14 @@ raw JSON-Schema text so it can live in a `const`. State goes in a `Mutex`,
 via interior mutability like the shipped plugins.
 
 A tool whose result carries an image overrides `run_tool_output` instead and
-returns `ToolOutput { text, images }`; the two methods default to each other,
-so a plugin implements whichever fits. The host reads results through
-`run_tool_output`, keeps the text for the conversation message, and sends the
-images on the following request.
+returns `ToolOutput { text, images }`. Only one direction is defaulted:
+`run_tool_output` wraps `run_tool`, so a text-only plugin implements
+`run_tool` alone and never learns about images. The reverse is deliberately
+not defaulted — a pair that each called the other would recurse forever on a
+plugin that implements neither — so a plugin that attaches images leaves
+`run_tool` unimplemented and implements `run_tool_output` only. The host reads
+results through `run_tool_output`, keeps the text for the conversation
+message, and sends the images on the following request.
 
 ## 6. Observing the agent: events, status segments, background tasks
 

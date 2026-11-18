@@ -992,7 +992,7 @@ fn message_lines(message: &Message, width: usize) -> Vec<Line<'static>> {
             format!(
                 "🖼  image attachment · {} · {} · detail {}",
                 image.mime,
-                crate::plugins::builtin::tools::image::human_bytes(image.payload_bytes()),
+                crate::plugins::builtin::tools::image::human_bytes(image.decoded_bytes()),
                 image.detail,
             ),
             Style::default().fg(theme::DIM),
