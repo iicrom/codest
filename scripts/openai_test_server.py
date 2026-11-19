@@ -215,7 +215,7 @@ def help_reply(messages: Any) -> str:
         "- `--model` names the fallback model; `--tool` / `--tool-arguments` "
         "decide what `@tool` calls\n"
         "- `--dump-headers PATH` appends one JSON line per request with its "
-        "headers, so a test can assert the session header reached the wire"
+        "headers and body, so a test can assert what actually reached the wire"
     )
 
 
@@ -494,9 +494,13 @@ class ChatHandler(BaseHTTPRequestHandler):
         elif path.endswith("/models"):
             # OpenAI-shaped directory for codest's `fetch_models` discovery;
             # `default_level` feeds the /effort picker, the context-window
-            # fields feed the footer/status display. The two entries spell
-            # the window differently on purpose: `context_length` is what
-            # OpenRouter returns, `context_window` the plain spelling.
+            # fields feed the footer/status display, and `capabilities.vision`
+            # makes `test-model` an image-input model so the `read_image` tool
+            # is offered (the host withholds image tools from text-only models,
+            # and then strips the transcript's images from the request too).
+            # The two entries spell the window differently on purpose:
+            # `context_length` is what OpenRouter returns, `context_window` the
+            # plain spelling.
             self._send_json(
                 200,
                 {
@@ -507,6 +511,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                             "name": "Test Model",
                             "default_level": "high",
                             "context_length": 128000,
+                            "capabilities": {"vision": True},
                         },
                         {
                             "id": "second-model",
@@ -524,8 +529,6 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": {"message": f"unknown path: {self.path}"}})
             return
 
-        self._record_headers()
-
         try:
             body = self._read_json()
         except ValueError as error:
@@ -536,21 +539,30 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "request body must be an object"}})
             return
 
+        self._record_request(body)
+
         if body.get("stream"):
             self._send_stream(body)
         else:
             self._send_completion(body)
 
-    def _record_headers(self) -> None:
-        """Append this request's headers as one JSON line to `--dump-headers`.
+    def _record_request(self, body: Any) -> None:
+        """Append this request as one JSON line to `--dump-headers`.
 
-        The session header is the one thing a client can only get wrong on the
-        wire, so the smoke tests assert it here rather than trusting the body.
+        The session header is the one part of a request a client can only get
+        wrong on the wire, so the smoke tests assert it here rather than
+        trusting the body. The body rides along too, because some gates (the
+        image-input one) are only visible in the declared `tools`, and a
+        request that never arrived is itself the bug.
         """
         sink = getattr(self.server, "dump_headers", None)
         if not sink:
             return
-        record = {"path": self.path, "headers": {key: value for key, value in self.headers.items()}}
+        record = {
+            "path": self.path,
+            "headers": {key: value for key, value in self.headers.items()},
+            "body": body,
+        }
         try:
             with open(sink, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -883,7 +895,7 @@ def main() -> int:
         "--dump-headers",
         default=None,
         metavar="PATH",
-        help="append one JSON line per request with its headers (for header assertions)",
+        help="append one JSON line per request with its headers and body (for wire assertions)",
     )
     args = parser.parse_args()
 

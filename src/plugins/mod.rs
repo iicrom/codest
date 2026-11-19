@@ -782,6 +782,7 @@ mod tests {
         description: "reply with pong",
         parameters_json: r#"{ "type": "object" }"#,
         read_only: true,
+        requires_image_input: false,
     };
 
     struct Echo;
@@ -893,6 +894,7 @@ mod tests {
             plugin_ids: host.plugin_ids(),
             system_sections: &[],
             effort: None,
+            image_input: false,
             request: RequestFacts {
                 protocol: "",
                 base_url: "",

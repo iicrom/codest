@@ -49,7 +49,18 @@ Windows differences worth knowing:
 | `read` | Line-numbered window over a text file, with `offset` (1-based) and `limit` continuation; refuses binary files and points at `read_image` when the bytes carry an image signature, at the host's shell tool (`bash`/`pwsh`) otherwise. Marked `read_only`. |
 | `write` | Create or overwrite a file with complete content, creating parent directories as needed. |
 | `edit` | Exact-string replacement via `old_string`/`new_string`; requires a unique match or `replace_all`. BOM and CRLF are preserved, so untouched lines keep their bytes. |
-| `read_image` | Load a local PNG/JPEG/GIF/WebP for visual inspection — codex's `view_image`. The image is downscaled to the model's image budget and attached to the tool result; the text says what was read and how it was prepared. Marked `read_only`. |
+| `read_image` | Load a local PNG/JPEG/GIF/WebP for visual inspection — codex's `view_image`. The image is downscaled to the model's image budget and attached to the tool result; the text says what was read and how it was prepared. Marked `read_only` and **image-input-only**: the host withholds it from any model whose profile does not declare `vision` (see [multi-provider.md](multi-provider.md#22-providers-models)). |
+
+`read_image` is only offered to **image-input models**. A model declares
+that with `vision = true` in `providers.toml` (or the models API's
+`capabilities.vision` / `modalities` entry); an undeclared model counts as
+text-only, because `None` is not a claim. The gate is enforced in three
+places: the tool is left out of the request's `tools` field, a call made
+anyway is rejected before the executor runs, and the transcript's attached
+images are stripped from every request to a text-only model — an endpoint
+that takes no images would reject the whole call otherwise. The transcript
+and the rollout keep those images, so switching back to a vision model
+restores them.
 
 `read_image` decodes the file, then fits it to a **patch budget** (32-pixel
 patches) before attaching it: `detail: "high"` (the default) allows 2500
@@ -98,6 +109,12 @@ headless front-end gets "UI not available" — explicitly not a decline.
 | `/tools <name> on` / `off` | Pin one tool on or off. |
 
 `read_only` tools are marked in the picker; unknown tool names and directions (`on`/`off`, plus `enable`/`disable`) are rejected with an error listing the available tools.
+
+A tool that needs image input (`read_image`) is shown with a `[-]` box and a
+`needs a vision model` note while the active model declares no `vision`; Space
+does not flip it, `/tools read_image on` explains why, and `/context` reports
+it as `unavailable`. Switching to a vision model with `/model` lifts the
+restriction on the next frame.
 
 - **Disabled tools are removed from the request's `tools` field entirely** — saving tokens and preventing hallucinated calls.
 - A call to a disabled tool that the model makes anyway is **rejected at execution time**: it never runs, and the model gets a `tool … is disabled in this session (re-enable it with /tools)` error. A name nobody declares comes back as `unknown tool …`. Both travel back like any other tool error, prefixed `error: ` on the wire.

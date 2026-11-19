@@ -964,6 +964,10 @@ struct ToolsMenuItem {
     /// The tool only inspects state (`read`) — advisory, shown as a marker
     /// and later used by read-only profiles.
     read_only: bool,
+    /// The tool needs image input. Whether it is *usable* right now also
+    /// depends on the active model, so the picker reads that at render time
+    /// rather than baking it into the row.
+    needs_image_input: bool,
     enabled: bool,
 }
 
@@ -3639,6 +3643,17 @@ impl App {
             .and_then(|model| model.context_window)
     }
 
+    /// Whether the active model accepts image input. Mirrors the worker's
+    /// rule: fail-closed, so an undeclared or unresolvable model answers
+    /// `false`. Tools that need images are shown unavailable in that case.
+    fn image_input(&self) -> bool {
+        self.route
+            .as_ref()
+            .and_then(|route| self.pool.model_info(route))
+            .and_then(|model| model.vision)
+            .unwrap_or(false)
+    }
+
     /// Tokens the next request will roughly carry: the last measured turn's
     /// input (the transcript as sent) plus its output. `None` before the
     /// first measured turn of this run.
@@ -3853,6 +3868,7 @@ impl App {
             .map(|spec| ToolsMenuItem {
                 name: spec.name.to_string(),
                 read_only: spec.read_only,
+                needs_image_input: spec.requires_image_input,
                 enabled: self.enabled_tools.contains(spec.name),
             })
             .collect();
@@ -4063,10 +4079,13 @@ impl App {
     }
 
     /// Flip the highlighted checkbox. Nothing is sent until Enter applies
-    /// the set, so Esc discards the fiddling for free.
+    /// the set, so Esc discards the fiddling for free. A tool the active
+    /// model cannot use stays pinned — the host would withhold it anyway.
     fn toggle_tools_entry(&mut self) {
+        let image_input = self.image_input();
         if let Some(menu) = self.tools_menu.as_mut()
             && let Some(item) = menu.items.get_mut(menu.selected)
+            && !(item.needs_image_input && !image_input)
         {
             item.enabled = !item.enabled;
         }
@@ -4120,6 +4139,16 @@ impl App {
                 return;
             }
         };
+        // Enabling an image tool on a text-only model would change nothing
+        // the model sees, so say why instead of recording a set that the
+        // worker silently withholds.
+        if enabled && spec.requires_image_input && !self.image_input() {
+            self.view_mut().history.push(HistoryCell::Error(format!(
+                "`{name}` needs a model that accepts image input; the active model does \
+                 not (switch with /model)"
+            )));
+            return;
+        }
         let mut set = self.enabled_tools.clone();
         if enabled {
             if !set.insert(spec.name.to_string()) {
@@ -4241,6 +4270,7 @@ impl App {
             plugin_ids: self.plugins.plugin_ids(),
             system_sections: &self.system_sections_with_appendix,
             effort: self.effort.as_deref(),
+            image_input: self.image_input(),
             request: crate::plugins::RequestFacts {
                 protocol: &self.request_facts.protocol,
                 base_url: &self.request_facts.base_url,
@@ -4517,7 +4547,9 @@ impl App {
             EventMsg::ModelSwitched { model } => {
                 // `/model` already updated the label optimistically; this is
                 // the core's authoritative confirmation (also covering
-                // non-TUI front-ends).
+                // non-TUI front-ends). An open `/tools` picker needs no
+                // resync: whether an image tool is available is derived from
+                // the active route at render time.
                 self.route = Selection::parse(&model).ok();
                 self.model_label = model;
                 self.refresh_request_facts();
@@ -5068,8 +5100,13 @@ impl App {
         }
         if let Some(menu) = self.tools_menu.as_ref() {
             let window = command_menu_window(menu.items.len(), menu.selected, height);
+            // Availability follows the active route, so a model switch while
+            // the picker is open is reflected on the next frame.
+            let image_input = self.image_input();
             return window
-                .map(|index| tools_menu_line(&menu.items[index], index == menu.selected))
+                .map(|index| {
+                    tools_menu_line(&menu.items[index], index == menu.selected, image_input)
+                })
                 .collect();
         }
         if let Some(selected) = self.session_menu {
@@ -6172,7 +6209,11 @@ fn pending_line(entry: &PendingInput, selected: bool) -> Line<'static> {
     }
 }
 
-fn tools_menu_line(item: &ToolsMenuItem, selected: bool) -> Line<'static> {
+fn tools_menu_line(item: &ToolsMenuItem, selected: bool, image_input: bool) -> Line<'static> {
+    // A tool the active model cannot use is shown greyed with a dash box: the
+    // host withholds it whatever the checkbox says, so neither state would be
+    // honest.
+    let unavailable = item.needs_image_input && !image_input;
     let marker = if selected { "▸ " } else { "  " };
     let (marker_style, text_style) = if selected {
         (
@@ -6188,8 +6229,12 @@ fn tools_menu_line(item: &ToolsMenuItem, selected: bool) -> Line<'static> {
         )
     };
 
-    let checkbox = if item.enabled { "[x] " } else { "[ ] " };
-    let checkbox_style = if item.enabled {
+    let checkbox = match (unavailable, item.enabled) {
+        (true, _) => "[-] ",
+        (false, true) => "[x] ",
+        (false, false) => "[ ] ",
+    };
+    let checkbox_style = if !unavailable && item.enabled {
         Style::default().fg(theme::ACCENT)
     } else {
         Style::default().fg(theme::DIM)
@@ -6205,6 +6250,14 @@ fn tools_menu_line(item: &ToolsMenuItem, selected: bool) -> Line<'static> {
             " · read-only",
             Style::default()
                 .fg(theme::DIM)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    if unavailable {
+        spans.push(Span::styled(
+            " · needs a vision model",
+            Style::default()
+                .fg(theme::WARNING)
                 .add_modifier(Modifier::ITALIC),
         ));
     }
@@ -9281,6 +9334,54 @@ mod tests {
             app.view().history.last()
         );
         assert!(app.view().park_on_last_report);
+    }
+
+    /// `/tools`: `read_image` is listed but pinned on a model that declares
+    /// no image input — Space does not flip it, and `/tools read_image on`
+    /// explains why instead of recording a set the worker withholds.
+    #[tokio::test]
+    async fn image_tools_are_unavailable_on_a_text_only_model() {
+        let mut app = test_app();
+        // `test/one` declares no `vision`, so the gate is fail-closed.
+        assert!(!app.image_input());
+        app.open_tools_menu();
+        let menu = app.tools_menu.as_ref().expect("the picker opened");
+        let image = menu
+            .items
+            .iter()
+            .position(|item| item.name == "read_image")
+            .expect("read_image is declared by the fs plugin");
+        assert!(menu.items[image].needs_image_input);
+
+        // Space on the image row is a no-op.
+        app.tools_menu.as_mut().expect("menu").selected = image;
+        app.toggle_tools_entry();
+        assert!(
+            app.tools_menu.as_ref().expect("menu").items[image].enabled,
+            "the row stays checked"
+        );
+        app.tools_menu = None;
+
+        // `/tools read_image on` on an already-enabled set is a no-op anyway;
+        // take it off first, then try to put it back.
+        app.composer.set_text("/tools read_image off".to_string());
+        app.try_submit();
+        assert!(!app.enabled_tools.contains("read_image"));
+        app.composer.set_text("/tools read_image on".to_string());
+        app.try_submit();
+        assert!(!app.enabled_tools.contains("read_image"));
+        assert!(
+            matches!(app.view().history.last(), Some(HistoryCell::Error(text)) if text.contains("image input")),
+            "{:?}",
+            app.view().history.last()
+        );
+
+        // The picker draws the row with the dash box and the reason.
+        app.open_tools_menu();
+        let lines = render_lines(&mut app, 100, 24);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("[-] read_image"), "{rendered}");
+        assert!(rendered.contains("needs a vision model"), "{rendered}");
     }
 
     #[tokio::test]

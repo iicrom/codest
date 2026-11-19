@@ -60,6 +60,7 @@ the instances below in `providers.toml`; `model-cache.json` is machine-managed.
 | `reasoning` | string array | — | Effort levels the model accepts, **lowest first**; feeds `/effort` (Section 5). |
 | `default_level` | string | — | Effort adopted when this model is selected, until `/effort` overrides it. |
 | `session_header` | string | — | Per-model override of `wire.session_header`; `"none"` sends no header for this model. |
+| `vision` | bool | — | The model accepts image input. Required for the `read_image` tool: it is withheld from every model that does not declare it. Undeclared is treated as **no**, so an endpoint whose models API says nothing needs this set explicitly. |
 
 Declared entries win over discovered twins, but fields a declaration leaves
 unset are filled from discovery — a sparse `id`-only entry still gets the
@@ -176,10 +177,13 @@ The outer envelope is OpenAI's `{data: [{...}]}`. Entry fields are read by
 | context window | `limit.context` → `context_length` → `context_window` | footer readout, picker rows |
 | effort levels | `capabilities.reasoning.effort` → `reasoning` (ordered, lowest first) | `/effort` vocabulary |
 | default level | `capabilities.reasoning.default` → `default_level` | effort adopted on selection |
+| image input | `capabilities.vision` → `supports_vision` → `architecture.input_modalities` / `input_modalities` (a list naming `image`) | `read_image` gating |
 
-Missing or malformed metadata is simply absent — never an error — and
-unknown fields (pricing, modalities, capability matrices, API blocks) are
-ignored.
+Missing or malformed metadata is simply absent — never an error. An entry
+that says nothing about image input yields no `vision` value, which the host
+reads as **no**: `read_image` is only offered to models that affirmatively
+declare it. Other unknown fields (pricing, capability matrices, API blocks)
+are ignored.
 
 Endpoints whose models directory is not at `{base_url}/models` name it
 explicitly through the `options` pocket; the default is unchanged:

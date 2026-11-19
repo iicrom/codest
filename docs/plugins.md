@@ -101,8 +101,8 @@ idle, so a "submit a prompt" command works.
 above: `command_table()`, `model()`, `mode()`, `transcript_len()`,
 `message_count()`, `context_window()`, `last_usage()`, `total_input()`,
 `total_output()`, `plugin_ids()`, `system_sections()`, `effort()`,
-`request()` (protocol, base URL, endpoint, `body_overrides`), `tools()`, and
-`enabled_tools()` — never the agent session or the event loop. Errors are
+`image_input()`, `request()` (protocol, base URL, endpoint, `body_overrides`),
+`tools()`, and `enabled_tools()` — never the agent session or the event loop. Errors are
 soft: `run_command` / `run_tool` returning `Err` becomes an `Error` effect
 (command) or `error: …` fed to the model plus a transcript failure line
 (tool); registry problems are startup errors (section 4); a plugin panic is
@@ -290,8 +290,8 @@ cargo clippy --all-targets -- -D warnings
 
 A hooks-only plugin skips `commands()` entirely and implements, say,
 `on_turn_complete`; a tool plugin implements `tools()` + `run_tool` with
-`ToolSpec { name, description, parameters_json, read_only }` — the schema is
-raw JSON-Schema text so it can live in a `const`. State goes in a `Mutex`,
+`ToolSpec { name, description, parameters_json, read_only, requires_image_input }`
+— the schema is raw JSON-Schema text so it can live in a `const`. State goes in a `Mutex`,
 via interior mutability like the shipped plugins.
 
 A tool whose result carries an image overrides `run_tool_output` instead and
@@ -303,6 +303,14 @@ plugin that implements neither — so a plugin that attaches images leaves
 `run_tool` unimplemented and implements `run_tool_output` only. The host reads
 results through `run_tool_output`, keeps the text for the conversation
 message, and sends the images on the following request.
+
+Set `requires_image_input: true` when the result is only useful to a model
+that accepts images (`read_image` does). The host then withholds the tool from
+any model whose `providers.toml` entry — or discovered metadata — does not
+declare vision, rejects a call for it without executing, and stops sending the
+transcript's images with that model. A plugin cannot make that call itself: it
+never sees the selection's metadata, and the gate has to hold even for an
+executor that would happily attach bytes.
 
 ## 6. Observing the agent: events, status segments, background tasks
 

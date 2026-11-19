@@ -60,6 +60,12 @@ pub struct ModelInfo {
     /// all. `None` inherits the instance setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_header: Option<String>,
+    /// Whether the model accepts image input. `None` means "not declared",
+    /// which the host reads as **no**: tools that need image input (the
+    /// `read_image` tool) are only offered when this is `Some(true)`.
+    /// Declared in `providers.toml` or filled in from models discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 impl ModelInfo {
@@ -72,6 +78,7 @@ impl ModelInfo {
             reasoning: None,
             default_level: None,
             session_header: None,
+            vision: None,
         }
     }
 

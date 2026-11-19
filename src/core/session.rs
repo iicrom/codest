@@ -165,6 +165,17 @@ impl ModelBackend {
         }
     }
 
+    /// Whether the active model accepts image input. Fail-closed: a fixed
+    /// backend (tests, the echo model) and an unknown or undeclared model
+    /// answer `false`, so a tool that needs images is never offered where
+    /// the result could not be read.
+    fn accepts_image_input(&self) -> bool {
+        self.selection()
+            .and_then(|selection| self.model_info(selection))
+            .and_then(|model| model.vision)
+            .unwrap_or(false)
+    }
+
     /// Switch the pooled backend to another `provider/model`. The selection is
     /// validated (and its client proven buildable) here, so a broken choice
     /// surfaces as this error instead of failing the next turn. A fixed
@@ -696,10 +707,19 @@ fn default_enabled(tools: &[ToolSpec]) -> BTreeSet<String> {
 /// declared specs, in registration order. Disabled tools are withheld so the
 /// model neither sees them nor (in the common case) calls them; the executor
 /// gate is the backstop for a call the model hallucinated anyway.
-fn declared_tools(tools: &[ToolSpec], enabled: &BTreeSet<String>) -> Vec<ToolSpec> {
+///
+/// A tool that needs image input is withheld as well unless the model
+/// accepts images (`image_input`): declaring `read_image` to a text-only
+/// model would only invite a call whose result it could not read.
+fn declared_tools(
+    tools: &[ToolSpec],
+    enabled: &BTreeSet<String>,
+    image_input: bool,
+) -> Vec<ToolSpec> {
     tools
         .iter()
         .filter(|spec| enabled.contains(spec.name))
+        .filter(|spec| image_input || !spec.requires_image_input)
         .copied()
         .collect()
 }
@@ -777,7 +797,16 @@ const MAX_REQUEST_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// round just produced is never dropped — and an evicted image simply stops
 /// travelling; its text result ("read image … 412 KB") stays in the
 /// transcript, so the model still knows a picture was read.
-fn request_messages(conversation: &Conversation, appendix: Option<&str>) -> Vec<Message> {
+///
+/// A model that takes no image input gets no images at all (`image_input`):
+/// the transcript keeps them, but an endpoint without the modality would
+/// reject the whole request, so a picture read under a vision model cannot
+/// follow the session onto a text-only one.
+fn request_messages(
+    conversation: &Conversation,
+    appendix: Option<&str>,
+    image_input: bool,
+) -> Vec<Message> {
     let mut messages = conversation.snapshot();
     if let (Some(system), Some(appendix)) = (messages.first_mut(), appendix) {
         if system.content.trim().is_empty() {
@@ -787,7 +816,13 @@ fn request_messages(conversation: &Conversation, appendix: Option<&str>) -> Vec<
             system.content.push_str(appendix);
         }
     }
-    budget_images(&mut messages);
+    if image_input {
+        budget_images(&mut messages);
+    } else {
+        for message in &mut messages {
+            message.images.clear();
+        }
+    }
     messages
 }
 
@@ -945,6 +980,9 @@ async fn run_worker(
     loop {
         if let Some(mut turn) = active.take() {
             interrupt.install(turn.cancel.clone());
+            // Read per round, so a model switch (always between turns) is in
+            // effect for this turn's declarations and every request it makes.
+            let image_input = backend.accepts_image_input();
             let Ok(client) = backend.client() else {
                 // The selection stopped resolving between the turn starting
                 // and this round; report it as a turn error rather than
@@ -962,13 +1000,14 @@ async fn run_worker(
                 client,
                 options: TurnOptions {
                     effort: effort.clone(),
-                    tools: declared_tools(&tools, &session_tools[current]),
+                    tools: declared_tools(&tools, &session_tools[current], image_input),
                     session_id: rollouts.id(current).map(str::to_string),
                 },
                 executor: executor.clone(),
                 declared: tools.clone(),
                 enabled: session_tools[current].clone(),
                 appendix: session_appendix[current].clone(),
+                image_input,
                 max_tool_rounds,
                 tool_output_token_limit,
             };
@@ -1051,11 +1090,16 @@ async fn run_worker(
                     ));
                     continue;
                 };
+                let image_input = backend.accepts_image_input();
                 let stream = client.stream_chat(
-                    request_messages(&sessions[current], session_appendix[current].as_deref()),
+                    request_messages(
+                        &sessions[current],
+                        session_appendix[current].as_deref(),
+                        image_input,
+                    ),
                     TurnOptions {
                         effort: effort.clone(),
-                        tools: declared_tools(&tools, &session_tools[current]),
+                        tools: declared_tools(&tools, &session_tools[current], image_input),
                         session_id: rollouts.id(current).map(str::to_string),
                     },
                     cancel.clone(),
@@ -1124,11 +1168,16 @@ async fn run_worker(
                     let _ = tx.send(Event::new(submission.id, EventMsg::TurnComplete));
                     continue;
                 };
+                let image_input = backend.accepts_image_input();
                 let stream = client.stream_chat(
-                    request_messages(&sessions[current], session_appendix[current].as_deref()),
+                    request_messages(
+                        &sessions[current],
+                        session_appendix[current].as_deref(),
+                        image_input,
+                    ),
                     TurnOptions {
                         effort: effort.clone(),
-                        tools: declared_tools(&tools, &session_tools[current]),
+                        tools: declared_tools(&tools, &session_tools[current], image_input),
                         session_id: rollouts.id(current).map(str::to_string),
                     },
                     cancel.clone(),
@@ -1586,6 +1635,11 @@ struct TurnContext {
     /// The session's system-prompt appendix, appended to every request's
     /// system message (`Op::SetSystemPromptAppendix`).
     appendix: Option<String>,
+    /// Whether the turn's model accepts image input. `false` withholds
+    /// image-only tools from the declaration, strips the transcript's images
+    /// from every request in this turn, and rejects an image tool call the
+    /// model made anyway.
+    image_input: bool,
     /// Optional runaway guard: the turn errors out once this many rounds have
     /// completed. `None` — the default — follows codex and leaves the loop
     /// unbounded, ending it only when the model stops calling tools, the user
@@ -1740,7 +1794,7 @@ async fn run_turn(
         claim_steers(turn, conversation, rollouts, current, tx, steer_rx);
         // The next round sees the tool results in the snapshot.
         turn.stream = deps.client.stream_chat(
-            request_messages(conversation, deps.appendix.as_deref()),
+            request_messages(conversation, deps.appendix.as_deref(), deps.image_input),
             deps.options.clone(),
             turn.cancel.clone(),
         );
@@ -1865,11 +1919,14 @@ async fn execute_tool_call(
         },
     ));
     let started_at = std::time::Instant::now();
+    // The spec this run knows under that name, if any: it decides both which
+    // gate answers and whether the tool needs image input.
+    let spec = deps.declared.iter().find(|spec| spec.name == call.name);
     let outcome = if !deps.enabled.contains(&call.name) {
         // Two distinct cases, answered differently: a tool nobody declares
         // (a hallucinated name) versus one this session switched off.
         // Neither executes; the model gets something it can act on.
-        if deps.declared.iter().any(|spec| spec.name == call.name) {
+        if spec.is_some() {
             Err(format!(
                 "tool `{}` is disabled in this session (re-enable it with /tools)",
                 call.name
@@ -1877,6 +1934,16 @@ async fn execute_tool_call(
         } else {
             Err(format!("unknown tool `{}`", call.name))
         }
+    } else if spec.is_some_and(|spec| spec.requires_image_input) && !deps.image_input {
+        // Enabled, but unusable here: the model was not declared this tool
+        // this turn. Reaching here means a call learned from an earlier
+        // model or a hallucination — the gate answers either way, because
+        // the attached image could not be sent to this model.
+        Err(format!(
+            "tool `{}` needs a model that accepts image input; the active model does not \
+             (switch to a vision model with /model)",
+            call.name
+        ))
     } else {
         match deps.executor.clone() {
             // The executor is synchronous plugin code: run it on the blocking
@@ -2323,6 +2390,7 @@ mod tests {
         description: "reply with pong",
         parameters_json: "",
         read_only: true,
+        requires_image_input: false,
     };
 
     fn tool_call(id: &str, name: &str) -> ToolCall {
@@ -2684,6 +2752,98 @@ mod tests {
         )));
         let seen = seen.lock().expect("lock");
         assert!(seen[1][3].content.contains("disabled"));
+    }
+
+    /// An image-only tool on a fixed backend: `ping`'s spec plus the
+    /// `read_image` shape, for the capability gate's tests.
+    static IMAGE_SPEC: ToolSpec = ToolSpec {
+        name: "read_image",
+        description: "load an image",
+        parameters_json: "",
+        read_only: true,
+        requires_image_input: true,
+    };
+
+    /// A tool that needs image input is withheld from a model that does not
+    /// declare it, and appears once the model does — the declaration follows
+    /// the selection, because a switch is only ever applied between turns.
+    #[tokio::test]
+    async fn image_tools_follow_the_models_input_modalities() {
+        let (_, options) = recording_handles("rec-vision");
+        let mut vision = ModelInfo::from_id("vision");
+        vision.vision = Some(true);
+        let mut session = AgentSession::spawn_with_pool(
+            recording_pool("rec-vision", vec![ModelInfo::from_id("text"), vision]),
+            Some(&Selection::new("rec-vision", "text")),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![PING_SPEC, IMAGE_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+        )
+        .expect("initial selection resolves");
+
+        session.submit_user_turn("first");
+        collect_turn(&mut session).await;
+        {
+            let options = options.lock().expect("lock");
+            let names: Vec<&str> = options[0].tools.iter().map(|spec| spec.name).collect();
+            assert_eq!(names, ["ping"], "the image tool is not declared");
+        }
+
+        session.switch_model("rec-vision/vision");
+        let event = session.next_event().await.expect("switch event");
+        assert!(matches!(event.msg, EventMsg::ModelSwitched { .. }));
+
+        session.submit_user_turn("second");
+        collect_turn(&mut session).await;
+        let options = options.lock().expect("lock");
+        let names: Vec<&str> = options[1].tools.iter().map(|spec| spec.name).collect();
+        assert_eq!(names, ["ping", "read_image"], "now it is usable");
+    }
+
+    /// A call for an image tool that the model was never declared — a fixed
+    /// backend declares no modalities at all, so it is the fail-closed case —
+    /// is rejected before the executor runs, with the reason the model can
+    /// act on.
+    #[tokio::test]
+    async fn image_tool_calls_are_rejected_without_image_input() {
+        let client = ScriptedClient::new(vec![
+            vec![StreamItem::ToolCalls(vec![tool_call("c1", "read_image")])],
+            vec![StreamItem::Delta("done".to_string())],
+        ]);
+        let seen = client.snapshots();
+        let options = client.turn_options();
+        let mut session = AgentSession::spawn_with_bootstrap(
+            Arc::new(client),
+            "be brief",
+            SessionBootstrap {
+                tools: vec![IMAGE_SPEC],
+                executor: Some(Arc::new(MapExecutor)),
+                ..SessionBootstrap::default()
+            },
+        );
+
+        session.submit_user_turn("look at shot.png");
+        let events = collect_turn(&mut session).await;
+
+        // The tool is not offered at all…
+        assert!(options.lock().expect("lock")[0].tools.is_empty());
+
+        // …and the call comes back as the capability gate's error, not the
+        // executor's own failure (`nope: read_image`).
+        assert!(events.iter().any(|event| matches!(
+            &event.msg,
+            EventMsg::AgentToolCall { name, error: Some(error), .. }
+                if name == "read_image" && error.contains("accepts image input")
+        )));
+        let seen = seen.lock().expect("lock");
+        assert!(
+            seen[1].last().expect("the result").content.contains("accepts image input"),
+            "{}",
+            seen[1].last().expect("the result").content
+        );
     }
 
     /// The system-prompt appendix rides every request's system message while
@@ -3629,6 +3789,91 @@ mod tests {
         };
         let registry =
             crate::core::providers::ProviderRegistry::build(&[&RecordingFactory], vec![instance])
+                .expect("valid registry");
+        Arc::new(ModelPool::new(registry))
+    }
+
+    /// Test protocol: hands out [`ScriptedClient`]s keyed by instance name —
+    /// the pooled counterpart of a bare scripted client, for tests that need
+    /// both model metadata (the vision gate) and a tool round-trip.
+    struct ScriptedFactory;
+
+    type ScriptedHandles = (
+        Arc<Mutex<Vec<Vec<StreamItem>>>>,
+        Arc<Mutex<Vec<Vec<Message>>>>,
+        Arc<Mutex<Vec<TurnOptions>>>,
+    );
+
+    static SCRIPTED: std::sync::OnceLock<Mutex<HashMap<String, ScriptedHandles>>> =
+        std::sync::OnceLock::new();
+
+    fn scripted_registry() -> &'static Mutex<HashMap<String, ScriptedHandles>> {
+        SCRIPTED.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Pre-install the scripts for instance `name` and return the observation
+    /// handles.
+    fn scripted_handles(name: &str, scripts: Vec<Vec<StreamItem>>) -> RecordingHandles {
+        let scripts = Arc::new(Mutex::new(scripts));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let options = Arc::new(Mutex::new(Vec::new()));
+        scripted_registry().lock().expect("lock").insert(
+            name.to_string(),
+            (scripts, seen.clone(), options.clone()),
+        );
+        (seen, options)
+    }
+
+    impl crate::core::providers::ProtocolFactory for ScriptedFactory {
+        fn id(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Scripted (testing)"
+        }
+
+        fn create(
+            &self,
+            instance: &ProviderInstance,
+            _model: &str,
+        ) -> Result<Arc<dyn ModelClient>, crate::core::model::ModelError> {
+            let mut map = scripted_registry().lock().expect("lock");
+            let (scripts, seen, options) = map
+                .entry(instance.name.clone())
+                .or_insert_with(|| {
+                    (
+                        Arc::new(Mutex::new(Vec::new())),
+                        Arc::new(Mutex::new(Vec::new())),
+                        Arc::new(Mutex::new(Vec::new())),
+                    )
+                })
+                .clone();
+            Ok(Arc::new(ScriptedClient {
+                scripts,
+                seen,
+                options,
+            }))
+        }
+    }
+
+    /// A one-instance pool over [`ScriptedFactory`].
+    fn scripted_pool(name: &str, models: Vec<ModelInfo>) -> Arc<ModelPool> {
+        let instance = ProviderInstance {
+            name: name.to_string(),
+            protocol: Some("scripted".to_string()),
+            base_url: None,
+            api_key: None,
+            models,
+            fetch_models: Some(false),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            wire: None,
+            options: Default::default(),
+            requires_api_key: false,
+        };
+        let registry =
+            crate::core::providers::ProviderRegistry::build(&[&ScriptedFactory], vec![instance])
                 .expect("valid registry");
         Arc::new(ModelPool::new(registry))
     }
@@ -4925,13 +5170,20 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("tempdir");
-        let client = ScriptedClient::new(vec![
-            vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
-            vec![StreamItem::Delta("done".to_string())],
-        ]);
-        let seen = client.snapshots();
-        let mut session = AgentSession::spawn_with_bootstrap(
-            Arc::new(client),
+        // A vision model, so the gate lets the attachment through: without
+        // the declaration the tool would be withheld and the image stripped.
+        let (seen, _options) = scripted_handles(
+            "scripted-vision",
+            vec![
+                vec![StreamItem::ToolCalls(vec![tool_call("c1", "ping")])],
+                vec![StreamItem::Delta("done".to_string())],
+            ],
+        );
+        let mut vision = ModelInfo::from_id("vision");
+        vision.vision = Some(true);
+        let mut session = AgentSession::spawn_with_pool(
+            scripted_pool("scripted-vision", vec![vision]),
+            Some(&Selection::new("scripted-vision", "vision")),
             "be brief",
             SessionBootstrap {
                 rollout_dir: Some(dir.clone()),
@@ -4940,7 +5192,8 @@ mod tests {
                 executor: Some(Arc::new(ImageExecutor)),
                 ..SessionBootstrap::default()
             },
-        );
+        )
+        .expect("initial selection resolves");
         session.submit_user_turn("hi");
         collect_turn(&mut session).await;
 
@@ -5005,7 +5258,7 @@ mod tests {
                 vec![image(each)],
             ));
         }
-        let messages = request_messages(&conversation, None);
+        let messages = request_messages(&conversation, None, true);
         let kept: Vec<&Message> = messages
             .iter()
             .filter(|message| !message.images.is_empty())
@@ -5048,7 +5301,45 @@ mod tests {
                 detail: "high".to_string(),
             }],
         ));
-        let messages = request_messages(&conversation, None);
+        let messages = request_messages(&conversation, None, true);
         assert_eq!(messages.last().expect("the result").images.len(), 1);
+    }
+
+    /// A text-only model gets no images at all: the transcript keeps them (a
+    /// picture read under a vision model is part of the record), but the
+    /// request carries none — an endpoint that takes no image input would
+    /// otherwise reject the whole call.
+    #[test]
+    fn a_text_only_model_receives_no_images() {
+        let mut conversation = Conversation::new("system");
+        conversation.push_message(Message::tool_result_with_images(
+            "c1",
+            "read image shot.png",
+            vec![crate::core::tools::ToolImage {
+                data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                mime: "image/png".to_string(),
+                detail: "high".to_string(),
+            }],
+        ));
+
+        let messages = request_messages(&conversation, None, false);
+        assert!(
+            messages.iter().all(|message| message.images.is_empty()),
+            "no images ride a text-only request"
+        );
+        // The result text stays, so the model still knows a picture was read.
+        assert_eq!(
+            messages.last().expect("the result").content,
+            "read image shot.png"
+        );
+        // The conversation itself was not touched.
+        assert_eq!(
+            conversation
+                .messages()
+                .iter()
+                .filter(|message| !message.images.is_empty())
+                .count(),
+            1
+        );
     }
 }

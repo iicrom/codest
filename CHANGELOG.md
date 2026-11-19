@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+`read_image` now reaches only the models that can read it. A model's image
+input is a declared capability, and the host enforces it rather than trusting
+the endpoint to reject what it cannot use.
+
+### Added
+
+- Image-input gating: `read_image` is offered only to models that accept image input. A model declares it with `vision = true` in `providers.toml`, or the host reads it from models discovery (`capabilities.vision`, `supports_vision`, `architecture.input_modalities` / `input_modalities`). An undeclared model counts as text-only — silence is not a claim, so the gate fails closed.
+- `ToolSpec::requires_image_input` and `PluginInfo::image_input`, so a plugin can mark a tool that needs vision and explain its availability.
+- `scripts/image_gate_smoke.py`: a wire-level check that the declared `tools` array carries `read_image` for a vision model and withholds it otherwise. The test server's `--dump-headers` now records the request body alongside the headers.
+
+### Changed
+
+- The worker enforces the gate in three places: it leaves such a tool out of the request's `tools`, rejects a call for it before the executor runs (naming `/model` as the fix), and strips the transcript's attached images from every request to a text-only model. The conversation and the rollout keep the images, so switching back to a vision model restores them.
+- `/tools` shows an image tool as `[-] · needs a vision model` on a text-only model; Space does not toggle it and `/tools <name> on` explains why. `/context` reports it as `unavailable` and excludes it from the enabled count.
+
+### Internal
+
+- `ToolSpec` gained a required field, so `PLUGIN_API_VERSION` is now `3` and `cst-plugin-api` is `0.3`; a plugin built against the previous contract fails at compile time rather than starting without the field.
+
 ## [0.4.0] — 2026-11-18
 
 Merge of `feat/read-image-tool` (`d9db34b`) and `feat/pending-queue-control` (`566dc52`): tool results can carry images, and the TUI owns the queue of messages typed mid-turn.

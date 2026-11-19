@@ -69,9 +69,13 @@ pub fn build_context_report(info: &PluginInfo<'_>) -> ReportBlock {
     // consulted for, and the system prompt below can be long enough to
     // push everything else off screen.
     let tools = info.tools;
+    // A tool that needs image input counts as enabled only when the active
+    // model accepts images: the worker withholds it otherwise, so the count
+    // and the rows must say what the model was actually offered.
+    let usable = |tool: &crate::core::ToolSpec| !tool.requires_image_input || info.image_input;
     let enabled_count = tools
         .iter()
-        .filter(|tool| info.enabled_tools.iter().any(|name| name == tool.name))
+        .filter(|tool| usable(tool) && info.enabled_tools.iter().any(|name| name == tool.name))
         .count();
     groups.push(ReportGroup {
         heading: format!("Tools ({enabled_count}/{} enabled)", tools.len()),
@@ -80,10 +84,13 @@ pub fn build_context_report(info: &PluginInfo<'_>) -> ReportBlock {
             false => tools
                 .iter()
                 .map(|tool| {
-                    let mut line = if info.enabled_tools.iter().any(|name| name == tool.name) {
-                        "enabled".to_string()
-                    } else {
-                        "disabled".to_string()
+                    let mut line = match (
+                        usable(tool),
+                        info.enabled_tools.iter().any(|name| name == tool.name),
+                    ) {
+                        (false, _) => "unavailable · needs a vision model".to_string(),
+                        (true, true) => "enabled".to_string(),
+                        (true, false) => "disabled".to_string(),
                     };
                     if tool.read_only {
                         line.push_str(" · read-only");
@@ -1566,10 +1573,27 @@ mod tests {
                 description: "reply with pong",
                 parameters_json: "",
                 read_only: true,
+                requires_image_input: false,
             }]
         });
     static ENABLED_PING: std::sync::LazyLock<Vec<String>> =
         std::sync::LazyLock::new(|| vec!["ping".to_string()]);
+
+    /// An image tool beside `ping`, to exercise its availability rules.
+    static IMAGE_TOOLS: std::sync::LazyLock<Vec<crate::core::ToolSpec>> =
+        std::sync::LazyLock::new(|| {
+            let mut tools = TEST_TOOLS.clone();
+            tools.push(crate::core::ToolSpec {
+                name: "read_image",
+                description: "load an image",
+                parameters_json: "",
+                read_only: true,
+                requires_image_input: true,
+            });
+            tools
+        });
+    static BOTH_ENABLED: std::sync::LazyLock<Vec<String>> =
+        std::sync::LazyLock::new(|| vec!["ping".to_string(), "read_image".to_string()]);
 
     fn info<'a>(
         host: &'a crate::plugins::PluginHost,
@@ -1588,6 +1612,7 @@ mod tests {
             plugin_ids: host.plugin_ids(),
             system_sections: sections,
             effort: Some("high"),
+            image_input: true,
             request: RequestFacts {
                 protocol: "openai-compat",
                 base_url: "https://api.example.test/v1",
@@ -1673,6 +1698,40 @@ mod tests {
         let tools = group(&block, "Tools");
         assert_eq!(tools.heading, "Tools (0/1 enabled)");
         assert_eq!(entry(tools, "ping"), "disabled · read-only");
+    }
+
+    /// An image tool is reported as unavailable — and left out of the
+    /// enabled count — when the active model takes no image input, because
+    /// the worker withholds it from that model.
+    #[test]
+    fn report_marks_image_tools_unavailable_on_a_text_only_model() {
+        let host = crate::plugins::PluginHost::new(&[]).expect("valid plugin");
+        let mut text_only = info(&host, &[]);
+        text_only.tools = &IMAGE_TOOLS;
+        text_only.enabled_tools = &BOTH_ENABLED;
+        text_only.image_input = false;
+        let block = build_context_report(&text_only);
+
+        let tools = group(&block, "Tools");
+        assert_eq!(
+            tools.heading, "Tools (1/2 enabled)",
+            "the withheld tool is not counted as enabled"
+        );
+        assert_eq!(entry(tools, "ping"), "enabled · read-only");
+        assert_eq!(
+            entry(tools, "read_image"),
+            "unavailable · needs a vision model · read-only"
+        );
+
+        // A vision model makes the same set fully enabled.
+        let mut vision = info(&host, &[]);
+        vision.tools = &IMAGE_TOOLS;
+        vision.enabled_tools = &BOTH_ENABLED;
+        vision.image_input = true;
+        let vision_block = build_context_report(&vision);
+        let tools = group(&vision_block, "Tools");
+        assert_eq!(tools.heading, "Tools (2/2 enabled)");
+        assert_eq!(entry(tools, "read_image"), "enabled · read-only");
     }
 
     #[test]

@@ -673,6 +673,7 @@ mod tests {
                 description: "reply with pong",
                 parameters_json: r#"{ "type": "object" }"#,
                 read_only: true,
+                requires_image_input: false,
             }],
             session_id: None,
         };

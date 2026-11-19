@@ -26,6 +26,7 @@ python3 scripts/pty_smoke.py                    # pty 内端到端冒烟（双 T
 python3 scripts/tool_smoke.py                   # 真实 shell/read 执行 + /tools 开关
 python3 scripts/markdown_smoke.py               # Markdown 渲染可视检查（双 TUI 模式）
 python3 scripts/session_header_smoke.py         # 断言 session-id 头真的发到线上
+python3 scripts/image_gate_smoke.py             # read_image 只下发给声明了视觉的模型
 python3 scripts/plugin_smoke.py                 # 外部插件安装/构建往返
 ```
 
@@ -35,10 +36,11 @@ python3 scripts/plugin_smoke.py                 # 外部插件安装/构建往�
 | `pty_smoke.py` | 在伪终端里启动二进制、输入消息，把捕获的 ANSI 输出渲染成纯文本网格。默认跑两种 TUI 模式：`fullscreen` 必须发出 `\x1b[?1049h`（alternate screen）与 `\x1b[?1000h`（鼠标捕获），`inline` 两者都不能发；滚轮必须能滚、消息必须出现在 transcript、模式提示与空闲 footer 必须出现、进程必须干净退出。config 变体额外检查模型发现、菜单切换与 footer 的上下文窗口（声明窗口与发现窗口）；两个变体都会用 `--continue` 再跑一遍，检查恢复的会话与记录的用量。 |
 | `tool_smoke.py` | 对本地服务跑 shell 工具与 `read` 两个用例：真实工具轮必须显示出命令输出（`hello-from-tool`、`exit code: 0`）或文件内容（`alpha`、`gamma`、`3 lines total`）；随后 `/tools <name> off` 加 `/context` 必须按收窄后的集合报出 `Tools (3/4 enabled)`，并仍把该工具列为 `disabled`。 |
 | `markdown_smoke.py` | 两种模式下的可视检查，素材来自脚本化的服务回复：标题文本、粗体/斜体/行内代码、圆点与嵌套圆点标记、有序标记、`▎` 引用竖条、分隔线、带 `│ rust` / `│ python` 标签与正文的两个代码围栏、表头与表线、任务复选框——以及屏幕上不出现原始的 `**bold**` 标记。inline 模式检查标题、代码标签与无原始标记三项。 |
+| `image_gate_smoke.py` | 对会 dump 请求体的服务跑三种情况：`vision = true` 时首个 chat 请求的 `tools` 里有 `read_image`；`vision = false` 时没有；条目对图片输入只字未提时也没有——闸门是失败关闭的，所以 models API 忽略该能力的端点不可能被误发图片工具。 |
 | `session_header_smoke.py` | 对会 dump 请求头的服务跑三种情况：默认实例发出的 `session-id` 头取值匹配 UUIDv7；`wire.session_header = "none"` 一个都不发；model 级 opt-out 也不发。客户端完全没发请求也算失败。 |
 | `plugin_smoke.py` | 外部插件往返，默认指向同级 checkout（`--plugin ../cst-provider-qoder`）：`codest plugin install <路径>` 干净退出、写入 `plugins.toml`、生成 wrapper crate 并构建出 wrapper 二进制；manifest 以 path 依赖该插件，生成的代码链接它的 `PLUGIN` 静态量；构建出的二进制在 `/status` 里报出插件 id、在 `/help` 里列出其指令；`codest plugin uninstall` 重新生成不含插件的 wrapper 并重新构建。最后对 codest checkout 做一次 `git status --porcelain` 比对，证明安装没有动过仓库（`--skip-git-check` 可关闭）。 |
 
-TUI、工具、markdown 与会话头这几个脚本各自起停自己的测试服务、用临时回环端口（`plugin_smoke.py` 例外，它构建的是 wrapper crate），所以上面单独一行启动 `openai_test_server.py` 只是手动调试时用。所有脚本都接受二进制路径参数，默认 `target/debug/codest`（`session_header_smoke.py` 用 `--binary`，默认 `target/debug/cst`）。
+TUI、工具、markdown、会话头与图片闸门这几个脚本各自起停自己的测试服务、用临时回环端口（`plugin_smoke.py` 例外，它构建的是 wrapper crate），所以上面单独一行启动 `openai_test_server.py` 只是手动调试时用。所有脚本都接受二进制路径参数，默认 `target/debug/codest`（`session_header_smoke.py` 用 `--binary`，默认 `target/debug/cst`）。
 
 ### 单元测试在哪
 
@@ -114,7 +116,7 @@ python3 scripts/plugin_smoke.py --skip-git-check
 
 ## 已知边界
 
-- 工具结果图片（`read_image`）是唯一的媒体通道：聊天输入仍只支持文本，没有审批，没有 MCP。
+- 工具结果图片（`read_image`）是唯一的媒体通道，且只对声明了 `vision` 的模型开放：聊天输入仍只支持文本，没有审批，没有 MCP。
 - Markdown 渲染是精选子集：没有 OSC 8 超链接、没有表格 key/value 降级、没有 mermaid 和数学公式；图片只显示 alt 文本与地址。
 - 插件是编译期静态链接：新增/修改需要重新编译；不支持运行时加载 `.so` 或脚本插件。插件与宿主同权限——没有沙箱。
 - 插件钩子在 TUI 线程同步执行；钩子里不能做阻塞 I/O。

@@ -157,6 +157,7 @@ static TOOLS: [ToolSpec; 1] = [ToolSpec {
     // Asking a question mutates nothing: a read-only profile may keep it, and
     // `/tools` marks it as an inspection aid rather than an executor.
     read_only: true,
+    requires_image_input: false,
 }];
 
 pub static ASK_USER: AskUser = AskUser::new();
