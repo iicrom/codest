@@ -26,6 +26,7 @@ python3 scripts/pty_smoke.py                    # end-to-end smoke in a pty (bot
 python3 scripts/tool_smoke.py                   # real shell/read execution + /tools toggles
 python3 scripts/markdown_smoke.py               # visual markdown check (both TUI modes)
 python3 scripts/session_header_smoke.py         # asserts the session-id header hits the wire
+python3 scripts/image_gate_smoke.py             # read_image is declared only to vision models
 python3 scripts/plugin_smoke.py                 # external plugin install/build round-trip
 ```
 
@@ -36,9 +37,10 @@ python3 scripts/plugin_smoke.py                 # external plugin install/build 
 | `tool_smoke.py` | Two cases, the shell tool and `read`, against the local server: a real tool round must show the command's output (`hello-from-tool`, `exit code: 0`) or the file's content (`alpha`, `gamma`, `3 lines total`); then `/tools <name> off` followed by `/context` must report the narrowed set as `Tools (3/4 enabled)` and still list the tool as `disabled`. |
 | `markdown_smoke.py` | A visual check in both modes, from a scripted server reply: heading text, bold/italic/inline code, bullet and nested-bullet markers, an ordered marker, the `▎` quote bar, a rule, two code fences with `│ rust` / `│ python` labels and body, a table header and divider, a task checkbox — plus the absence of raw `**bold**` markers. Inline mode is checked for the heading, a code label, and the absence of raw markers. |
 | `session_header_smoke.py` | Three cases against a server that dumps request headers: the default instance sends a `session-id` header whose value matches a UUIDv7; `wire.session_header = "none"` sends none; a model-level opt-out sends none. It also fails if the client sent no request at all. |
+| `image_gate_smoke.py` | Three cases against a server that dumps request bodies: with `vision = true` the first chat request declares `read_image`; with `vision = false` it does not; and a model entry that says nothing about image input does not either — the gate fails closed, so an endpoint whose models API ignores the capability can never be handed an image tool by accident. |
 | `plugin_smoke.py` | External plugin round-trip, defaulting to a sibling checkout (`--plugin ../cst-provider-qoder`): `codest plugin install <path>` exits cleanly, writes `plugins.toml`, generates the wrapper crate, and builds a wrapper binary; the manifest depends on the plugin by path and the generated code links its `PLUGIN` static; the built binary reports the plugin id in `/status` and its command in `/help`; `codest plugin uninstall` regenerates a plugin-free wrapper and rebuilds. A `git status --porcelain` check on the codest checkout proves the install left the repository untouched (`--skip-git-check` opts out). |
 
-The TUI, tool, markdown, and session-header scripts each start and stop their own test server on an ephemeral loopback port (`plugin_smoke.py` instead builds a wrapper crate), so the standalone `openai_test_server.py` line is only for poking at the server by hand. Every script accepts a binary path argument and defaults to `target/debug/codest` (`session_header_smoke.py` uses `--binary`, defaulting to `target/debug/cst`).
+The TUI, tool, markdown, session-header, and image-gate scripts each start and stop their own test server on an ephemeral loopback port (`plugin_smoke.py` instead builds a wrapper crate), so the standalone `openai_test_server.py` line is only for poking at the server by hand. Every script accepts a binary path argument and defaults to `target/debug/codest` (`session_header_smoke.py` uses `--binary`, defaulting to `target/debug/cst`).
 
 ### Where the unit tests live
 
@@ -114,7 +116,7 @@ Docs are maintained bilingually: `docs/*.md` is primary, `docs/zh/*.md` mirrors 
 
 ## Known limitations
 
-- Tool-result images (`read_image`) are the one media path: chat input is still text only, there are no approvals, and no MCP.
+- Tool-result images (`read_image`) are the one media path — and only for models that declare `vision`: chat input is still text only, there are no approvals, and no MCP.
 - Markdown rendering is a curated subset: no OSC 8 hyperlinks, no key/value table degradation, no mermaid or math; images show alt text and URL only.
 - Plugins are compile-time static: adding or changing one requires a rebuild; no runtime `.so` or script plugins. Plugins run with host privileges — no sandbox.
 - Plugin hooks run synchronously on the TUI thread; no blocking I/O in hooks.

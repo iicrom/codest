@@ -544,6 +544,7 @@ mod tests {
             plugin_ids: &["tps"],
             system_sections: &[],
             effort: None,
+            image_input: false,
             request: RequestFacts {
                 protocol: "",
                 base_url: "",

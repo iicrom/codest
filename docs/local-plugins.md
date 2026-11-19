@@ -32,7 +32,7 @@ a plugin — so Cargo sees no cycle. The host re-exports every contract module
 under its historical paths (`codest::core::model`, `codest::plugins::Plugin`,
 …), so the split renamed nothing.
 
-**Versioning.** `PLUGIN_API_VERSION` is `2`. There is no runtime handshake:
+**Versioning.** `PLUGIN_API_VERSION` is `3`. There is no runtime handshake:
 the host and a plugin agree through **Cargo versions**, and an incompatible
 contract fails to **compile**, not to start — which is the better failure.
 Adding a trait method with a default implementation does not bump the

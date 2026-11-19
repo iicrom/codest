@@ -575,6 +575,9 @@ impl ModelPool {
                         if declared.default_level.is_none() {
                             declared.default_level = model.default_level.clone();
                         }
+                        if declared.vision.is_none() {
+                            declared.vision = model.vision;
+                        }
                     }
                     None => models.push(model.clone()),
                 }
@@ -946,7 +949,9 @@ const MODELS_URL_OPTION: &str = "models_url";
 /// * reasoning levels — `capabilities.reasoning.effort` (an ordered list,
 ///   lowest first), falling back to a top-level `reasoning` array, else the
 ///   `default_level` field;
-/// * default level — `capabilities.reasoning.default`, then `default_level`.
+/// * default level — `capabilities.reasoning.default`, then `default_level`;
+/// * image input — `capabilities.vision`, then `supports_vision`, then
+///   `architecture.input_modalities` / `input_modalities` naming `image`.
 ///
 /// Entries without an id are skipped, duplicates are collapsed, order is
 /// preserved. Unknown fields are ignored: the directory carries far more than
@@ -1000,9 +1005,44 @@ pub fn models_from_openai_list(payload: &serde_json::Value) -> Vec<ModelInfo> {
             default_level,
             // Models discovery reports no per-model overrides.
             session_header: None,
+            vision: vision_support(entry),
         });
     }
     models
+}
+
+/// Whether one directory entry affirms image input, read by shape.
+///
+/// `capabilities.vision` may be a boolean or a `{supported: true}` object;
+/// some endpoints instead declare a flat `supports_vision` or list the
+/// accepted modalities (`architecture.input_modalities`, or a top-level
+/// `input_modalities`) as strings. An entry that names no image input gives
+/// `None` — "not declared" — which the host reads as no vision support at
+/// all, never as a rejection.
+fn vision_support(entry: &serde_json::Value) -> Option<bool> {
+    let flag = |value: Option<&serde_json::Value>| match value {
+        Some(serde_json::Value::Bool(flag)) => Some(*flag),
+        Some(serde_json::Value::Object(object)) => {
+            object.get("supported").and_then(serde_json::Value::as_bool)
+        }
+        _ => None,
+    };
+    if let Some(flag) = flag(entry.pointer("/capabilities/vision")) {
+        return Some(flag);
+    }
+    if let Some(flag) = flag(entry.get("supports_vision")) {
+        return Some(flag);
+    }
+    let modalities = entry
+        .pointer("/architecture/input_modalities")
+        .or_else(|| entry.get("input_modalities"))
+        .and_then(serde_json::Value::as_array)?;
+    Some(
+        modalities
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|modality| modality.trim().eq_ignore_ascii_case("image")),
+    )
 }
 
 /// The effort levels one directory entry accepts, lowest first. An absent or
@@ -1613,6 +1653,69 @@ mod tests {
             models_from_openai_list(&payload)[0].context_window,
             Some(500_000)
         );
+    }
+
+    /// Image input is read by shape, in the spellings endpoints actually
+    /// use, and an entry that says nothing about it stays `None` — which the
+    /// host reads as "no vision", never as a rejection.
+    #[test]
+    fn models_list_reads_vision_support_by_shape() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "cap-bool", "capabilities": {"vision": true}},
+                {"id": "cap-object", "capabilities": {"vision": {"supported": true}}},
+                {"id": "cap-off", "capabilities": {"vision": false}},
+                {"id": "flat", "supports_vision": true},
+                {"id": "modalities", "architecture": {"input_modalities": ["text", "image"]}},
+                {"id": "flat-modalities", "input_modalities": ["text", "image"]},
+                {"id": "text-only", "architecture": {"input_modalities": ["text"]}},
+                {"id": "silent"}
+            ]
+        });
+        let models = models_from_openai_list(&payload);
+        let vision = |index: usize| models[index].vision;
+        assert_eq!(vision(0), Some(true), "capabilities.vision boolean");
+        assert_eq!(vision(1), Some(true), "capabilities.vision object");
+        assert_eq!(vision(2), Some(false), "an explicit no is kept");
+        assert_eq!(vision(3), Some(true), "supports_vision");
+        assert_eq!(vision(4), Some(true), "architecture.input_modalities");
+        assert_eq!(vision(5), Some(true), "input_modalities");
+        assert_eq!(vision(6), Some(false), "text-only modalities");
+        assert_eq!(vision(7), None, "silence is not a claim either way");
+    }
+
+    /// A declared `vision` wins over discovery, and a declaration that
+    /// leaves it unset takes the discovered value — the same
+    /// declared-wins/empty-fills rule as the other advisory fields.
+    #[test]
+    fn vision_merges_like_the_other_advisory_fields() {
+        let mut declared = ModelInfo::from_id("m1");
+        declared.vision = Some(false);
+        let instance = ProviderInstance {
+            name: "p".to_string(),
+            protocol: Some(DEFAULT_PROTOCOL.to_string()),
+            base_url: None,
+            api_key: None,
+            models: vec![declared, ModelInfo::from_id("m2")],
+            fetch_models: Some(true),
+            headers: Default::default(),
+            body_overrides: Default::default(),
+            wire: None,
+            options: Default::default(),
+            requires_api_key: false,
+        };
+        let pool = ModelPool::new(
+            ProviderRegistry::build(&[], vec![instance]).expect("valid registry"),
+        );
+        let mut fetched_m1 = ModelInfo::from_id("m1");
+        fetched_m1.vision = Some(true);
+        let mut fetched_m2 = ModelInfo::from_id("m2");
+        fetched_m2.vision = Some(true);
+        pool.stage_fetched("p", vec![fetched_m1, fetched_m2]);
+
+        let models = pool.models_of("p");
+        assert_eq!(models[0].vision, Some(false), "the declaration wins");
+        assert_eq!(models[1].vision, Some(true), "an unset declaration fills");
     }
 
     /// `options.models_url` names the models API explicitly; without it the

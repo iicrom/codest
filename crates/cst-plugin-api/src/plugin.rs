@@ -366,6 +366,10 @@ pub struct PluginInfo<'a> {
     /// The reasoning effort sent with each turn (`/effort`); `None` sends no
     /// effort field at all.
     pub effort: Option<&'a str>,
+    /// Whether the active model accepts image input. A plugin can use it to
+    /// explain why an image tool is unavailable; the host enforces the gate
+    /// itself regardless of what a plugin does with the fact.
+    pub image_input: bool,
     /// Where requests go and which static fields ride along.
     pub request: RequestFacts<'a>,
     /// Tools the plugins declared, in registration order.
@@ -485,6 +489,11 @@ impl<'a> PluginContext<'a> {
     /// The reasoning effort sent with each turn; `None` sends no field.
     pub fn effort(&self) -> Option<&str> {
         self.info.effort
+    }
+
+    /// Whether the active model accepts image input.
+    pub fn image_input(&self) -> bool {
+        self.info.image_input
     }
 
     /// Where requests go and which static fields ride along.

@@ -106,6 +106,7 @@ command tree on expiry.",
   "required": ["command"]
 }"#,
     read_only: false,
+    requires_image_input: false,
 };
 
 /// The shell plugin's `## Tools` section. The trailing `## Files` bullets come

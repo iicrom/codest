@@ -35,7 +35,7 @@ Rust 类型；代价是新增插件必须重新编译（取舍见第 6 节；
 
 trait 及其交换的数据都在契约 crate
 [`cst-plugin-api`](../../crates/cst-plugin-api/README.md) 里（
-`PLUGIN_API_VERSION` 当前为 `2`），因此外部插件实现契约不需要依赖宿主
+`PLUGIN_API_VERSION` 当前为 `3`），因此外部插件实现契约不需要依赖宿主
 二进制。宿主侧在 [`src/plugins/mod.rs`](../../src/plugins/mod.rs)。
 
 ### trait 方法
@@ -95,8 +95,9 @@ trait 及其交换的数据都在契约 crate
 `PluginContext` 暴露只读的会话事实加上上述副作用请求：`command_table()`、
 `model()`、`mode()`、`transcript_len()`、`message_count()`、
 `context_window()`、`last_usage()`、`total_input()`、`total_output()`、
-`plugin_ids()`、`system_sections()`、`effort()`、`request()`（protocol、
-base URL、endpoint、`body_overrides`）、`tools()`、`enabled_tools()`——
+`plugin_ids()`、`system_sections()`、`effort()`、`image_input()`、`request()`
+（protocol、base URL、endpoint、`body_overrides`）、`tools()`、
+`enabled_tools()`——
 从不暴露 agent 会话或事件循环。错误是软性的：`run_command` / `run_tool`
 返回 `Err` 会变成 `Error` 效果（命令），或把 `error: …` 回传给模型并在
 transcript 显示一行失败（工具）；注册表层面的问题是启动错误（第 4 节）；
@@ -267,8 +268,8 @@ cargo clippy --all-targets -- -D warnings
 
 纯钩子插件可以完全不写 `commands()`，只实现比如 `on_turn_complete`；工具
 插件实现 `tools()` + `run_tool`，规格为
-`ToolSpec { name, description, parameters_json, read_only }`——schema 是
-原始 JSON-Schema 文本，这样它能放进 `const`。状态放在 `Mutex` 里，与内置
+`ToolSpec { name, description, parameters_json, read_only, requires_image_input }`
+——schema 是原始 JSON-Schema 文本，这样它能放进 `const`。状态放在 `Mutex` 里，与内置
 插件一样走内部可变性。
 
 结果要带图片的工具改为重写 `run_tool_output`，返回
@@ -277,6 +278,13 @@ cargo clippy --all-targets -- -D warnings
 不做默认——两个方法互相调用会在谁都没实现时无限递归——因此带图片的工具不实现
 `run_tool`，只实现 `run_tool_output`。宿主通过 `run_tool_output` 读取结果，
 文本进入会话消息，图片随下一次请求发出。
+
+结果只对接受图片的模型有意义的工具（`read_image` 就是）把
+`requires_image_input` 设为 `true`。宿主随后只在模型声明了 `vision` 时
+才下发该工具（`providers.toml` 声明或发现到的元数据都算），否则不执行该
+调用并直接拒绝，同时不再把 transcript 里的图片发给该模型。这个判断不能交给
+插件自己做：插件看不到选中模型的元数据，而且闸门必须对「乐于附加字节的
+执行器」同样成立。
 
 ## 6. 观测 agent：事件流、状态栏分段、后台任务
 

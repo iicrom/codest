@@ -28,7 +28,7 @@ Types only — no HTTP client, no configuration loading, no terminal code:
 | `config` | `ProviderInstance`, `ModelInfo`, `WireQuirks`, `PluginSettings` |
 | `settings` | `SettingsSection`, `SettingField`, `SettingKind`, `SettingOption` |
 | `commands` | `CommandSpec`, `CommandTable`, `Invocation`, `ArgsPolicy` |
-| `tools` | `ToolSpec`, `ToolCall`, `ToolExecutor`, `ToolCallAccumulator` |
+| `tools` | `ToolSpec`, `ToolCall`, `ToolExecutor`, `ToolCallAccumulator`, `ToolOutput`, `ToolImage` |
 | `sse` | `SseDecoder`, `SseFrame` |
 | `auth` | `AuthProvider`, `AuthMethod`, `AuthStatus`, `SignInFuture`, `SignInNotifier` |
 
@@ -49,7 +49,7 @@ implementation at `../../../cst-provider-qoder`.
 
 ## Versioning
 
-`PLUGIN_API_VERSION` is `2`.
+`PLUGIN_API_VERSION` is `3`.
 
 - Adding a trait method **with a default implementation** does not bump it.
 - Changing an existing signature or its meaning does — plugins must follow.

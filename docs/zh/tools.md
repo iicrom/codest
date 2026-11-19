@@ -49,7 +49,15 @@ Windows 上值得知道的差异：
 | `read` | 对文本文件做带行号的窗口读取，支持 `offset`（从 1 开始）与 `limit` 续读；拒绝二进制文件——字节带图片签名时指向 `read_image`，否则指向宿主的 shell 工具（`bash`/`pwsh`）。标记为 `read_only`。 |
 | `write` | 以完整内容创建或覆盖文件，按需创建父目录。 |
 | `edit` | 通过 `old_string`/`new_string` 做精确字符串替换；要求唯一匹配，或使用 `replace_all`。保留 BOM 与 CRLF，未被改动的行保持原字节。 |
-| `read_image` | 载入本地 PNG/JPEG/GIF/WebP 供视觉查看——即 codex 的 `view_image`。图片按模型的图像预算缩放并附在工具结果上，文本部分说明读了什么、如何准备。标记为 `read_only`。 |
+| `read_image` | 载入本地 PNG/JPEG/GIF/WebP 供视觉查看——即 codex 的 `view_image`。图片按模型的图像预算缩放并附在工具结果上，文本部分说明读了什么、如何准备。标记为 `read_only`，并且**只有图片输入模型可用**：模型未声明 `vision` 时宿主一律不下发该工具（见 [multi-provider.md](multi-provider.md#22-providersmodels)）。 |
+
+`read_image` 只对**图片输入模型**可用。模型在 `providers.toml` 里用
+`vision = true` 声明（或由 models API 的 `capabilities.vision` / 模态字段
+给出）；未声明的模型按纯文本模型处理，因为「没有声明」不是声明。这道闸门
+在三个地方生效：请求的 `tools` 字段里不含该工具；模型仍然发起的调用在执行
+器之前就被拒绝；发往纯文本模型的每个请求都会剥掉 transcript 里已附带的
+图片——不接受图片的端点会因此拒绝整个请求。transcript 与 rollout 仍保留
+这些图片，切回视觉模型后它们会重新随请求发送。
 
 `read_image` 先解码文件，再把它裁进 **patch 预算**（32 像素一个 patch）：`detail: "high"`（默认）允许 2500 个 patch、每边最多 2048 px；`detail: "original"` 允许 10 000 个 patch、6000 px。先压长边，再按面积收缩，保证整数结果落在预算内——2304x864 的截图以 2048x768 抵达。PNG、JPEG、WebP 在无需缩放时逐字节透传；任何重编码（GIF 帧、被缩放的图）都落为 PNG。字节以 inline `data:` URL 传输：chat-completions 请求没有上传文件句柄，而 `role: "tool"` 只能带文本——因此客户端把图片作为紧随其后的 `user` 消息、以 `image_url` content part 发出，这是网关适配器接受的形状；该载体排在一整轮工具结果**之后**，绝不会插在两个结果中间。每次请求只携带最新的图片：解码后 4 MB 是单次请求的图片预算，更早的图片不再重发，但它的文本结果仍留在 transcript 里。超过 128 MB 的文件、画布任一边超过 16384 px 的图片，以及非图片都会被拒绝，并在消息里指出下一步（文本走 `read`）。
 
@@ -80,6 +88,11 @@ Windows 上值得知道的差异：
 | `/tools <name> on` / `off` | 把某个工具固定为开/关。 |
 
 `read_only` 工具在列表中带标记；未知工具名与未知方向（`on`/`off`，另有 `enable`/`disable`）会报错并列出可用工具。
+
+需要图片输入的工具（`read_image`）在当前模型未声明 `vision` 时显示为
+`[-]` 和 `needs a vision model`：空格不会切换它，`/tools read_image on`
+会说明原因，`/context` 把它列为 `unavailable`。用 `/model` 切到视觉模型
+后，下一帧即解除限制。
 
 - **禁用的工具会从请求的 `tools` 字段中完全移除**——省 token，也防幻觉调用。
 - 模型仍然误调禁用工具时，**在执行期被拒绝**：它不会执行，模型收到 `tool … is disabled in this session (re-enable it with /tools)` 错误；名字无人声明的工具返回 `unknown tool …`。两者都像其他工具错误一样回给模型，在 wire 上以 `error: ` 前缀呈现。

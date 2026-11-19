@@ -49,6 +49,12 @@ pub struct ToolSpec {
     /// shows it as a marker. Nothing enforces it — a tool that lies about
     /// `read_only` simply gets enabled by read-only profiles.
     pub read_only: bool,
+    /// The tool's result is only useful to a model that accepts image input
+    /// (`read_image`). Unlike `read_only`, the host enforces it: such a tool
+    /// is withheld from models that do not declare vision, a call for it is
+    /// rejected without executing, and the transcript's images stop riding
+    /// requests to a text-only model.
+    pub requires_image_input: bool,
 }
 
 impl ToolSpec {
@@ -288,6 +294,7 @@ mod tests {
             description: "reply with pong",
             parameters_json: r#"{ "type": "object", "properties": { "n": { "type": "integer" } } }"#,
             read_only: true,
+            requires_image_input: false,
         };
         let function = spec.function_json()["function"].clone();
         assert_eq!(function["name"], "ping");

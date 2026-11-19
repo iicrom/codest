@@ -89,6 +89,7 @@ tool instead.",
   "required": ["path"]
 }"#,
     read_only: true,
+    requires_image_input: false,
 };
 
 static WRITE_SPEC: ToolSpec = ToolSpec {
@@ -111,6 +112,7 @@ overwrite loses anything you did not retype.",
   "required": ["path", "content"]
 }"#,
     read_only: false,
+    requires_image_input: false,
 };
 
 static EDIT_SPEC: ToolSpec = ToolSpec {
@@ -141,6 +143,7 @@ once — include enough surrounding lines to make it unique — or set \
   "required": ["path", "old_string", "new_string"]
 }"#,
     read_only: false,
+    requires_image_input: false,
 };
 
 static READ_IMAGE_SPEC: ToolSpec = ToolSpec {
@@ -165,6 +168,9 @@ screenshots, diagrams, and design references already on disk.",
   "required": ["path"]
 }"#,
     read_only: true,
+    // The one tool the host gates on the model's input modalities: a
+    // text-only model cannot use the result, so the worker withholds it.
+    requires_image_input: true,
 };
 
 static FS_PROMPT: &str = r#"## Files

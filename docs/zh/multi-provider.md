@@ -58,6 +58,7 @@ codest 可以同时对接任意多个模型端点：能配置什么、TUI 命令
 | `reasoning` | 字符串数组 | — | 模型接受的推理等级，**从低到高**；供 `/effort` 使用（§5）。 |
 | `default_level` | 字符串 | — | 选中该模型时采用的推理等级，直到 `/effort` 覆盖。 |
 | `session_header` | 字符串 | — | 对该模型覆盖 `wire.session_header`；`"none"` 表示这个模型不发会话头。 |
+| `vision` | 布尔 | — | 该模型接受图片输入。`read_image` 工具需要它：没声明 `vision` 的模型一律不下发该工具。未声明按**不支持**处理，所以 models API 不作说明的端点需要显式写这一项。 |
 
 声明条目优先于发现到的同名模型，但声明缺着的字段由发现补齐——只写
 `id` 的稀疏条目也能拿到 models API 报告的上下文窗口。
@@ -157,9 +158,11 @@ wire = { effort_field = "none" }                # 端点拒绝未知请求字段
 | 上下文窗口 | `limit.context` → `context_length` → `context_window` | footer 读数、选择器行 |
 | 推理等级 | `capabilities.reasoning.effort` → `reasoning`（有序，从低到高） | `/effort` 词汇表 |
 | 默认等级 | `capabilities.reasoning.default` → `default_level` | 选中模型时采用的 effort |
+| 图片输入 | `capabilities.vision` → `supports_vision` → `architecture.input_modalities` / `input_modalities`（列表里含 `image`） | `read_image` 的启用判定 |
 
-元数据缺失或类型不对就当作不存在——绝不是错误——未知字段（定价、模态、
-能力矩阵、API 块）一律忽略。
+元数据缺失或类型不对就当作不存在——绝不是错误。条目对图片输入只字未提时
+`vision` 保持未设置，宿主按**不支持**处理：`read_image` 只下发给明确声明的
+模型。其余未知字段（定价、能力矩阵、API 块）一律忽略。
 
 models 目录不在 `{base_url}/models` 的端点用 `options` 口袋显式指明；
 缺省行为不变：
