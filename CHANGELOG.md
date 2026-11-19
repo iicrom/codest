@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-11-19
+
 `read_image` now reaches only the models that can read it. A model's image
 input is a declared capability, and the host enforces it rather than trusting
 the endpoint to reject what it cannot use.
@@ -120,7 +122,8 @@ The development line from `54d1c4a` (`chore: initial commit`) through `3f23ae5` 
 
 - Open-source release preparation and an offline test suite: unit tests colocated with the code, plus `pty` / markdown / tool smoke scripts driven against a local test server.
 
-[Unreleased]: https://github.com/iicrom/codest/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/iicrom/codest/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/iicrom/codest/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/iicrom/codest/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/iicrom/codest/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/iicrom/codest/compare/v0.2.0...v0.3.0
