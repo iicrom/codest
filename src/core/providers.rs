@@ -950,8 +950,10 @@ const MODELS_URL_OPTION: &str = "models_url";
 ///   lowest first), falling back to a top-level `reasoning` array, else the
 ///   `default_level` field;
 /// * default level — `capabilities.reasoning.default`, then `default_level`;
-/// * image input — `capabilities.vision`, then `supports_vision`, then
-///   `architecture.input_modalities` / `input_modalities` naming `image`.
+/// * image input — `capabilities.vision`, then `supports_vision`, then any
+///   accepted-input list (`architecture.input_modalities`,
+///   `input_modalities`, `modalities.input`) naming image input, either as
+///   the bare `image` or as a MIME type under it (`image/png`).
 ///
 /// Entries without an id are skipped, duplicates are collapsed, order is
 /// preserved. Unknown fields are ignored: the directory carries far more than
@@ -1015,10 +1017,13 @@ pub fn models_from_openai_list(payload: &serde_json::Value) -> Vec<ModelInfo> {
 ///
 /// `capabilities.vision` may be a boolean or a `{supported: true}` object;
 /// some endpoints instead declare a flat `supports_vision` or list the
-/// accepted modalities (`architecture.input_modalities`, or a top-level
-/// `input_modalities`) as strings. An entry that names no image input gives
-/// `None` — "not declared" — which the host reads as no vision support at
-/// all, never as a rejection.
+/// accepted modalities as strings. The list lives under
+/// `architecture.input_modalities`, a top-level `input_modalities`, or
+/// `modalities.input`, and names image input either as the bare modality
+/// (`image`) or as a MIME type under it (`image/png`, `image/jpeg` — what an
+/// endpoint whose directory enumerates the file types it accepts returns).
+/// An entry that names no image input gives `None` — "not declared" — which
+/// the host reads as no vision support at all, never as a rejection.
 fn vision_support(entry: &serde_json::Value) -> Option<bool> {
     let flag = |value: Option<&serde_json::Value>| match value {
         Some(serde_json::Value::Bool(flag)) => Some(*flag),
@@ -1036,13 +1041,27 @@ fn vision_support(entry: &serde_json::Value) -> Option<bool> {
     let modalities = entry
         .pointer("/architecture/input_modalities")
         .or_else(|| entry.get("input_modalities"))
+        .or_else(|| entry.pointer("/modalities/input"))
         .and_then(serde_json::Value::as_array)?;
     Some(
         modalities
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .any(|modality| modality.trim().eq_ignore_ascii_case("image")),
+            .map(str::trim)
+            .any(names_image_input),
     )
+}
+
+/// Whether one accepted-input modality names image input: the bare modality
+/// (`image`) or a MIME type under it (`image/png`). Both spellings appear on
+/// the wire, and a directory that enumerates file types never writes the bare
+/// one.
+fn names_image_input(modality: &str) -> bool {
+    let modality = modality.split(';').next().unwrap_or_default().trim();
+    modality.eq_ignore_ascii_case("image")
+        || modality
+            .get(.."image/".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
 }
 
 /// The effort levels one directory entry accepts, lowest first. An absent or
@@ -1682,6 +1701,53 @@ mod tests {
         assert_eq!(vision(5), Some(true), "input_modalities");
         assert_eq!(vision(6), Some(false), "text-only modalities");
         assert_eq!(vision(7), None, "silence is not a claim either way");
+    }
+
+    /// A directory that enumerates the file types it accepts spells image
+    /// input as MIME types under `modalities.input` and never writes the bare
+    /// `image` — the shape a real gateway returns. Reading only the bare
+    /// modality would silently make every model there text-only, so the
+    /// `image/…` prefix counts too.
+    #[test]
+    fn models_list_reads_image_mime_types_as_image_input() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "types", "modalities": {
+                    "input": ["text", "image/jpeg", "image/png", "image/gif", "image/webp"],
+                    "output": ["text"]}},
+                {"id": "bare", "modalities": {"input": ["text", "image"]}},
+                {"id": "pdf-only", "modalities": {"input": ["text", "application/pdf"]}},
+                {"id": "no-input-key", "modalities": {"output": ["text"]}},
+                {"id": "nested-types", "architecture": {
+                    "input_modalities": ["text", "IMAGE/PNG"]}},
+                {"id": "flat-types", "input_modalities": ["text", "image/*"]}
+            ]
+        });
+        let models = models_from_openai_list(&payload);
+        let vision = |index: usize| models[index].vision;
+        assert_eq!(vision(0), Some(true), "modalities.input MIME types");
+        assert_eq!(vision(1), Some(true), "the bare modality still counts");
+        assert_eq!(vision(2), Some(false), "a non-image type is text-only");
+        assert_eq!(vision(3), None, "no input list is not a claim either way");
+        assert_eq!(vision(4), Some(true), "MIME matching ignores case");
+        assert_eq!(vision(5), Some(true), "a wildcard type counts as image");
+    }
+
+    /// A boolean spelling still outranks the modality lists, so an endpoint
+    /// that reports both is read by its most specific field.
+    #[test]
+    fn models_list_prefers_the_boolean_over_modalities() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "off", "capabilities": {"vision": false},
+                 "modalities": {"input": ["text", "image/png"]}},
+                {"id": "on", "supports_vision": true,
+                 "modalities": {"input": ["text"]}}
+            ]
+        });
+        let models = models_from_openai_list(&payload);
+        assert_eq!(models[0].vision, Some(false), "the explicit no wins");
+        assert_eq!(models[1].vision, Some(true), "supports_vision wins");
     }
 
     /// A declared `vision` wins over discovery, and a declaration that

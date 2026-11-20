@@ -177,13 +177,15 @@ The outer envelope is OpenAI's `{data: [{...}]}`. Entry fields are read by
 | context window | `limit.context` → `context_length` → `context_window` | footer readout, picker rows |
 | effort levels | `capabilities.reasoning.effort` → `reasoning` (ordered, lowest first) | `/effort` vocabulary |
 | default level | `capabilities.reasoning.default` → `default_level` | effort adopted on selection |
-| image input | `capabilities.vision` → `supports_vision` → `architecture.input_modalities` / `input_modalities` (a list naming `image`) | `read_image` gating |
+| image input | `capabilities.vision` → `supports_vision` → an accepted-input list (`architecture.input_modalities`, `input_modalities`, `modalities.input`) naming `image` or any `image/…` type | `read_image` gating |
 
 Missing or malformed metadata is simply absent — never an error. An entry
 that says nothing about image input yields no `vision` value, which the host
 reads as **no**: `read_image` is only offered to models that affirmatively
-declare it. Other unknown fields (pricing, capability matrices, API blocks)
-are ignored.
+declare it. Either spelling in a modality list counts, because a directory
+that enumerates the file types it accepts (`image/png`, `image/jpeg`) never
+writes the bare `image`. Other unknown fields (pricing, capability matrices,
+API blocks) are ignored.
 
 Endpoints whose models directory is not at `{base_url}/models` name it
 explicitly through the `options` pocket; the default is unchanged:

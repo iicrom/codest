@@ -494,11 +494,14 @@ class ChatHandler(BaseHTTPRequestHandler):
         elif path.endswith("/models"):
             # OpenAI-shaped directory for codest's `fetch_models` discovery;
             # `default_level` feeds the /effort picker, the context-window
-            # fields feed the footer/status display, and `capabilities.vision`
-            # makes `test-model` an image-input model so the `read_image` tool
-            # is offered (the host withholds image tools from text-only models,
-            # and then strips the transcript's images from the request too).
-            # The two entries spell the window differently on purpose:
+            # fields feed the footer/status display, and the image-input
+            # spellings make models accept `read_image` (the host withholds
+            # image tools from text-only models, and then strips the
+            # transcript's images from the request too). Both spellings of
+            # image input are served on purpose: `test-model` uses the
+            # capability flag, `second-model` the MIME-type modality list a
+            # gateway that enumerates accepted file types returns. The two
+            # entries spell the window differently for the same reason:
             # `context_length` is what OpenRouter returns, `context_window` the
             # plain spelling.
             self._send_json(
@@ -516,6 +519,10 @@ class ChatHandler(BaseHTTPRequestHandler):
                         {
                             "id": "second-model",
                             "context_window": 200000,
+                            "modalities": {
+                                "input": ["text", "image/png", "image/jpeg", "image/webp"],
+                                "output": ["text"],
+                            },
                         },
                     ],
                 },

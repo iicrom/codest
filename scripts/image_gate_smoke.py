@@ -9,6 +9,9 @@ array of the first chat request:
 
   * `vision = true` declares `read_image`;
   * `vision = false` does not;
+  * a model that names image input only through its modality list (the MIME
+    types a gateway enumerates under `modalities.input`) declares it, and one
+    whose list holds no image type does not;
   * an entry that says nothing about image input does not either, because an
     undeclared model is treated as text-only (the gate fails closed).
 
@@ -42,13 +45,19 @@ PROVIDERS = """\
 name = "gate"
 base_url = "__BASE_URL__"
 api_key = "test-key"
-fetch_models = false
+fetch_models = __FETCH__
+__DECLARED__"""
+
+CONFIG = 'default = "gate/test-model"\n'
+
+# The model the run pins. Declared without a `vision` line, so with discovery
+# on its capability comes from the server's directory alone — which is the
+# path a real gateway takes.
+DECLARED = """\
 
   [[providers.models]]
   id = "test-model"
 __VISION__"""
-
-CONFIG = 'default = "gate/test-model"\n'
 
 
 def start_server(dump_path: Path) -> subprocess.Popen[str]:
@@ -80,13 +89,13 @@ def reported_url(process: subprocess.Popen[str]) -> str:
     return "http://" + marker[1].split()[0]
 
 
-def drive_once(binary: str, home: str) -> None:
+def drive_once(binary: str, home: str, model: str = "test-model") -> None:
     """Run one turn in a pty; the server records the request body."""
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     env = dict(os.environ, TERM="xterm-256color", CODEST_HOME=home)
     process = subprocess.Popen(
-        [binary, "--tui-mode", "fullscreen", "--provider", "gate", "--model", "test-model"],
+        [binary, "--tui-mode", "fullscreen", "--provider", "gate", "--model", model],
         stdin=slave,
         stdout=slave,
         stderr=slave,
@@ -138,18 +147,30 @@ def tool_names(dump_path: Path) -> list[str] | None:
     return None
 
 
-def run_case(binary: str, label: str, vision_line: str, expect: bool) -> tuple[bool, str]:
+def run_case(
+    binary: str,
+    label: str,
+    vision_line: str,
+    expect: bool,
+    fetch_models: bool = False,
+    model_id: str = "test-model",
+) -> tuple[bool, str]:
     workdir = Path(tempfile.mkdtemp(prefix="cst-image-gate-"))
     dump_path = workdir / "requests.jsonl"
     server = start_server(dump_path)
     try:
         base_url = reported_url(server)
+        declared = DECLARED.replace("__VISION__", vision_line)
         (workdir / "providers.toml").write_text(
-            PROVIDERS.replace("__BASE_URL__", base_url).replace("__VISION__", vision_line),
+            PROVIDERS.replace("__BASE_URL__", base_url)
+            .replace("__FETCH__", "true" if fetch_models else "false")
+            .replace("__DECLARED__", declared),
             encoding="utf-8",
         )
-        (workdir / "config.toml").write_text(CONFIG, encoding="utf-8")
-        drive_once(binary, str(workdir))
+        (workdir / "config.toml").write_text(
+            CONFIG.replace("test-model", model_id), encoding="utf-8"
+        )
+        drive_once(binary, str(workdir), model_id)
     finally:
         server.terminate()
         try:
@@ -176,13 +197,33 @@ def main() -> int:
         return 2
 
     cases = [
-        ("vision = true declares read_image", "  vision = true\n", True),
-        ("vision = false withholds it", "  vision = false\n", False),
-        ("an undeclared model withholds it", "", False),
+        ("vision = true declares read_image", "  vision = true\n", True, False),
+        ("vision = false withholds it", "  vision = false\n", False, False),
+        ("an undeclared model withholds it", "", False, False),
+        # The discovery path: the pinned model declares nothing, so its image
+        # input comes from the server's `capabilities.vision`.
+        ("discovery's capabilities.vision declares it", "", True, True),
+        # And the shape a gateway that enumerates file types returns: the MIME
+        # list under `modalities.input`, with no `vision` flag anywhere.
+        (
+            "discovery's modalities.input MIME types declare it",
+            "",
+            True,
+            True,
+            "second-model",
+        ),
     ]
     failures = 0
-    for label, vision_line, expect in cases:
-        ok, detail = run_case(binary, label, vision_line, expect)
+    for case in cases:
+        label, vision_line, expect, fetch_models, *rest = case
+        ok, detail = run_case(
+            binary,
+            label,
+            vision_line,
+            expect,
+            fetch_models,
+            rest[0] if rest else "test-model",
+        )
         print(f"{'PASS' if ok else 'FAIL'}  {detail}")
         failures += 0 if ok else 1
     return 1 if failures else 0

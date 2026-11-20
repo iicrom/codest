@@ -158,11 +158,13 @@ wire = { effort_field = "none" }                # 端点拒绝未知请求字段
 | 上下文窗口 | `limit.context` → `context_length` → `context_window` | footer 读数、选择器行 |
 | 推理等级 | `capabilities.reasoning.effort` → `reasoning`（有序，从低到高） | `/effort` 词汇表 |
 | 默认等级 | `capabilities.reasoning.default` → `default_level` | 选中模型时采用的 effort |
-| 图片输入 | `capabilities.vision` → `supports_vision` → `architecture.input_modalities` / `input_modalities`（列表里含 `image`） | `read_image` 的启用判定 |
+| 图片输入 | `capabilities.vision` → `supports_vision` → 接受输入列表（`architecture.input_modalities`、`input_modalities`、`modalities.input`）里含 `image` 或任一 `image/…` 类型 | `read_image` 的启用判定 |
 
 元数据缺失或类型不对就当作不存在——绝不是错误。条目对图片输入只字未提时
 `vision` 保持未设置，宿主按**不支持**处理：`read_image` 只下发给明确声明的
-模型。其余未知字段（定价、能力矩阵、API 块）一律忽略。
+模型。模态列表里两种拼写都算数：枚举所接受文件类型（`image/png`、
+`image/jpeg`）的目录从不会写裸的 `image`。其余未知字段（定价、能力矩阵、
+API 块）一律忽略。
 
 models 目录不在 `{base_url}/models` 的端点用 `options` 口袋显式指明；
 缺省行为不变：

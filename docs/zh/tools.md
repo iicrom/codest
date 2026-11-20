@@ -52,8 +52,10 @@ Windows 上值得知道的差异：
 | `read_image` | 载入本地 PNG/JPEG/GIF/WebP 供视觉查看——即 codex 的 `view_image`。图片按模型的图像预算缩放并附在工具结果上，文本部分说明读了什么、如何准备。标记为 `read_only`，并且**只有图片输入模型可用**：模型未声明 `vision` 时宿主一律不下发该工具（见 [multi-provider.md](multi-provider.md#22-providersmodels)）。 |
 
 `read_image` 只对**图片输入模型**可用。模型在 `providers.toml` 里用
-`vision = true` 声明（或由 models API 的 `capabilities.vision` / 模态字段
-给出）；未声明的模型按纯文本模型处理，因为「没有声明」不是声明。这道闸门
+`vision = true` 声明（或由 models API 的 `capabilities.vision` /
+`supports_vision` / 模态列表给出——`image` 或任一 `image/…` 类型，位于
+`architecture.input_modalities`、`input_modalities` 或 `modalities.input`）；
+未声明的模型按纯文本模型处理，因为「没有声明」不是声明。这道闸门
 在三个地方生效：请求的 `tools` 字段里不含该工具；模型仍然发起的调用在执行
 器之前就被拒绝；发往纯文本模型的每个请求都会剥掉 transcript 里已附带的
 图片——不接受图片的端点会因此拒绝整个请求。transcript 与 rollout 仍保留

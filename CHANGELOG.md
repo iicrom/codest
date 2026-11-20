@@ -14,7 +14,7 @@ the endpoint to reject what it cannot use.
 
 ### Added
 
-- Image-input gating: `read_image` is offered only to models that accept image input. A model declares it with `vision = true` in `providers.toml`, or the host reads it from models discovery (`capabilities.vision`, `supports_vision`, `architecture.input_modalities` / `input_modalities`). An undeclared model counts as text-only — silence is not a claim, so the gate fails closed.
+- Image-input gating: `read_image` is offered only to models that accept image input. A model declares it with `vision = true` in `providers.toml`, or the host reads it from models discovery (`capabilities.vision`, `supports_vision`, or an accepted-input list — `architecture.input_modalities`, `input_modalities`, `modalities.input` — naming `image` or any `image/…` MIME type, the spelling a directory that enumerates file types returns). An undeclared model counts as text-only — silence is not a claim, so the gate fails closed.
 - `ToolSpec::requires_image_input` and `PluginInfo::image_input`, so a plugin can mark a tool that needs vision and explain its availability.
 - `scripts/image_gate_smoke.py`: a wire-level check that the declared `tools` array carries `read_image` for a vision model and withholds it otherwise. The test server's `--dump-headers` now records the request body alongside the headers.
 

@@ -53,8 +53,10 @@ Windows differences worth knowing:
 
 `read_image` is only offered to **image-input models**. A model declares
 that with `vision = true` in `providers.toml` (or the models API's
-`capabilities.vision` / `modalities` entry); an undeclared model counts as
-text-only, because `None` is not a claim. The gate is enforced in three
+`capabilities.vision` / `supports_vision` / modality list — `image` or any
+`image/…` type, under `architecture.input_modalities`, `input_modalities`, or
+`modalities.input`); an undeclared model counts as text-only, because `None`
+is not a claim. The gate is enforced in three
 places: the tool is left out of the request's `tools` field, a call made
 anyway is rejected before the executor runs, and the transcript's attached
 images are stripped from every request to a text-only model — an endpoint
