@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-11-20
+
+Hotfix on `main` (`4c48a9c`), no merge: the image-input gate shipped in 0.4.1
+could not see the capability on the endpoints that spell it as MIME types.
+
+### Fixed
+
+- Models discovery reads image input from `modalities.input` too, and a modality entry counts when it is the bare `image` **or** any `image/…` type (`image/png`, `image/jpeg`, case-insensitive). A directory that enumerates the accepted file types — what an OpenRouter/opencode-shaped gateway returns — matched no spelling 0.4.1 knew, so every vision model there was read as text-only and lost `read_image` to the gate. The boolean spellings keep precedence, so an explicit `capabilities.vision = false` still wins over a list, and a list with no image type is still a "no".
+- `scripts/image_gate_smoke.py` covers both discovery spellings as wire-level cases (`capabilities.vision`, and a MIME-only `modalities.input`), and the test server serves both shapes.
+
 ## [0.4.1] — 2026-11-19
 
 `read_image` now reaches only the models that can read it. A model's image
@@ -122,7 +132,8 @@ The development line from `54d1c4a` (`chore: initial commit`) through `3f23ae5` 
 
 - Open-source release preparation and an offline test suite: unit tests colocated with the code, plus `pty` / markdown / tool smoke scripts driven against a local test server.
 
-[Unreleased]: https://github.com/iicrom/codest/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/iicrom/codest/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/iicrom/codest/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/iicrom/codest/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/iicrom/codest/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/iicrom/codest/compare/v0.3.0...v0.3.1
